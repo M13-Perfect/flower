@@ -1,0 +1,14 @@
+{
+  "Font 4": {
+    "enabled": true,
+    "apply_mode": "replace_last_letter",
+    "description": "Font 4 ending swash glyphs",
+    "letters": {}
+  },
+  "Font 2": {
+    "enabled": true,
+    "apply_mode": "replace_last_letter",
+    "description": "Font 2 ending swash glyphs",
+    "letters": {}
+  }
+}

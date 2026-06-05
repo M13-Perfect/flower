@@ -1,0 +1,20 @@
+.venv/
+.codex/
+.superpowers/
+__pycache__/
+.pytest_cache/
+outputs/
+birth_flower_config.json
+*.pyc
+
+# Local business assets are intentionally kept out of GitHub.
+BirthMonth flowers/
+user/
+*.jpg
+*.jpeg
+*.png
+*.psd
+*.dxf
+*.ttf
+*.otf
+新建文本文档.txt

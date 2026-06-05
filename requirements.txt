@@ -1,0 +1,7 @@
+pytest>=8.0
+fonttools>=4.0
+Pillow>=10.0
+freetype-py>=2.4
+uharfbuzz>=0.40
+svgwrite>=1.4
+ezdxf>=1.3
