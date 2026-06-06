@@ -21,7 +21,7 @@ from order_importer import load_order_remark_from_file
 from parse_pipeline import parse_order_remark_auto
 from gpt_parser import DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, parse_order_remark_with_gpt
 from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_dxf, render_png, render_svg
-from text_layout import LINE_HEIGHT_RATIO, layout_personalization_text
+from text_layout import LINE_HEIGHT_RATIO, measure_text_ink_bbox, layout_personalization_text
 
 
 DEFAULT_FLOWER_DIR = Path("BirthMonth flowers")
@@ -421,6 +421,8 @@ class BirthFlowerApp:
         self.preview_font_family_cache: dict[Path, str] = {}
         self.preview_loaded_fonts: set[Path] = set()
         self.preview_cache = PreviewCache()
+        # 保存 PhotoImage 引用，避免 Tk 垃圾回收后预览文字消失。
+        self.preview_text_images: list[object] = []
         default_layout = EngravingLayout()
         self.layout_vars = {
             "canvas_width": tk.StringVar(value=str(default_layout.canvas_width)),
@@ -1408,8 +1410,10 @@ class BirthFlowerApp:
         glyph_result = self._resolve_current_glyph()
         name = glyph_result.render_text.strip() or "Name"
         text_layout = layout_personalization_text(name, layout, self.personalization_type_var.get(), self._selected_font_path())
+        self.preview_text_images.clear()
         preview_size = max(8, round(text_layout.final_font_size * scale))
         preview_family = self._selected_preview_font_family()
+        font_path = self._selected_font_path()
         line_height = text_layout.final_font_size * LINE_HEIGHT_RATIO
         for index, line in enumerate(text_layout.lines):
             if index < len(text_layout.line_origins):
@@ -1417,6 +1421,8 @@ class BirthFlowerApp:
             else:
                 line_x = text_layout.draw_x
                 line_y = text_layout.draw_y + index * line_height
+            if self._draw_ink_aligned_preview_text(canvas, line, line_x, line_y, text_layout.final_font_size, font_path, scale, offset_x, offset_y):
+                continue
             canvas.create_text(
                 sx(line_x),
                 sy(line_y),
@@ -1430,6 +1436,38 @@ class BirthFlowerApp:
             self._draw_visual_debug(canvas, layout, text_layout, sx, sy)
         self._draw_selection_controls(canvas, layout, sx, sy)
         self._set_readiness_display(self._current_readiness_parse_result(), text_layout)
+
+    def _draw_ink_aligned_preview_text(
+        self,
+        canvas: tk.Canvas,
+        line: str,
+        origin_x: float,
+        origin_y: float,
+        font_size: int,
+        font_path: Path | None,
+        scale: float,
+        offset_x: float,
+        offset_y: float,
+    ) -> bool:
+        """用 Pillow 生成真实墨迹预览图，让黑色字形边界与布局框一致；失败时回退到 Tk 文本。"""
+        try:
+            from PIL import ImageTk
+        except Exception:
+            return False
+        preview_size = max(8, round(font_size * scale))
+        image_and_offset = _preview_text_ink_image(line, preview_size, font_path)
+        if image_and_offset is None:
+            return False
+        image, offset_left, offset_top = image_and_offset
+        try:
+            photo = ImageTk.PhotoImage(image)
+        except Exception:
+            return False
+        self.preview_text_images.append(photo)
+        x = offset_x + (origin_x * scale) + offset_left
+        y = offset_y + (origin_y * scale) + offset_top
+        canvas.create_image(x, y, image=photo, anchor="nw", tags=("text_art",))
+        return True
 
     def _draw_flower_preview(self, canvas: tk.Canvas, layout: EngravingLayout, sx, sy) -> None:
         asset_path = self._selected_flower_path()
@@ -1648,6 +1686,36 @@ class BirthFlowerApp:
     def _on_canvas_release(self, _event) -> None:
         self._drag_target = None
         self._drag_start = None
+
+
+def _preview_text_ink_image(text: str, font_size: int, font_path: Path | None):
+    """返回裁剪到真实黑色墨迹的 RGBA 图片及其相对文字 origin 的偏移，供 Tk 预览精准贴合方框。"""
+    if not text:
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+    try:
+        font = ImageFont.truetype(str(font_path), font_size) if font_path is not None else ImageFont.load_default(size=font_size)
+    except Exception:
+        try:
+            font = ImageFont.load_default(size=font_size)
+        except TypeError:
+            font = ImageFont.load_default()
+    bbox = measure_text_ink_bbox(text, font_size, font_path)
+    if bbox.width <= 0 or bbox.height <= 0:
+        return None
+    width = max(1, int(bbox.width) + 1)
+    height = max(1, int(bbox.height) + 1)
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.text((-bbox.left, -bbox.top), text, font=font, fill="#111111")
+    alpha_bbox = image.getbbox()
+    if alpha_bbox is None:
+        return None
+    cropped = image.crop(alpha_bbox)
+    return cropped, bbox.left + alpha_bbox[0], bbox.top + alpha_bbox[1]
 
 
 def main() -> None:

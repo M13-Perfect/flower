@@ -240,7 +240,7 @@ choco install ripgrep
 
 - SVG 素材默认启用 `USE_VISUAL_BBOX_FOR_SVG=True`：预览、SVG viewBox 嵌入和 DXF polyline 映射都会优先使用真实 path/stroke 可见包围盒，而不是原始 viewBox 的透明留白。
 - 通用适配函数位于 `visual_layout.py`：`fit_content_bbox_to_target_rect(content_bbox, target_rect, mode="contain", align=(0.5, 0.5))` 会扣除 `content_bbox.x/y` 后再缩放和居中，支持 `contain`、`cover`、`stretch`。
-- 文字布局使用 Pillow `ImageDraw.textbbox()` 测量真实 ink bbox，并用二分搜索选择能放入 `text_width/text_height` 的最大字号；空文本、空格文本和字体加载失败会降级处理，不会让应用崩溃。
+- 文字布局先使用 Pillow `ImageDraw.textbbox()` 获取初始范围，再把文字绘制到透明蒙版并按实际非透明像素计算黑色字形 ink bbox；预览也会用同一 bbox 生成裁剪后的文字图层，使墨迹上下左右与 `text_width/text_height` 方框匹配。空文本、空格文本和字体加载失败会降级处理，不会让应用崩溃。
 - 调试开关为 `renderer.DEBUG_VISUAL_BBOX`，默认关闭。开启后预览会画出 target rect、layout/viewBox bbox、visual/ink bbox，便于排查偏移来源。
 
 ## GitHub 低风险仓库
