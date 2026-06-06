@@ -21,11 +21,15 @@ from order_importer import load_order_remark_from_file
 from parse_pipeline import parse_order_remark_auto
 from gpt_parser import DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, parse_order_remark_with_gpt
 from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_dxf, render_png, render_svg
-from text_layout import LINE_HEIGHT_RATIO, layout_personalization_text
+from text_layout import LINE_HEIGHT_RATIO, measure_text_ink_bbox, layout_personalization_text
 
 
 DEFAULT_FLOWER_DIR = Path("BirthMonth flowers")
 DEFAULT_FONT_SOURCE = Path("Birthmonth_font.ttf")
+IMPORTABLE_FONT_SUFFIXES = {".ttf", ".otf"}
+IMPORTABLE_VECTOR_SUFFIXES = {".svg"}
+IMPORTABLE_BITMAP_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+IMPORTABLE_ASSET_SUFFIXES = IMPORTABLE_VECTOR_SUFFIXES | IMPORTABLE_BITMAP_SUFFIXES
 APP_COLORS = {
     "background": "#f6f7f8",
     "panel": "#ffffff",
@@ -421,6 +425,8 @@ class BirthFlowerApp:
         self.preview_font_family_cache: dict[Path, str] = {}
         self.preview_loaded_fonts: set[Path] = set()
         self.preview_cache = PreviewCache()
+        # 保存 PhotoImage 引用，避免 Tk 垃圾回收后预览文字消失。
+        self.preview_text_images: list[object] = []
         default_layout = EngravingLayout()
         self.layout_vars = {
             "canvas_width": tk.StringVar(value=str(default_layout.canvas_width)),
@@ -465,7 +471,10 @@ class BirthFlowerApp:
     def _build_menu(self) -> None:
         menu_bar = tk.Menu(self.root)
         file_menu = tk.Menu(menu_bar, tearoff=False)
-        file_menu.add_command(label="导入备注...", command=self.import_remark_file)
+        import_menu = tk.Menu(file_menu, tearoff=False)
+        import_menu.add_command(label="导入备注...", command=self.import_remark_file)
+        import_menu.add_command(label="导入素材...", command=self.import_asset_file)
+        file_menu.add_cascade(label="导入", menu=import_menu)
         file_menu.add_command(label="打开输出目录", command=self.open_output_dir)
         file_menu.add_separator()
         file_menu.add_command(label="设置...", accelerator="Ctrl+,", command=self.open_settings)
@@ -652,22 +661,14 @@ class BirthFlowerApp:
         self.flower_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_flower_combo_selected())
         ttk.Label(asset_group, text="素材名").grid(row=0, column=0, sticky="w", pady=4)
         self.flower_combo.grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Button(asset_group, text="添加", command=self._add_selected_flower_to_canvas).grid(
-            row=0, column=2, sticky="e", padx=(8, 0), pady=4
-        )
         self.font_combo = ttk.Combobox(asset_group, textvariable=self.font_asset_var, state="readonly")
         self.font_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_font_combo_selected())
         ttk.Label(asset_group, text="字体类型").grid(row=1, column=0, sticky="w", pady=4)
         self.font_combo.grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Button(asset_group, text="添加", command=self._add_selected_font_to_canvas).grid(
-            row=1, column=2, sticky="e", padx=(8, 0), pady=4
-        )
 
         layout_group = ttk.LabelFrame(panel, text="布局参数", padding=10, style="Panel.TLabelframe")
         layout_group.grid(row=1, column=0, sticky="ew")
         layout_fields = (
-            ("画布宽", "canvas_width"),
-            ("画布高", "canvas_height"),
             ("花 x", "flower_x"),
             ("花 y", "flower_y"),
             ("花宽", "flower_width"),
@@ -739,6 +740,7 @@ class BirthFlowerApp:
         notebook.pack(fill="both", expand=True, padx=12, pady=12)
         self._build_asset_settings_tab(notebook)
         self._build_font_settings_tab(notebook)
+        self._build_output_settings_tab(notebook)
         self._build_ai_settings_tab(notebook)
         button_row = ttk.Frame(window)
         button_row.pack(fill="x", padx=12, pady=(0, 12))
@@ -814,16 +816,25 @@ class BirthFlowerApp:
 
     def _build_output_settings_tab(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=12)
-        notebook.add(frame, text="输出默认值")
-        self._add_path_row(frame, 0, "默认输出路径", self.output_var, self.choose_output)
+        notebook.add(frame, text="输出设置")
+        ttk.Label(frame, text="输出格式").grid(row=0, column=0, sticky="w", pady=4)
         format_row = ttk.Frame(frame)
-        format_row.grid(row=1, column=1, sticky="w", pady=8)
+        format_row.grid(row=0, column=1, sticky="w", pady=4)
         for output_format, label in (("png", "PNG"), ("svg", "SVG"), ("dxf", "DXF")):
             ttk.Checkbutton(format_row, text=label, variable=self.output_format_vars[output_format]).pack(
                 side="left", padx=(0, 8)
             )
+        self._add_path_row(frame, 1, "输出路径", self.output_var, self.choose_output)
+        resolution_group = ttk.LabelFrame(frame, text="输出分辨率", padding=8)
+        resolution_group.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        resolution_group.columnconfigure(1, weight=1)
+        for row, (label, key) in enumerate((("画布宽", "canvas_width"), ("画布高", "canvas_height"))):
+            ttk.Label(resolution_group, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(resolution_group, textvariable=self.layout_vars[key], width=12).grid(
+                row=row, column=1, sticky="ew", pady=3
+            )
         ttk.Label(frame, text="最终文件仍必须通过主界面的人工确认按钮生成。").grid(
-            row=2, column=1, sticky="w", pady=(4, 0)
+            row=3, column=1, sticky="w", pady=(4, 0)
         )
         frame.columnconfigure(1, weight=1)
 
@@ -916,6 +927,118 @@ class BirthFlowerApp:
         self.remark_var.set(" ".join(remark.split()))
         self._set_warnings([])
 
+    def import_asset_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="导入素材",
+            filetypes=[
+                ("可导入素材", "*.svg *.png *.jpg *.jpeg *.webp *.bmp *.ttf *.otf"),
+                ("字体", "*.ttf *.otf"),
+                ("矢量/位图", "*.svg *.png *.jpg *.jpeg *.webp *.bmp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self._import_asset_path(Path(path))
+
+    def _import_asset_path(self, path: Path | str) -> None:
+        import_path = Path(path)
+        suffix = import_path.suffix.casefold()
+        if suffix in IMPORTABLE_FONT_SUFFIXES:
+            self._import_font_file(import_path)
+            return
+        if suffix in IMPORTABLE_ASSET_SUFFIXES:
+            self._import_flower_file(import_path)
+            return
+        messagebox.showerror("导入失败", f"不支持的文件类型：{import_path.suffix or '无后缀'}")
+
+    def _import_font_file(self, path: Path | str) -> None:
+        font_path = Path(path)
+        if not font_path.is_file():
+            messagebox.showerror("导入失败", f"字体文件不存在：{font_path}")
+            return
+        fonts = scan_font_assets(font_path)
+        if not fonts:
+            messagebox.showerror("导入失败", f"无法识别字体文件：{font_path}")
+            return
+        self.font_source_var.set(str(font_path))
+        self.font_assets = fonts
+        self.preview_font_family_cache.clear()
+        self._refresh_font_choices()
+        selected = next((asset for asset in fonts if asset.path == font_path), fonts[0])
+        self._select_imported_font_asset(selected)
+        self._save_current_config()
+
+    def _import_flower_file(self, path: Path | str) -> None:
+        asset_path = Path(path)
+        if not asset_path.is_file():
+            messagebox.showerror("导入失败", f"素材文件不存在：{asset_path}")
+            return
+        suffix = asset_path.suffix.casefold()
+        if suffix not in IMPORTABLE_ASSET_SUFFIXES:
+            messagebox.showerror("导入失败", f"不支持的素材类型：{asset_path.suffix or '无后缀'}")
+            return
+        self.flower_dir_var.set(str(asset_path.parent))
+        scanned_assets = scan_flower_assets(asset_path.parent) if suffix in IMPORTABLE_VECTOR_SUFFIXES else []
+        selected = next((asset for asset in scanned_assets if asset.path == asset_path), None)
+        if selected is None:
+            selected = self._imported_flower_asset(asset_path)
+        self.flower_assets = [asset for asset in scanned_assets if asset.path != asset_path]
+        self.flower_assets.append(selected)
+        self.preview_cache.clear()
+        self._refresh_flower_choices()
+        self._select_imported_flower_asset(selected)
+        self._save_current_config()
+
+    def _imported_flower_asset(self, path: Path) -> FlowerAsset:
+        try:
+            month = int(self.month_var.get())
+        except ValueError:
+            month = 1
+        month = min(12, max(1, month))
+        try:
+            flower = int(self.flower_var.get())
+        except ValueError:
+            flower = 1
+        flower = max(1, flower)
+        is_bitmap = path.suffix.casefold() in IMPORTABLE_BITMAP_SUFFIXES
+        return FlowerAsset(
+            name=path.stem,
+            month=month,
+            flower=flower,
+            path=path,
+            asset_key=path.stem.casefold(),
+            display_name=path.stem,
+            category="imported_bitmap" if is_bitmap else "imported_vector",
+            is_vector_safe=not is_bitmap,
+            embedded_raster_warnings=("位图素材导出 SVG 时会以图片嵌入，不是纯矢量。",) if is_bitmap else (),
+        )
+
+    def _select_imported_flower_asset(self, asset: FlowerAsset) -> None:
+        label = self._flower_label(asset)
+        if label not in self.flower_label_map:
+            self.flower_label_map[label] = asset
+            self.flower_combo.configure(values=list(self.flower_label_map))
+        self.flower_asset_var.set(label)
+        self.month_var.set(str(asset.month))
+        self.flower_var.set(str(asset.flower))
+        self.selected_preview_item = "flower"
+        if asset.embedded_raster_warnings:
+            self._set_warnings(list(asset.embedded_raster_warnings))
+        self._redraw_preview()
+
+    def _select_imported_font_asset(self, asset: FontAsset) -> None:
+        label = self._font_label(asset)
+        if label not in self.font_label_map:
+            self.font_label_map[label] = asset
+            self.font_combo.configure(values=list(self.font_label_map))
+        self.font_asset_var.set(label)
+        self.current_manual_glyph_override = None
+        self.current_glyph_overrides.clear()
+        self.selected_glyph_position = None
+        self.font_var.set(str(asset.index))
+        self.selected_preview_item = "text"
+        self._redraw_preview()
+
     def parse_remark(self) -> None:
         remark = self.remark_var.get()
         ai_config = self._current_ai_config()
@@ -965,10 +1088,18 @@ class BirthFlowerApp:
 
     def choose_output(self) -> None:
         current_output = normalize_output_path(self.output_var.get())
+        selected_formats = self._selected_output_formats_or_default()
+        default_format = selected_formats[0] if selected_formats else "svg"
         path = filedialog.asksaveasfilename(
-            title="选择 SVG 输出路径",
-            defaultextension=".svg",
-            filetypes=[("SVG", "*.svg")],
+            title="选择输出路径",
+            defaultextension=f".{default_format}",
+            filetypes=[
+                ("输出文件", "*.png *.svg *.dxf"),
+                ("PNG", "*.png"),
+                ("SVG", "*.svg"),
+                ("DXF", "*.dxf"),
+                ("All files", "*.*"),
+            ],
             initialdir=str(current_output.parent),
             initialfile=current_output.name,
         )
@@ -1144,6 +1275,15 @@ class BirthFlowerApp:
             selected_formats = self._selected_output_formats()
         except ValueError as exc:
             messagebox.showerror("输出格式", str(exc))
+            return
+
+        selected_flower_path = self._selected_flower_path()
+        if (
+            selected_flower_path is not None
+            and selected_flower_path.suffix.casefold() in IMPORTABLE_BITMAP_SUFFIXES
+            and "dxf" in selected_formats
+        ):
+            messagebox.showerror("输出格式", "位图素材无法导出 DXF；请取消 DXF，或导入纯矢量 SVG 素材。")
             return
 
         unmapped_glyphs = _unmapped_glyph_override_labels(glyph_result.glyph_overrides)
@@ -1390,6 +1530,7 @@ class BirthFlowerApp:
         if canvas is None:
             return
         canvas.delete("all")
+        self.preview_text_images.clear()
         try:
             layout = layout_from_values(self.layout_vars)
         except ValueError:
@@ -1410,6 +1551,7 @@ class BirthFlowerApp:
         text_layout = layout_personalization_text(name, layout, self.personalization_type_var.get(), self._selected_font_path())
         preview_size = max(8, round(text_layout.final_font_size * scale))
         preview_family = self._selected_preview_font_family()
+        font_path = self._selected_font_path()
         line_height = text_layout.final_font_size * LINE_HEIGHT_RATIO
         for index, line in enumerate(text_layout.lines):
             if index < len(text_layout.line_origins):
@@ -1417,6 +1559,20 @@ class BirthFlowerApp:
             else:
                 line_x = text_layout.draw_x
                 line_y = text_layout.draw_y + index * line_height
+            fill_bounds = text_layout.text_bounds if text_layout.line_count == 1 else None
+            if self._draw_ink_aligned_preview_text(
+                canvas,
+                line,
+                line_x,
+                line_y,
+                text_layout.final_font_size,
+                font_path,
+                scale,
+                offset_x,
+                offset_y,
+                fill_bounds,
+            ):
+                continue
             canvas.create_text(
                 sx(line_x),
                 sy(line_y),
@@ -1431,9 +1587,58 @@ class BirthFlowerApp:
         self._draw_selection_controls(canvas, layout, sx, sy)
         self._set_readiness_display(self._current_readiness_parse_result(), text_layout)
 
+    def _draw_ink_aligned_preview_text(
+        self,
+        canvas: tk.Canvas,
+        line: str,
+        origin_x: float,
+        origin_y: float,
+        font_size: int,
+        font_path: Path | None,
+        scale: float,
+        offset_x: float,
+        offset_y: float,
+        fill_bounds=None,
+    ) -> bool:
+        """用 Pillow 生成真实墨迹预览图，让黑色字形边界与布局框一致；失败时回退到 Tk 文本。"""
+        try:
+            from PIL import ImageTk
+        except Exception:
+            return False
+        preview_size = max(8, round(font_size * scale))
+        if fill_bounds is not None:
+            image = _preview_text_fill_image(
+                line,
+                preview_size,
+                font_path,
+                max(1, round(fill_bounds.width * scale)),
+                max(1, round(fill_bounds.height * scale)),
+            )
+            if image is None:
+                return False
+            x = offset_x + fill_bounds.left * scale
+            y = offset_y + fill_bounds.top * scale
+        else:
+            image_and_offset = _preview_text_ink_image(line, preview_size, font_path)
+            if image_and_offset is None:
+                return False
+            image, offset_left, offset_top = image_and_offset
+            x = offset_x + (origin_x * scale) + offset_left
+            y = offset_y + (origin_y * scale) + offset_top
+        try:
+            photo = ImageTk.PhotoImage(image)
+        except Exception:
+            return False
+        self.preview_text_images.append(photo)
+        canvas.create_image(x, y, image=photo, anchor="nw", tags=("text_art",))
+        return True
+
     def _draw_flower_preview(self, canvas: tk.Canvas, layout: EngravingLayout, sx, sy) -> None:
         asset_path = self._selected_flower_path()
         if asset_path is None:
+            return
+        if asset_path.suffix.casefold() in IMPORTABLE_BITMAP_SUFFIXES:
+            self._draw_bitmap_flower_preview(canvas, asset_path, layout, sx, sy)
             return
         try:
             polylines = self.preview_cache.polylines(asset_path, layout)
@@ -1445,6 +1650,28 @@ class BirthFlowerApp:
                 points.extend((sx(x), sy(y)))
             if len(points) >= 4:
                 canvas.create_line(*points, fill="#555555", width=1, smooth=False, tags=("flower_art",))
+
+    def _draw_bitmap_flower_preview(self, canvas: tk.Canvas, asset_path: Path, layout: EngravingLayout, sx, sy) -> None:
+        try:
+            from PIL import Image, ImageTk
+        except Exception:
+            return
+        try:
+            image = Image.open(asset_path).convert("RGBA")
+        except Exception:
+            return
+        target_width = max(1, round(sx(layout.flower_x + layout.flower_width) - sx(layout.flower_x)))
+        target_height = max(1, round(sy(layout.flower_y + layout.flower_height) - sy(layout.flower_y)))
+        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+        image.thumbnail((target_width, target_height), resampling)
+        try:
+            photo = ImageTk.PhotoImage(image)
+        except Exception:
+            return
+        self.preview_text_images.append(photo)
+        x = sx(layout.flower_x) + (target_width - image.width) / 2
+        y = sy(layout.flower_y) + (target_height - image.height) / 2
+        canvas.create_image(x, y, image=photo, anchor="nw", tags=("flower_art",))
 
     def _draw_visual_debug(self, canvas: tk.Canvas, layout: EngravingLayout, text_layout, sx, sy) -> None:
         asset_path = self._selected_flower_path()
@@ -1648,6 +1875,54 @@ class BirthFlowerApp:
     def _on_canvas_release(self, _event) -> None:
         self._drag_target = None
         self._drag_start = None
+
+
+def _preview_text_ink_image(text: str, font_size: int, font_path: Path | None):
+    """返回裁剪到真实黑色墨迹的 RGBA 图片及其相对文字 origin 的偏移，供 Tk 预览精准贴合方框。"""
+    if not text:
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return None
+    try:
+        font = ImageFont.truetype(str(font_path), font_size) if font_path is not None else ImageFont.load_default(size=font_size)
+    except Exception:
+        try:
+            font = ImageFont.load_default(size=font_size)
+        except TypeError:
+            font = ImageFont.load_default()
+    bbox = measure_text_ink_bbox(text, font_size, font_path)
+    if bbox.width <= 0 or bbox.height <= 0:
+        return None
+    width = max(1, int(bbox.width) + 1)
+    height = max(1, int(bbox.height) + 1)
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.text((-bbox.left, -bbox.top), text, font=font, fill="#111111")
+    alpha_bbox = image.getbbox()
+    if alpha_bbox is None:
+        return None
+    cropped = image.crop(alpha_bbox)
+    return cropped, bbox.left + alpha_bbox[0], bbox.top + alpha_bbox[1]
+
+
+def _preview_text_fill_image(text: str, font_size: int, font_path: Path | None, target_width: int, target_height: int):
+    """把裁剪后的真实墨迹图非等比拉伸到目标方框尺寸，确保预览墨迹四边贴合方框。"""
+    image_and_offset = _preview_text_ink_image(text, font_size, font_path)
+    if image_and_offset is None:
+        return None
+    image, _offset_left, _offset_top = image_and_offset
+    target_size = (max(1, int(target_width)), max(1, int(target_height)))
+    if image.size == target_size:
+        return image
+    try:
+        from PIL import Image
+
+        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+    except Exception:
+        resampling = 1
+    return image.resize(target_size, resampling)
 
 
 def main() -> None:

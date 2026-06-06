@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from models import BirthFlowerDesign, EngravingLayout
 from renderer import PreviewCache, flower_preview_polylines, render_dxf, render_png, render_svg
 
@@ -63,6 +65,42 @@ def test_render_png_uses_layout_canvas_size(tmp_path, monkeypatch):
     render_png(design, output_path)
 
     assert created_sizes[0] == (1372, 1280)
+
+
+def test_render_png_does_not_draw_month_footer_label(tmp_path, monkeypatch):
+    output_path = tmp_path / "birth-flower.png"
+    drawn_texts = []
+
+    class FakeImage:
+        def __init__(self, size):
+            self.size = size
+
+        def save(self, path):
+            Path(path).write_bytes(b"fake png")
+
+    class FakeDraw:
+        def ellipse(self, *_args, **_kwargs):
+            return None
+
+        def text(self, _position, text, **_kwargs):
+            drawn_texts.append(text)
+
+    def fake_new(_mode, size, _color):
+        return FakeImage(size)
+
+    image_module = SimpleNamespace(new=fake_new)
+    draw_module = SimpleNamespace(Draw=lambda _image: FakeDraw())
+    font_module = SimpleNamespace(load_default=lambda: object())
+    monkeypatch.setitem(sys.modules, "PIL", SimpleNamespace(Image=image_module, ImageDraw=draw_module, ImageFont=font_module))
+    monkeypatch.setitem(sys.modules, "PIL.Image", image_module)
+    monkeypatch.setitem(sys.modules, "PIL.ImageDraw", draw_module)
+    monkeypatch.setitem(sys.modules, "PIL.ImageFont", font_module)
+    design = BirthFlowerDesign(text="hwl", month=1, font=2, flower=1)
+
+    render_png(design, output_path)
+
+    assert "hwl" in drawn_texts
+    assert "January Birth Flower" not in drawn_texts
 
 
 def test_render_png_draws_selected_flower_svg_polylines(tmp_path, monkeypatch):
@@ -230,6 +268,42 @@ def test_render_svg_allows_extended_indexes_when_asset_and_font_paths_are_select
     assert "CustomFont.ttf" in svg
 
 
+def test_render_svg_embeds_selected_bitmap_flower_with_vector_warning(tmp_path):
+    flower_path = tmp_path / "Imported.png"
+    flower_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    output_path = tmp_path / "bitmap.svg"
+    design = BirthFlowerDesign(
+        text="Iris",
+        month=4,
+        font=1,
+        flower=9,
+        flower_asset_path=flower_path,
+        flower_name="Imported",
+    )
+
+    render_svg(design, output_path)
+
+    svg = output_path.read_text(encoding="utf-8")
+    assert "不是纯矢量" in svg
+    assert "data:image/png;base64," in svg
+    assert "Imported" in svg
+
+
+def test_render_dxf_rejects_bitmap_flower_with_clear_error(tmp_path):
+    flower_path = tmp_path / "Imported.jpg"
+    flower_path.write_bytes(b"jpeg")
+    design = BirthFlowerDesign(
+        text="Iris",
+        month=4,
+        font=1,
+        flower=9,
+        flower_asset_path=flower_path,
+    )
+
+    with pytest.raises(ValueError, match="位图素材无法导出 DXF"):
+        render_dxf(design, tmp_path / "bitmap.dxf")
+
+
 def test_render_dxf_creates_engraving_file_with_flower_paths_and_text(tmp_path):
     flower_path = tmp_path / "DaffodilMarch.svg"
     flower_path.write_text(
@@ -298,7 +372,24 @@ def test_render_dxf_does_not_non_uniformly_stretch_text_width(tmp_path):
     render_dxf(design, output_path)
 
     dxf = output_path.read_text(encoding="utf-8")
-    assert "\n41\n" not in dxf
+    assert "\n41\n" in dxf
+
+
+def test_render_svg_scales_single_line_text_to_fill_layout_box(tmp_path):
+    output_path = tmp_path / "wide-text.svg"
+    design = BirthFlowerDesign(
+        text="Hi",
+        month=6,
+        font=1,
+        flower=1,
+        layout=EngravingLayout(text_x=1000, text_y=900, text_width=500, text_height=120),
+    )
+
+    render_svg(design, output_path)
+
+    svg = output_path.read_text(encoding="utf-8")
+    assert 'transform="translate(1000 900) scale(' in svg
+    assert 'id="text-art"' in svg
 
 
 def test_render_svg_wraps_message_text_with_smaller_font(tmp_path):

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from html import escape
 import math
+import mimetypes
 from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
@@ -39,6 +41,7 @@ DEFAULT_LAYOUT = EngravingLayout()
 USE_VISUAL_BBOX_FOR_SVG = True
 SVG_FIT_MODE = "contain"
 DEBUG_VISUAL_BBOX = False
+BITMAP_ASSET_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
 @dataclass(frozen=True)
@@ -116,7 +119,10 @@ def render_dxf(design: BirthFlowerDesign, output_path: Path | str) -> Path:
 
     entities: list[str] = []
     if design.flower_asset_path is not None:
-        for polyline in _flower_polylines(Path(design.flower_asset_path), design.layout):
+        flower_path = Path(design.flower_asset_path)
+        if _is_bitmap_asset(flower_path):
+            raise ValueError("位图素材无法导出 DXF；请改用 SVG/PNG，或导入纯矢量 SVG。")
+        for polyline in _flower_polylines(flower_path, design.layout):
             if len(polyline) >= 2:
                 entities.append(_dxf_polyline(polyline, "FLOWER"))
     text_layout = layout_personalization_text(design.text, design.layout, design.personalization_type, design.font_path)
@@ -142,7 +148,11 @@ def render_png(design: BirthFlowerDesign, output_path: Path | str) -> Path:
     image = Image.new("RGBA", (output_width, output_height), "#FFF8F0")
     draw = ImageDraw.Draw(image)
     if design.flower_asset_path is not None:
-        _draw_png_svg_flower(draw, Path(design.flower_asset_path), layout)
+        flower_path = Path(design.flower_asset_path)
+        if _is_bitmap_asset(flower_path):
+            _draw_png_bitmap_flower(image, Image, flower_path, layout)
+        else:
+            _draw_png_svg_flower(draw, flower_path, layout)
     else:
         _draw_png_fallback_flower(draw, design.flower)
 
@@ -152,25 +162,29 @@ def render_png(design: BirthFlowerDesign, output_path: Path | str) -> Path:
     offset_y = (output_height - layout.canvas_height * scale) / 2
     # 不内置商业字体；如果用户选择了字体文件，PNG 使用同一字体以接近最终字形效果。
     font = _png_font(ImageFont, design.font_path, max(8, round(text_layout.final_font_size * scale)))
-    line_start = 0
-    for index, line in enumerate(text_layout.lines):
-        if index < len(text_layout.line_origins):
-            line_x, line_y = text_layout.line_origins[index]
-        else:
-            line_x = text_layout.draw_x
-            line_y = text_layout.draw_y + index * text_layout.final_font_size * LINE_HEIGHT_RATIO
-        _draw_png_text_line(
-            image,
-            draw,
-            line,
-            line_start,
-            offset_x + line_x * scale,
-            offset_y + line_y * scale,
-            font,
-            design,
-        )
-        line_start += len(line)
-    draw.text((output_width / 2, output_height * 0.7875), f"{MONTH_NAMES[design.month]} Birth Flower", anchor="mm", fill="#6A625C", font=font)
+    if text_layout.line_count == 1 and text_layout.lines:
+        line = text_layout.lines[0]
+        if not _draw_png_fitted_text_line(image, Image, ImageDraw, line, font, design, text_layout, scale, offset_x, offset_y):
+            _draw_png_text_line(image, draw, line, 0, offset_x + text_layout.draw_x * scale, offset_y + text_layout.draw_y * scale, font, design)
+    else:
+        line_start = 0
+        for index, line in enumerate(text_layout.lines):
+            if index < len(text_layout.line_origins):
+                line_x, line_y = text_layout.line_origins[index]
+            else:
+                line_x = text_layout.draw_x
+                line_y = text_layout.draw_y + index * text_layout.final_font_size * LINE_HEIGHT_RATIO
+            _draw_png_text_line(
+                image,
+                draw,
+                line,
+                line_start,
+                offset_x + line_x * scale,
+                offset_y + line_y * scale,
+                font,
+                design,
+            )
+            line_start += len(line)
     image.save(path)
     return path
 
@@ -210,7 +224,7 @@ def _validate_design(design: BirthFlowerDesign) -> None:
     if design.flower < 1 or (design.flower not in {1, 2} and design.flower_asset_path is None):
         raise ValueError("flower 必须是 1-2，或选择一个实际素材文件")
     if design.flower_asset_path is not None and not Path(design.flower_asset_path).exists():
-        raise ValueError(f"花朵 SVG 不存在：{design.flower_asset_path}")
+        raise ValueError(f"素材文件不存在：{design.flower_asset_path}")
     if design.font_path is not None and not Path(design.font_path).exists():
         raise ValueError(f"字体文件不存在：{design.font_path}")
 
@@ -234,6 +248,27 @@ def _png_font(image_font_module, font_path: Path | None, font_size: int):
     except Exception:
         # 字体损坏或 Pillow 不支持时保留友好降级，不让 PNG 生成崩溃。
         return image_font_module.load_default()
+
+
+def _is_bitmap_asset(path: Path) -> bool:
+    return path.suffix.casefold() in BITMAP_ASSET_SUFFIXES
+
+
+def _draw_png_bitmap_flower(image, image_module, asset_path: Path, layout: EngravingLayout) -> None:
+    """位图素材只能作为图片贴入 PNG；SVG 会明确标注它不是纯矢量。"""
+    try:
+        bitmap = image_module.open(asset_path).convert("RGBA")
+    except Exception as exc:
+        raise RuntimeError(f"位图素材读取失败：{asset_path}") from exc
+    target_size = (max(1, int(layout.flower_width)), max(1, int(layout.flower_height)))
+    resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS", 1)
+    bitmap.thumbnail(target_size, resampling)
+    x = int(layout.flower_x + (layout.flower_width - bitmap.width) / 2)
+    y = int(layout.flower_y + (layout.flower_height - bitmap.height) / 2)
+    if hasattr(image, "alpha_composite"):
+        image.alpha_composite(bitmap, (x, y))
+    else:
+        image.paste(bitmap, (x, y), bitmap)
 
 
 def _draw_png_svg_flower(draw, asset_path: Path, layout: EngravingLayout) -> None:
@@ -277,6 +312,52 @@ def _draw_png_text_line(image, draw, line: str, line_start: int, origin_x: float
         cursor_x += char_width
 
 
+def _draw_png_fitted_text_line(
+    image,
+    image_module,
+    image_draw_module,
+    line: str,
+    font,
+    design: BirthFlowerDesign,
+    text_layout: TextLayoutResult,
+    scale: float,
+    offset_x: float,
+    offset_y: float,
+) -> bool:
+    """单行文字按真实墨迹裁剪并非等比铺满目标框；失败时交回普通文本渲染。"""
+    if not line or not hasattr(image, "alpha_composite"):
+        return False
+    if any(not override.get("codepoint") for override in (design.glyph_overrides or {}).values()):
+        return False
+    ink_bounds = text_layout.ink_bounds
+    if ink_bounds is None or ink_bounds.width <= 0 or ink_bounds.height <= 0:
+        return False
+    width = max(1, math.ceil(ink_bounds.width) + 1)
+    height = max(1, math.ceil(ink_bounds.height) + 1)
+    try:
+        text_image = image_module.new("RGBA", (width, height), (0, 0, 0, 0))
+        text_draw = image_draw_module.Draw(text_image)
+        text_draw.text((-ink_bounds.left, -ink_bounds.top), line, fill="#2E2A27", font=font)
+        alpha_bbox = text_image.getbbox()
+    except Exception:
+        return False
+    if alpha_bbox is None:
+        return False
+    target_size = (
+        max(1, round(text_layout.text_bounds.width * scale)),
+        max(1, round(text_layout.text_bounds.height * scale)),
+    )
+    try:
+        resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS", 1)
+        fitted = text_image.crop(alpha_bbox).resize(target_size, resampling)
+    except Exception:
+        return False
+    x = round(offset_x + text_layout.text_bounds.left * scale)
+    y = round(offset_y + text_layout.text_bounds.top * scale)
+    image.alpha_composite(fitted, (x, y))
+    return True
+
+
 def _paste_unmapped_png_glyph(image, design: BirthFlowerDesign, override: dict, cursor_x: float, center_y: float, char_width: float) -> None:
     if design.font_path is None:
         return
@@ -307,11 +388,20 @@ def _paste_unmapped_png_glyph(image, design: BirthFlowerDesign, override: dict, 
 
 def _svg_text_markup(design: BirthFlowerDesign, font_family: str, text_layout: TextLayoutResult) -> str:
     if text_layout.line_count == 1:
-        text = (
-            f'    <text x="{text_layout.draw_x:g}" y="{text_layout.draw_y:g}" '
-            f'font-family="{font_family}" font-size="{text_layout.final_font_size}" fill="#111111" xml:space="preserve">'
-            f"{escape(text_layout.lines[0])}</text>"
-        )
+        if text_layout.ink_bounds is not None and text_layout.ink_bounds.width > 0 and text_layout.ink_bounds.height > 0:
+            transform = _svg_text_fill_transform(text_layout)
+            text = (
+                f'    <g transform="{transform}">\n'
+                f'      <text x="0" y="0" font-family="{font_family}" font-size="{text_layout.final_font_size}" '
+                f'fill="#111111" xml:space="preserve">{escape(text_layout.lines[0])}</text>\n'
+                f"    </g>"
+            )
+        else:
+            text = (
+                f'    <text x="{text_layout.draw_x:g}" y="{text_layout.draw_y:g}" '
+                f'font-family="{font_family}" font-size="{text_layout.final_font_size}" fill="#111111" xml:space="preserve">'
+                f"{escape(text_layout.lines[0])}</text>"
+            )
         return f'  <g id="text-art">\n{text}\n  </g>'
 
     line_height = text_layout.final_font_size * LINE_HEIGHT_RATIO
@@ -329,12 +419,26 @@ def _svg_text_markup(design: BirthFlowerDesign, font_family: str, text_layout: T
     return "  <g id=\"text-art\">\n" + "\n".join(lines) + "\n  </g>"
 
 
+def _svg_text_fill_transform(text_layout: TextLayoutResult) -> str:
+    ink_bounds = text_layout.ink_bounds
+    if ink_bounds is None:
+        return ""
+    return (
+        f"translate({text_layout.text_bounds.left:g} {text_layout.text_bounds.top:g}) "
+        f"scale({text_layout.render_scale_x:g} {text_layout.render_scale_y:g}) "
+        f"translate({-ink_bounds.left:g} {-ink_bounds.top:g})"
+    )
+
+
 def _dxf_text_entities(design: BirthFlowerDesign, text_layout: TextLayoutResult) -> list[str]:
     layout = design.layout
     if text_layout.line_count == 1:
         center_x = (text_layout.text_bounds.left + text_layout.text_bounds.right) / 2
         center_y = (text_layout.text_bounds.top + text_layout.text_bounds.bottom) / 2
-        return [_dxf_text(text_layout.lines[0], center_x, layout.canvas_height - center_y, text_layout.final_font_size, "TEXT")]
+        vertical_scale = max(0.0001, text_layout.render_scale_y)
+        text_size = text_layout.final_font_size * vertical_scale
+        width_factor = text_layout.render_scale_x / vertical_scale
+        return [_dxf_text(text_layout.lines[0], center_x, layout.canvas_height - center_y, text_size, "TEXT", width_factor)]
 
     center_x = (text_layout.text_bounds.left + text_layout.text_bounds.right) / 2
     entities: list[str] = []
@@ -346,6 +450,8 @@ def _dxf_text_entities(design: BirthFlowerDesign, text_layout: TextLayoutResult)
 
 def _selected_flower_markup(design: BirthFlowerDesign) -> str:
     asset_path = Path(design.flower_asset_path or "")
+    if _is_bitmap_asset(asset_path):
+        return _selected_bitmap_flower_markup(design, asset_path)
     raw_svg = asset_path.read_text(encoding="utf-8")
     attrs, inner = _extract_svg_parts(raw_svg)
     view_box = _svg_content_view_box(asset_path, USE_VISUAL_BBOX_FOR_SVG)
@@ -358,6 +464,18 @@ def _selected_flower_markup(design: BirthFlowerDesign) -> str:
     <svg x="{layout.flower_x}" y="{layout.flower_y}" width="{layout.flower_width}" height="{layout.flower_height}" viewBox="{escape(view_box)}" preserveAspectRatio="xMidYMid meet" {namespace_attrs}>
 {inner}
     </svg>
+  </g>"""
+
+
+def _selected_bitmap_flower_markup(design: BirthFlowerDesign, asset_path: Path) -> str:
+    layout = design.layout
+    mime_type = mimetypes.guess_type(asset_path.name)[0] or "application/octet-stream"
+    encoded = base64.b64encode(asset_path.read_bytes()).decode("ascii")
+    title = escape(design.flower_name or asset_path.stem)
+    return f"""  <g id="flower-art">
+    <title>{title}</title>
+    <metadata>位图素材以图片嵌入，不是纯矢量；如需 DXF 或纯矢量 SVG，请导入矢量 SVG。</metadata>
+    <image x="{layout.flower_x}" y="{layout.flower_y}" width="{layout.flower_width}" height="{layout.flower_height}" href="data:{escape(mime_type)};base64,{encoded}" preserveAspectRatio="xMidYMid meet" />
   </g>"""
 
 
@@ -768,8 +886,11 @@ POLYLINE
 SEQEND"""
 
 
-def _dxf_text(text: str, x: float, y: float, size: float, layer: str) -> str:
+def _dxf_text(text: str, x: float, y: float, size: float, layer: str, width_factor: float = 1.0) -> str:
     clean_text = text.replace("\r", " ").replace("\n", " ").replace("\\", "/")
+    width_factor_markup = ""
+    if width_factor > 0 and abs(width_factor - 1.0) > 0.0001:
+        width_factor_markup = f"\n41\n{width_factor:.4f}"
     return f"""0
 TEXT
 8
@@ -781,7 +902,7 @@ TEXT
 30
 0.0
 40
-{size:.4f}
+{size:.4f}{width_factor_markup}
 1
 {clean_text}
 7
