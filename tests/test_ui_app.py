@@ -12,6 +12,7 @@ from models import FlowerAsset, FontAsset
 from ui_app import (
     APP_COLORS,
     BirthFlowerApp,
+    _preview_text_ink_image,
     _ttf_family_name,
     build_ai_profile_from_settings,
     build_ai_parse_config,
@@ -106,6 +107,18 @@ def test_layout_from_values_parses_numeric_layout_fields():
     assert layout.text_width == 804
     assert layout.text_height == 260
     assert layout.text_size == 190
+
+
+def test_preview_text_ink_image_is_cropped_to_visible_black_pixels():
+    result = _preview_text_ink_image("gyjpq", 64, None)
+
+    assert result is not None
+    image, offset_left, offset_top = result
+    assert image.width > 0
+    assert image.height > 0
+    assert image.getbbox() == (0, 0, image.width, image.height)
+    assert isinstance(offset_left, float)
+    assert isinstance(offset_top, float)
 
 
 def test_ttf_family_name_reads_birthmonth_font_family():

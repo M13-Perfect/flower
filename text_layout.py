@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import math
 import re
 import unicodedata
 
@@ -312,6 +313,9 @@ def _measure_text_ink_bbox_cached(text: str, font_size: int, font_path_key: str)
         draw = ImageDraw.Draw(Image.new("L", (1, 1), 0))
         left, top, right, bottom = (float(value) for value in draw.textbbox((0, 0), text, font=font))
         if right > left and bottom > top:
+            raster_bounds = _rasterized_ink_bbox(Image, ImageDraw, font, text, Bounds(left, top, right, bottom), font_size)
+            if raster_bounds is not None:
+                return raster_bounds
             return Bounds(left, top, right, bottom)
         if text.strip():
             length = float(draw.textlength(text, font=font))
@@ -322,6 +326,23 @@ def _measure_text_ink_bbox_cached(text: str, font_size: int, font_path_key: str)
         if not text.strip():
             return Bounds(0.0, 0.0, 0.0, 0.0)
         return Bounds(0.0, 0.0, _measure_text(text, font_size), _line_height(font_size))
+
+
+def _rasterized_ink_bbox(image_module, image_draw_module, font, text: str, bbox: Bounds, font_size: int) -> Bounds | None:
+    """把文字实际绘制到透明蒙版后取非透明像素 bbox，确保布局按黑色字形墨迹而不是字体行框计算。"""
+    margin = max(4, math.ceil(font_size * 0.08))
+    width = max(1, math.ceil(bbox.width) + margin * 2)
+    height = max(1, math.ceil(bbox.height) + margin * 2)
+    mask = image_module.new("L", (width, height), 0)
+    draw = image_draw_module.Draw(mask)
+    origin_x = margin - bbox.left
+    origin_y = margin - bbox.top
+    draw.text((origin_x, origin_y), text, font=font, fill=255)
+    ink = mask.getbbox()
+    if ink is None:
+        return None
+    left, top, right, bottom = (float(value) for value in ink)
+    return Bounds(left - origin_x, top - origin_y, right - origin_x, bottom - origin_y)
 
 
 def _load_pillow_font(image_font_module, font_path_key: str, font_size: int):
