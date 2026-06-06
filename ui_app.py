@@ -1549,6 +1549,7 @@ class BirthFlowerApp:
         glyph_result = self._resolve_current_glyph()
         name = glyph_result.render_text.strip() or "Name"
         text_layout = layout_personalization_text(name, layout, self.personalization_type_var.get(), self._selected_font_path())
+        self.preview_text_images.clear()
         preview_size = max(8, round(text_layout.final_font_size * scale))
         preview_family = self._selected_preview_font_family()
         font_path = self._selected_font_path()
