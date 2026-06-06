@@ -61,6 +61,21 @@ def test_name_layout_shrinks_to_fit_explicit_text_box_size():
     assert abs((layout.text_bounds.top + layout.text_bounds.bottom) / 2 - 436) < 1
 
 
+def test_name_layout_stretches_ink_bounds_to_fill_explicit_text_box():
+    engraving_layout = EngravingLayout(text_x=500, text_y=400, text_width=300, text_height=90)
+
+    layout = layout_personalization_text("Hi", engraving_layout, personalization_type="name")
+
+    assert layout.did_fit is True
+    assert layout.text_bounds.left == pytest.approx(engraving_layout.text_x)
+    assert layout.text_bounds.top == pytest.approx(engraving_layout.text_y)
+    assert layout.text_bounds.width == pytest.approx(engraving_layout.text_width)
+    assert layout.text_bounds.height == pytest.approx(engraving_layout.text_height)
+    assert layout.ink_bounds is not None
+    assert layout.render_scale_x == pytest.approx(engraving_layout.text_width / layout.ink_bounds.width)
+    assert layout.render_scale_y == pytest.approx(engraving_layout.text_height / layout.ink_bounds.height)
+
+
 def test_name_layout_centers_real_ink_bbox_for_descenders_and_accents():
     font_path = Path("Birthmonth_font.ttf")
     if not font_path.is_file():

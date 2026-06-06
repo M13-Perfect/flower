@@ -1,5 +1,6 @@
 import threading
 import tkinter as tk
+from tkinter import ttk
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,9 +10,13 @@ from config_store import AIProfile
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult
 from models import FlowerAsset, FontAsset
+import ui_app as ui_app_module
 from ui_app import (
     APP_COLORS,
     BirthFlowerApp,
+    IMPORTABLE_ASSET_SUFFIXES,
+    IMPORTABLE_FONT_SUFFIXES,
+    _preview_text_ink_image,
     _ttf_family_name,
     build_ai_profile_from_settings,
     build_ai_parse_config,
@@ -108,6 +113,27 @@ def test_layout_from_values_parses_numeric_layout_fields():
     assert layout.text_size == 190
 
 
+def test_preview_text_ink_image_is_cropped_to_visible_black_pixels():
+    result = _preview_text_ink_image("gyjpq", 64, None)
+
+    assert result is not None
+    image, offset_left, offset_top = result
+    assert image.width > 0
+    assert image.height > 0
+    assert image.getbbox() == (0, 0, image.width, image.height)
+    assert isinstance(offset_left, float)
+    assert isinstance(offset_top, float)
+
+
+def test_preview_text_fill_image_resizes_black_ink_to_target_box():
+    result = ui_app_module._preview_text_fill_image("Hi", 64, None, 240, 80)
+
+    assert result is not None
+    image = result
+    assert image.size == (240, 80)
+    assert image.getbbox() == (0, 0, 240, 80)
+
+
 def test_ttf_family_name_reads_birthmonth_font_family():
     font_path = Path("Birthmonth_font.ttf")
     if not font_path.is_file():
@@ -162,11 +188,20 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         assert app.preview_canvas.bind("<Delete>")
         assert app.preview_canvas.bind("<BackSpace>")
         menu = root.nametowidget(root.cget("menu"))
+        file_menu = None
         edit_menu = None
         for index in range(menu.index("end") + 1):
+            if menu.type(index) == "cascade" and menu.entrycget(index, "label") == "文件":
+                file_menu = root.nametowidget(menu.entrycget(index, "menu"))
             if menu.type(index) == "cascade" and menu.entrycget(index, "label") == "编辑":
                 edit_menu = root.nametowidget(menu.entrycget(index, "menu"))
-                break
+        assert file_menu is not None
+        file_labels = [
+            file_menu.entrycget(index, "label")
+            for index in range(file_menu.index("end") + 1)
+            if file_menu.type(index) != "separator"
+        ]
+        assert "导入" in file_labels
         assert edit_menu is not None
         edit_labels = [
             edit_menu.entrycget(index, "label")
@@ -177,9 +212,9 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         visible_texts = _widget_texts(root)
         assert "内容" in visible_texts
         assert "区分大小写" in visible_texts
-        assert "添加" in visible_texts
-        assert "画布宽" in visible_texts
-        assert "画布高" in visible_texts
+        assert "添加" not in visible_texts
+        assert "画布宽" not in visible_texts
+        assert "画布高" not in visible_texts
         assert "字宽" in visible_texts
         assert "字高" in visible_texts
         assert "字号" not in visible_texts
@@ -196,7 +231,7 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         root.destroy()
 
 
-def test_add_buttons_put_selected_asset_and_font_on_canvas():
+def test_import_asset_dispatches_font_and_flower_paths(monkeypatch, tmp_path):
     try:
         root = tk.Tk()
     except tk.TclError:
@@ -204,24 +239,110 @@ def test_add_buttons_put_selected_asset_and_font_on_canvas():
 
     try:
         app = BirthFlowerApp(root)
-        flower_label = "1 - Snowdrop | SnowdropJanuary.svg"
-        font_label = "Font 2 - Script"
-        app.flower_label_map = {
-            flower_label: FlowerAsset(name="Snowdrop", month=1, flower=1, path=Path("missing.svg"))
-        }
-        app.font_label_map = {
-            font_label: FontAsset(name="Script", index=2, path=Path("missing.ttf"))
-        }
-        app.flower_asset_var.set(flower_label)
-        app.font_asset_var.set(font_label)
+        font_path = tmp_path / "Custom.ttf"
+        flower_path = tmp_path / "Custom.svg"
+        font_path.write_bytes(b"font")
+        flower_path.write_text("<svg/>", encoding="utf-8")
+        calls = []
 
-        app._add_selected_flower_to_canvas()
-        app._add_selected_font_to_canvas()
+        def fake_import(path):
+            calls.append(Path(path))
 
-        assert app.month_var.get() == "1"
-        assert app.flower_var.get() == "1"
-        assert app.font_var.get() == "2"
+        monkeypatch.setattr(app, "_import_font_file", fake_import)
+        monkeypatch.setattr(app, "_import_flower_file", fake_import)
+
+        app._import_asset_path(font_path)
+        app._import_asset_path(flower_path)
+
+        assert calls == [font_path, flower_path]
+        assert ".ttf" in IMPORTABLE_FONT_SUFFIXES
+        assert ".svg" in IMPORTABLE_ASSET_SUFFIXES
+    finally:
+        root.destroy()
+
+
+def test_import_font_file_selects_font_and_text(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        font_path = tmp_path / "Script.ttf"
+        font_path.write_bytes(b"font")
+        font_asset = FontAsset(name="Script", index=5, path=font_path)
+        monkeypatch.setattr(ui_app_module, "scan_font_assets", lambda _path: [font_asset])
+        monkeypatch.setattr(app, "_save_current_config", lambda: None)
+
+        app._import_font_file(font_path)
+
+        assert app.font_source_var.get() == str(font_path)
+        assert app.font_assets == [font_asset]
+        assert app.font_var.get() == "5"
         assert app.selected_preview_item == "text"
+    finally:
+        root.destroy()
+
+
+def test_import_flower_file_selects_asset_and_flower(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        flower_path = tmp_path / "Custom.svg"
+        flower_path.write_text("<svg/>", encoding="utf-8")
+        flower_asset = FlowerAsset(name="Custom", month=12, flower=9, path=flower_path)
+        monkeypatch.setattr(ui_app_module, "scan_flower_assets", lambda _path: [flower_asset])
+        monkeypatch.setattr(app, "_save_current_config", lambda: None)
+
+        app._import_flower_file(flower_path)
+
+        assert app.flower_dir_var.get() == str(tmp_path)
+        assert app.flower_assets == [flower_asset]
+        assert app.month_var.get() == "12"
+        assert app.flower_var.get() == "9"
+        assert app.selected_preview_item == "flower"
+    finally:
+        root.destroy()
+
+
+def test_confirm_rejects_bitmap_flower_when_dxf_is_selected(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        flower_path = tmp_path / "Imported.png"
+        flower_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        asset = FlowerAsset(name="Imported", month=4, flower=9, path=flower_path)
+        app.name_var.set("Iris")
+        app.month_var.set("4")
+        app.flower_var.set("9")
+        app.font_var.set("1")
+        app.flower_assets = [asset]
+        app._refresh_flower_choices()
+        label = app._flower_label(asset)
+        app.flower_asset_var.set(label)
+        app.output_format_vars["png"].set(False)
+        app.output_format_vars["svg"].set(False)
+        app.output_format_vars["dxf"].set(True)
+        errors = []
+        asked = []
+
+        monkeypatch.setattr(ui_app_module.messagebox, "showerror", lambda title, message: errors.append((title, message)))
+        monkeypatch.setattr(ui_app_module.messagebox, "askyesno", lambda *_args, **_kwargs: asked.append(True))
+
+        app.confirm_and_generate()
+
+        assert errors
+        assert "位图素材无法导出 DXF" in errors[0][1]
+        assert asked == []
     finally:
         root.destroy()
 
@@ -317,6 +438,31 @@ def test_font_settings_uses_one_choose_font_button():
         assert "选择字体" in texts
         assert "选择字体文件" not in texts
         assert "选择字体目录" not in texts
+    finally:
+        root.destroy()
+
+
+def test_output_settings_exposes_format_path_and_resolution():
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        app.open_settings()
+        root.update_idletasks()
+        settings_window = [child for child in root.winfo_children() if isinstance(child, tk.Toplevel)][-1]
+        notebook = next(child for child in settings_window.winfo_children() if isinstance(child, ttk.Notebook))
+        tab_texts = [notebook.tab(index, "text") for index in range(len(notebook.tabs()))]
+        texts = _widget_texts(root)
+
+        assert "输出设置" in tab_texts
+        assert "输出格式" in texts
+        assert "输出路径" in texts
+        assert "输出分辨率" in texts
+        assert "画布宽" in texts
+        assert "画布高" in texts
     finally:
         root.destroy()
 
