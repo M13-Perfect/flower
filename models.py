@@ -124,11 +124,14 @@ class Layer:
 
 @dataclass
 class ImageLayer(Layer):
-    """PNG/JPG/SVG 素材图层；导出 SVG 时 SVG 素材尽量保留为独立结构。"""
+    """PNG/JPG/SVG 素材图层；每个素材图层持有独立几何参数和素材信息。"""
 
     path: Path | None = None
     type: str = "image"
     preserve_svg: bool = True
+    material_id: str = ""
+    material_name: str = ""
+    lock_aspect_ratio: bool = True
 
 
 @dataclass
@@ -201,6 +204,9 @@ def add_image_layer(
     y: float = 0,
     width: float = 300,
     height: float = 300,
+    material_id: str = "",
+    material_name: str = "",
+    lock_aspect_ratio: bool = True,
 ) -> ImageLayer:
     """添加素材永远创建新 ImageLayer，绝不覆盖已有图层或旧选择。"""
     asset_path = Path(path)
@@ -212,6 +218,9 @@ def add_image_layer(
         width=width,
         height=height,
         z_index=len(document.layers),
+        material_id=material_id or asset_path.stem,
+        material_name=material_name or name or asset_path.stem,
+        lock_aspect_ratio=lock_aspect_ratio,
     )
     document.layers.append(layer)
     document.selected_layer_id = layer.id

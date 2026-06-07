@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from models import EngravingLayout
+
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = APP_DIR / "birth_flower_config.json"
@@ -36,6 +38,7 @@ class AppConfig:
     output_formats: tuple[str, ...] = DEFAULT_OUTPUT_FORMATS
     ai_profiles: tuple[AIProfile, ...] = (AIProfile(),)
     active_ai_profile: str = DEFAULT_AI_PROFILE_NAME
+    layout_defaults: EngravingLayout = EngravingLayout()
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
@@ -61,6 +64,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         output_formats=normalize_output_formats(payload.get("output_formats")),
         ai_profiles=profiles,
         active_ai_profile=active_profile,
+        layout_defaults=_layout_from_payload(payload.get("layout_defaults")),
     )
 
 
@@ -75,10 +79,58 @@ def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Pa
         "output_formats": list(normalize_output_formats(config.output_formats)),
         "ai_profiles": [_ai_profile_to_payload(profile) for profile in config.ai_profiles],
         "active_ai_profile": active_ai_profile(config).name,
+        "layout_defaults": _layout_to_payload(config.layout_defaults),
     }
     config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return config_path
 
+
+
+def _layout_from_payload(payload: Any) -> EngravingLayout:
+    """从配置文件恢复全局默认布局；字段缺失或非法时使用项目默认值。"""
+    default = EngravingLayout()
+    if not isinstance(payload, dict):
+        return default
+    values: dict[str, int] = {}
+    for field in (
+        "canvas_width",
+        "canvas_height",
+        "flower_x",
+        "flower_y",
+        "flower_width",
+        "flower_height",
+        "text_x",
+        "text_y",
+        "text_width",
+        "text_height",
+        "text_size",
+    ):
+        raw = payload.get(field, getattr(default, field))
+        try:
+            values[field] = int(raw)
+        except (TypeError, ValueError):
+            values[field] = getattr(default, field)
+    try:
+        return EngravingLayout(**values)
+    except TypeError:
+        return default
+
+
+def _layout_to_payload(layout: EngravingLayout) -> dict[str, int]:
+    """把全局默认布局写入配置；只保存数值，不保存任何图层快照。"""
+    return {
+        "canvas_width": layout.canvas_width,
+        "canvas_height": layout.canvas_height,
+        "flower_x": layout.flower_x,
+        "flower_y": layout.flower_y,
+        "flower_width": layout.flower_width,
+        "flower_height": layout.flower_height,
+        "text_x": layout.text_x,
+        "text_y": layout.text_y,
+        "text_width": layout.text_width,
+        "text_height": layout.text_height,
+        "text_size": layout.text_size,
+    }
 
 def normalize_output_formats(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
     normalized: list[str] = []
