@@ -67,3 +67,29 @@ def test_delete_selected_layer_updates_selection(tmp_path):
 
     assert removed is second
     assert document.selected_layer_id == first.id
+
+
+def test_image_layer_stores_independent_material_geometry(tmp_path):
+    document = Document()
+    layer = add_image_layer(
+        document,
+        tmp_path / "rose.svg",
+        name="Rose layer",
+        x=10,
+        y=20,
+        width=300,
+        height=400,
+        material_id="rose-1",
+        material_name="Rose June",
+    )
+
+    layer.x = 99
+    layer.width = 199
+
+    assert layer.material_id == "rose-1"
+    assert layer.material_name == "Rose June"
+    assert layer.x == 99
+    assert layer.y == 20
+    assert layer.width == 199
+    assert layer.height == 400
+    assert layer.lock_aspect_ratio is True
