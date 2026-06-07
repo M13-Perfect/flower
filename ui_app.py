@@ -10,17 +10,18 @@ import threading
 from collections.abc import Callable, Mapping
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from types import SimpleNamespace
 from typing import TypeVar
 
 from asset_resolver import find_flower_asset, scan_flower_assets, scan_font_assets
 from config_store import AIProfile, AppConfig, active_ai_profile, load_config, normalize_output_path, save_config
 from generation_readiness import GenerationReadiness, build_generation_readiness
 from glyph_service import GlyphApplyResult, GlyphMapConfig, check_runtime_dependencies, codepoint_to_char, normalize_codepoint, resolve_glyph
-from models import AIParseConfig, BirthFlowerDesign, EngravingLayout, FlowerAsset, FontAsset, ParseResult
+from models import AIParseConfig, BirthFlowerDesign, Document, EngravingLayout, FlowerAsset, FontAsset, ImageLayer, TextLayer, ParseResult, add_image_layer, add_text_layer, delete_layer, hit_test, move_layer
 from order_importer import load_order_remark_from_file
 from parse_pipeline import parse_order_remark_auto
 from gpt_parser import DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, parse_order_remark_with_gpt
-from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_dxf, render_png, render_svg
+from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_document_png, render_document_svg, render_dxf, render_png, render_svg
 from text_layout import LINE_HEIGHT_RATIO, measure_text_ink_bbox, layout_personalization_text
 
 
@@ -428,6 +429,14 @@ class BirthFlowerApp:
         # 保存 PhotoImage 引用，避免 Tk 垃圾回收后预览文字消失。
         self.preview_text_images: list[object] = []
         default_layout = EngravingLayout()
+        # 多图层文档是画布的真实数据源；旧版字段继续保留，保证订单解析和月份/字体选择兼容。
+        self.document = Document(default_layout.canvas_width, default_layout.canvas_height)
+        self.history_manager = None  # 预留 Ctrl+Z/Ctrl+Y 历史管理入口。
+        self.layers_listbox: tk.Listbox | None = None
+        self.layer_detail_var = tk.StringVar(value="未选择图层")
+        self.layer_text_var = tk.StringVar()
+        self.layer_font_size_var = tk.StringVar(value=str(default_layout.text_size))
+        self.layer_color_var = tk.StringVar(value="#111111")
         self.layout_vars = {
             "canvas_width": tk.StringVar(value=str(default_layout.canvas_width)),
             "canvas_height": tk.StringVar(value=str(default_layout.canvas_height)),
@@ -449,6 +458,7 @@ class BirthFlowerApp:
         self.section_frames: dict[str, tk.Widget] = {}
         self._drag_target: str | None = None
         self._drag_start: tuple[int, int] | None = None
+        self._drag_mode: str = "move"
         self.selected_preview_item: str | None = None
         self.last_parse_result: ParseResult | None = None
         self.glyph_config = GlyphMapConfig.load()
@@ -492,6 +502,14 @@ class BirthFlowerApp:
         menu_bar.add_cascade(label="帮助", menu=help_menu)
         self.root.config(menu=menu_bar)
         self.root.bind("<Control-comma>", lambda _event: self.open_settings())
+        self.root.bind("<Delete>", lambda _event: self._delete_selected_layer())
+        self.root.bind("<BackSpace>", lambda _event: self._delete_selected_layer())
+        self.root.bind("<Left>", lambda _event: self._nudge_selected_layer(-1, 0))
+        self.root.bind("<Right>", lambda _event: self._nudge_selected_layer(1, 0))
+        self.root.bind("<Up>", lambda _event: self._nudge_selected_layer(0, -1))
+        self.root.bind("<Down>", lambda _event: self._nudge_selected_layer(0, 1))
+        self.root.bind("<Control-z>", lambda _event: self.status_var.set("撤销历史已预留，后续版本启用"))
+        self.root.bind("<Control-y>", lambda _event: self.status_var.set("重做历史已预留，后续版本启用"))
 
     def _add_row(self, parent: ttk.LabelFrame, row: int, label: str, widget: ttk.Widget) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
@@ -586,8 +604,35 @@ class BirthFlowerApp:
         production_panel = self._build_production_panel(content)
         order_panel.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         production_panel.grid(row=1, column=0, sticky="ew")
+        layers_panel = self._build_layers_panel(content)
+        layers_panel.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         content.columnconfigure(0, weight=1)
         return panel, order_panel, production_panel
+
+
+    def _build_layers_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
+        """右下角图层面板：负责选择、显隐、锁定、删除和调整层级。"""
+        panel = ttk.LabelFrame(parent, text="图层", padding=10, style="Panel.TLabelframe")
+        panel.columnconfigure(0, weight=1)
+        self.layers_listbox = tk.Listbox(panel, height=7, exportselection=False)
+        self.layers_listbox.grid(row=0, column=0, columnspan=5, sticky="ew")
+        self.layers_listbox.bind("<<ListboxSelect>>", self._on_layer_list_select)
+        ttk.Button(panel, text="显/隐", command=self._toggle_selected_layer_visible).grid(row=1, column=0, sticky="ew", pady=3)
+        ttk.Button(panel, text="锁/解", command=self._toggle_selected_layer_locked).grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Button(panel, text="删除", command=self._delete_selected_layer).grid(row=1, column=2, sticky="ew", pady=3)
+        ttk.Button(panel, text="上移", command=lambda: self._move_selected_layer("up")).grid(row=2, column=0, sticky="ew", pady=3)
+        ttk.Button(panel, text="下移", command=lambda: self._move_selected_layer("down")).grid(row=2, column=1, sticky="ew", pady=3)
+        ttk.Button(panel, text="置顶", command=lambda: self._move_selected_layer("top")).grid(row=2, column=2, sticky="ew", pady=3)
+        ttk.Button(panel, text="置底", command=lambda: self._move_selected_layer("bottom")).grid(row=2, column=3, sticky="ew", pady=3)
+        ttk.Label(panel, textvariable=self.layer_detail_var, style="Status.TLabel", wraplength=240).grid(row=3, column=0, columnspan=5, sticky="ew")
+        ttk.Label(panel, text="文本").grid(row=4, column=0, sticky="w", pady=(6, 2))
+        ttk.Entry(panel, textvariable=self.layer_text_var).grid(row=4, column=1, columnspan=4, sticky="ew", pady=(6, 2))
+        ttk.Label(panel, text="字号").grid(row=5, column=0, sticky="w", pady=2)
+        ttk.Entry(panel, textvariable=self.layer_font_size_var, width=8).grid(row=5, column=1, sticky="ew", pady=2)
+        ttk.Label(panel, text="颜色").grid(row=5, column=2, sticky="w", pady=2)
+        ttk.Entry(panel, textvariable=self.layer_color_var, width=10).grid(row=5, column=3, sticky="ew", pady=2)
+        ttk.Button(panel, text="应用文本属性", command=self._apply_text_layer_properties).grid(row=5, column=4, sticky="ew", pady=2)
+        return panel
 
     def _build_order_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
         panel = ttk.LabelFrame(parent, text="订单与解析", padding=12, style="Panel.TLabelframe")
@@ -646,8 +691,8 @@ class BirthFlowerApp:
         self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", lambda _event: self._redraw_preview())
-        self.preview_canvas.bind("<Delete>", lambda _event: self._delete_selected_preview_item())
-        self.preview_canvas.bind("<BackSpace>", lambda _event: self._delete_selected_preview_item())
+        self.preview_canvas.bind("<Delete>", lambda _event: self._delete_selected_layer())
+        self.preview_canvas.bind("<BackSpace>", lambda _event: self._delete_selected_layer())
         return panel
 
     def _build_production_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -665,6 +710,10 @@ class BirthFlowerApp:
         self.font_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_font_combo_selected())
         ttk.Label(asset_group, text="字体类型").grid(row=1, column=0, sticky="w", pady=4)
         self.font_combo.grid(row=1, column=1, sticky="ew", pady=4)
+        action_row = ttk.Frame(asset_group)
+        action_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(action_row, text="添加素材为新图层", command=self._add_selected_flower_to_canvas).pack(side="left")
+        ttk.Button(action_row, text="添加文本", command=self._add_text_layer_from_fields).pack(side="left", padx=(8, 0))
 
         layout_group = ttk.LabelFrame(panel, text="布局参数", padding=10, style="Panel.TLabelframe")
         layout_group.grid(row=1, column=0, sticky="ew")
@@ -1021,10 +1070,9 @@ class BirthFlowerApp:
         self.flower_asset_var.set(label)
         self.month_var.set(str(asset.month))
         self.flower_var.set(str(asset.flower))
-        self.selected_preview_item = "flower"
         if asset.embedded_raster_warnings:
             self._set_warnings(list(asset.embedded_raster_warnings))
-        self._redraw_preview()
+        self._add_selected_flower_to_canvas()
 
     def _select_imported_font_asset(self, asset: FontAsset) -> None:
         label = self._font_label(asset)
@@ -1036,8 +1084,7 @@ class BirthFlowerApp:
         self.current_glyph_overrides.clear()
         self.selected_glyph_position = None
         self.font_var.set(str(asset.index))
-        self.selected_preview_item = "text"
-        self._redraw_preview()
+        self._add_text_layer_from_fields()
 
     def parse_remark(self) -> None:
         remark = self.remark_var.get()
@@ -1305,7 +1352,11 @@ class BirthFlowerApp:
             base_output_path = normalize_output_path(self.output_var.get())
             for output_format in selected_formats:
                 target_path = output_path_for_format(base_output_path, output_format)
-                if output_format == "svg":
+                if self.document.layers and output_format == "svg":
+                    generated_paths.append(render_document_svg(self.document, target_path))
+                elif self.document.layers and output_format == "png":
+                    generated_paths.append(render_document_png(self.document, target_path))
+                elif output_format == "svg":
                     generated_paths.append(render_svg(design, target_path))
                 elif output_format == "dxf":
                     generated_paths.append(render_dxf(design, target_path))
@@ -1352,6 +1403,106 @@ class BirthFlowerApp:
         self.status_var.set(text)
         self.warning_var.set(text)
 
+
+    def _refresh_layers_panel(self) -> None:
+        """刷新右下角图层面板，显示名称、类型、显隐和锁定状态。"""
+        listbox = self.layers_listbox
+        if listbox is None:
+            return
+        listbox.delete(0, "end")
+        for layer in reversed(self.document.layers):
+            visible = "👁" if layer.visible else "🚫"
+            locked = "🔒" if layer.locked else "🔓"
+            listbox.insert("end", f"{visible} {locked} {layer.name} [{layer.type}]")
+        selected = self.document.selected_layer()
+        if selected is not None:
+            panel_index = len(self.document.layers) - 1 - self.document.layers.index(selected)
+            listbox.selection_set(panel_index)
+            self.layer_detail_var.set(f"已选：{selected.name} ({selected.type})")
+            self._sync_layer_properties(selected)
+        else:
+            self.layer_detail_var.set("未选择图层")
+
+    def _on_layer_list_select(self, _event=None) -> None:
+        listbox = self.layers_listbox
+        if listbox is None:
+            return
+        selection = listbox.curselection()
+        if not selection:
+            return
+        layer_index = len(self.document.layers) - 1 - selection[0]
+        if 0 <= layer_index < len(self.document.layers):
+            layer = self.document.layers[layer_index]
+            self.document.selected_layer_id = layer.id
+            self.selected_preview_item = layer.id
+            self._sync_layer_properties(layer)
+            self._redraw_preview()
+
+    def _sync_layer_properties(self, layer) -> None:
+        if isinstance(layer, TextLayer):
+            self.layer_text_var.set(layer.text)
+            self.layer_font_size_var.set(str(layer.font_size))
+            self.layer_color_var.set(layer.color)
+        else:
+            self.layer_text_var.set("")
+
+    def _toggle_selected_layer_visible(self) -> None:
+        layer = self.document.selected_layer()
+        if layer is None:
+            self.status_var.set("未选择有效图层")
+            return
+        layer.visible = not layer.visible
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def _toggle_selected_layer_locked(self) -> None:
+        layer = self.document.selected_layer()
+        if layer is None:
+            self.status_var.set("未选择有效图层")
+            return
+        layer.locked = not layer.locked
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def _delete_selected_layer(self) -> None:
+        removed = delete_layer(self.document, self.document.selected_layer_id)
+        if removed is None:
+            self.status_var.set("未选择有效图层，或图层已锁定")
+        self.selected_preview_item = self.document.selected_layer_id
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def _move_selected_layer(self, action: str) -> None:
+        if not move_layer(self.document, self.document.selected_layer_id, action):
+            self.status_var.set("图层无法移动")
+            return
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def _apply_text_layer_properties(self) -> None:
+        layer = self.document.selected_layer()
+        if not isinstance(layer, TextLayer):
+            self.status_var.set("当前选中图层不是文本图层")
+            return
+        layer.text = self.layer_text_var.get()
+        try:
+            layer.font_size = max(1, int(self.layer_font_size_var.get()))
+        except ValueError:
+            messagebox.showerror("文本属性", "字号必须是整数")
+            return
+        layer.color = self.layer_color_var.get().strip() or "#111111"
+        # 文本修改后只更新 TextLayer，自身仍可继续编辑并重新渲染。
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def _nudge_selected_layer(self, dx: int, dy: int) -> None:
+        layer = self.document.selected_layer()
+        if layer is None or layer.locked:
+            return
+        layer.x += dx
+        layer.y += dy
+        self._redraw_preview()
+
     def _scan_assets(self, show_errors: bool) -> None:
         self.flower_assets = scan_flower_assets(Path(self.flower_dir_var.get()))
         self.font_assets = scan_font_assets(Path(self.font_source_var.get()))
@@ -1390,9 +1541,48 @@ class BirthFlowerApp:
         asset = self.flower_label_map.get(self.flower_asset_var.get())
         if asset is None:
             return
+        if not asset.path.is_file():
+            messagebox.showerror("素材错误", f"素材文件不存在：{asset.path}")
+            return
         self.month_var.set(str(asset.month))
         self.flower_var.set(str(asset.flower))
-        self.selected_preview_item = "flower"
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        # 添加素材必须追加 ImageLayer，不能覆盖已存在的素材图层。
+        layer = add_image_layer(
+            self.document,
+            asset.path,
+            name=asset.display_name or asset.name,
+            x=layout.flower_x,
+            y=layout.flower_y,
+            width=layout.flower_width,
+            height=layout.flower_height,
+        )
+        self.selected_preview_item = layer.id
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def _add_text_layer_from_fields(self) -> None:
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        text = self._content_text_for_render().strip() or "Name"
+        layer = add_text_layer(
+            self.document,
+            text,
+            font_path=self._selected_font_path(),
+            x=layout.text_x,
+            y=layout.text_y,
+            width=layout.text_width,
+            height=layout.text_height,
+            font_size=layout.text_size,
+        )
+        self.selected_preview_item = layer.id
+        self._sync_layer_properties(layer)
+        self._refresh_layers_panel()
         self._redraw_preview()
 
     def _on_font_combo_selected(self) -> None:
@@ -1406,7 +1596,10 @@ class BirthFlowerApp:
         self.current_glyph_overrides.clear()
         self.selected_glyph_position = None
         self.font_var.set(str(asset.index))
-        self.selected_preview_item = "text"
+        layer = self.document.selected_layer()
+        if isinstance(layer, TextLayer):
+            layer.font_path = asset.path
+            self._sync_layer_properties(layer)
         self._redraw_preview()
 
     def _select_flower_by_current_fields(self) -> None:
@@ -1544,49 +1737,100 @@ class BirthFlowerApp:
             return offset_y + value * scale
 
         canvas.create_rectangle(sx(0), sy(0), sx(layout.canvas_width), sy(layout.canvas_height), outline="#cccccc")
-        self._draw_flower_preview(canvas, layout, sx, sy)
-
-        glyph_result = self._resolve_current_glyph()
-        name = glyph_result.render_text.strip() or "Name"
-        text_layout = layout_personalization_text(name, layout, self.personalization_type_var.get(), self._selected_font_path())
-        self.preview_text_images.clear()
-        preview_size = max(8, round(text_layout.final_font_size * scale))
-        preview_family = self._selected_preview_font_family()
-        font_path = self._selected_font_path()
-        line_height = text_layout.final_font_size * LINE_HEIGHT_RATIO
-        for index, line in enumerate(text_layout.lines):
-            if index < len(text_layout.line_origins):
-                line_x, line_y = text_layout.line_origins[index]
-            else:
-                line_x = text_layout.draw_x
-                line_y = text_layout.draw_y + index * line_height
-            fill_bounds = text_layout.text_bounds if text_layout.line_count == 1 else None
-            if self._draw_ink_aligned_preview_text(
-                canvas,
-                line,
-                line_x,
-                line_y,
-                text_layout.final_font_size,
-                font_path,
-                scale,
-                offset_x,
-                offset_y,
-                fill_bounds,
-            ):
+        self.document.canvas_width = layout.canvas_width
+        self.document.canvas_height = layout.canvas_height
+        # 画布刷新只读取 Document：先清空，再按图层顺序逐层渲染可见图层。
+        for layer in self.document.sorted_layers():
+            if not layer.visible:
                 continue
-            canvas.create_text(
-                sx(line_x),
-                sy(line_y),
-                text=line,
-                fill="#111111",
-                anchor="nw",
-                font=(preview_family, preview_size),
-                tags=("text_art",),
-            )
+            if isinstance(layer, ImageLayer):
+                self._draw_image_layer_preview(canvas, layer, sx, sy)
+            elif isinstance(layer, TextLayer):
+                self._draw_text_layer_preview(canvas, layer, scale, offset_x, offset_y)
         if DEBUG_VISUAL_BBOX:
+            glyph_result = self._resolve_current_glyph()
+            name = glyph_result.render_text.strip() or "Name"
+            text_layout = layout_personalization_text(name, layout, self.personalization_type_var.get(), self._selected_font_path())
             self._draw_visual_debug(canvas, layout, text_layout, sx, sy)
         self._draw_selection_controls(canvas, layout, sx, sy)
-        self._set_readiness_display(self._current_readiness_parse_result(), text_layout)
+        if self.document.layers:
+            self._set_warnings([])
+        else:
+            glyph_result = self._resolve_current_glyph()
+            name = glyph_result.render_text.strip() or "Name"
+            text_layout = layout_personalization_text(name, layout, self.personalization_type_var.get(), self._selected_font_path())
+            self._set_readiness_display(self._current_readiness_parse_result(), text_layout)
+
+    def _draw_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
+        """预览素材图层；每个 ImageLayer 独立绘制，不再读取单一 current_asset。"""
+        if layer.path is None or not layer.path.exists():
+            return
+        if layer.path.suffix.casefold() in IMPORTABLE_BITMAP_SUFFIXES:
+            self._draw_bitmap_image_layer_preview(canvas, layer, sx, sy)
+            return
+        layout = EngravingLayout(
+            canvas_width=self.document.canvas_width,
+            canvas_height=self.document.canvas_height,
+            flower_x=round(layer.x),
+            flower_y=round(layer.y),
+            flower_width=round(layer.width * layer.scale_x),
+            flower_height=round(layer.height * layer.scale_y),
+        )
+        try:
+            polylines = self.preview_cache.polylines(layer.path, layout)
+        except (OSError, ValueError):
+            return
+        for polyline in polylines:
+            points: list[float] = []
+            for x, y in polyline:
+                points.extend((sx(x), sy(y)))
+            if len(points) >= 4:
+                canvas.create_line(*points, fill="#555555", width=1, smooth=False, tags=("layer_art", f"layer:{layer.id}"))
+
+    def _draw_bitmap_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
+        try:
+            from PIL import Image, ImageTk
+        except Exception:
+            return
+        try:
+            image = Image.open(layer.path).convert("RGBA")
+        except Exception:
+            return
+        target_width = max(1, round((layer.width * layer.scale_x) * (sx(1) - sx(0))))
+        target_height = max(1, round((layer.height * layer.scale_y) * (sy(1) - sy(0))))
+        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+        image.thumbnail((target_width, target_height), resampling)
+        try:
+            photo = ImageTk.PhotoImage(image)
+        except Exception:
+            return
+        self.preview_text_images.append(photo)
+        canvas.create_image(sx(layer.x), sy(layer.y), image=photo, anchor="nw", tags=("layer_art", f"layer:{layer.id}"))
+
+    def _draw_text_layer_preview(self, canvas: tk.Canvas, layer: TextLayer, scale: float, offset_x: float, offset_y: float) -> None:
+        """预览文本图层；使用 Pillow 墨迹边界实现真实视觉居中。"""
+        if self._draw_ink_aligned_preview_text(
+            canvas,
+            layer.text,
+            layer.x,
+            layer.y,
+            layer.font_size,
+            layer.font_path,
+            scale,
+            offset_x,
+            offset_y,
+            SimpleNamespace(left=layer.x, top=layer.y, width=layer.text_box_width, height=layer.text_box_height),
+        ):
+            return
+        canvas.create_text(
+            offset_x + layer.x * scale,
+            offset_y + layer.y * scale,
+            text=layer.text,
+            fill=layer.color,
+            anchor="nw",
+            font=(self._selected_preview_font_family(), max(8, round(layer.font_size * scale))),
+            tags=("layer_art", f"layer:{layer.id}"),
+        )
 
     def _draw_ink_aligned_preview_text(
         self,
@@ -1721,29 +1965,16 @@ class BirthFlowerApp:
         return scale, offset_x, offset_y
 
     def _draw_selection_controls(self, canvas: tk.Canvas, layout: EngravingLayout, sx, sy) -> None:
-        if self.selected_preview_item == "flower" and self._selected_flower_path() is not None:
-            self._draw_selection_box(
-                canvas,
-                sx(layout.flower_x),
-                sy(layout.flower_y),
-                sx(layout.flower_x + layout.flower_width),
-                sy(layout.flower_y + layout.flower_height),
-                "flower",
-            )
-        elif self.selected_preview_item == "text":
-            self._draw_selection_box(
-                canvas,
-                sx(layout.text_x),
-                sy(layout.text_y),
-                sx(layout.text_x + layout.text_width),
-                sy(layout.text_y + layout.text_height),
-                "text",
-            )
+        layer = self.document.selected_layer()
+        if layer is None:
+            return
+        left, top, right, bottom = layer.bounds
+        self._draw_selection_box(canvas, sx(left), sy(top), sx(right), sy(bottom), layer.id)
 
     def _draw_selection_box(self, canvas: tk.Canvas, left: float, top: float, right: float, bottom: float, item: str) -> None:
-        color = "#0d9488" if item == "flower" else "#d97706"
-        box_tag = f"{item}_box"
-        handle_tag = f"{item}_handle"
+        color = "#0d9488"
+        box_tag = "selected_layer_box"
+        handle_tag = "selected_layer_handle"
         canvas.create_rectangle(
             left,
             top,
@@ -1766,26 +1997,31 @@ class BirthFlowerApp:
         )
 
     def _select_preview_item(self, item: str | None) -> None:
-        self.selected_preview_item = item if item in {"flower", "text"} else None
+        if self.document.layer_by_id(item):
+            self.document.selected_layer_id = item
+            self.selected_preview_item = item
+        else:
+            self.document.selected_layer_id = None
+            self.selected_preview_item = None
+        self._refresh_layers_panel()
         self._redraw_preview()
 
     def _delete_selected_preview_item(self) -> None:
-        if self.selected_preview_item == "flower":
-            self.flower_asset_var.set("")
-            self.flower_var.set("0")
-        elif self.selected_preview_item == "text":
-            self.name_var.set("")
-        self.selected_preview_item = None
-        self._redraw_preview()
+        self._delete_selected_layer()
 
     def _on_canvas_double_click(self, event) -> None:
         canvas = self.preview_canvas
         if canvas is None:
             return
-        item = canvas.find_closest(event.x, event.y)
-        tags = set(canvas.gettags(item[0])) if item else set()
-        if {"text_art", "text_box", "text_handle"} & tags:
-            self._select_preview_item("text")
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        layer = hit_test(self.document, (event.x - offset_x) / scale, (event.y - offset_y) / scale)
+        if isinstance(layer, TextLayer):
+            self.document.selected_layer_id = layer.id
+            self._sync_layer_properties(layer)
             self._start_inline_text_edit(event)
 
     def _start_inline_text_edit(self, event) -> None:
@@ -1793,7 +2029,7 @@ class BirthFlowerApp:
         if canvas is None:
             return
         self._cancel_inline_text_edit()
-        entry = ttk.Entry(canvas, textvariable=self.name_var)
+        entry = ttk.Entry(canvas, textvariable=self.layer_text_var)
         entry.select_range(0, "end")
         entry.bind("<Return>", lambda _event: self._commit_inline_text_edit())
         entry.bind("<FocusOut>", lambda _event: self._commit_inline_text_edit())
@@ -1806,8 +2042,11 @@ class BirthFlowerApp:
         entry = self.inline_text_entry
         if entry is None:
             return
-        self.name_var.set(entry.get())
+        layer = self.document.selected_layer()
+        if isinstance(layer, TextLayer):
+            layer.text = entry.get()
         self._cancel_inline_text_edit()
+        self._refresh_layers_panel()
         self._redraw_preview()
 
     def _cancel_inline_text_edit(self) -> None:
@@ -1824,54 +2063,53 @@ class BirthFlowerApp:
         canvas = self.preview_canvas
         if canvas is None:
             return
-        item = canvas.find_closest(event.x, event.y)
-        tags = set(canvas.gettags(item[0])) if item else set()
-        if "flower_handle" in tags:
-            self.selected_preview_item = "flower"
-            self._drag_target = "flower_resize"
-        elif "text_handle" in tags:
-            self.selected_preview_item = "text"
-            self._drag_target = "text_resize"
-        elif "flower_box" in tags or "flower_art" in tags:
-            self.selected_preview_item = "flower"
-            self._drag_target = "flower_move"
-        elif "text_box" in tags or "text_art" in tags:
-            self.selected_preview_item = "text"
-            self._drag_target = "text_move"
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        doc_x = (event.x - offset_x) / scale
+        doc_y = (event.y - offset_y) / scale
+        layer = self.document.selected_layer()
+        tags = set(canvas.gettags(canvas.find_closest(event.x, event.y)[0])) if canvas.find_closest(event.x, event.y) else set()
+        if layer is not None and "selected_layer_handle" in tags and not layer.locked:
+            self._drag_target = layer.id
+            self._drag_mode = "resize"
         else:
-            self.selected_preview_item = None
-            self._drag_target = None
+            layer = hit_test(self.document, doc_x, doc_y)
+            self._drag_target = layer.id if layer and not layer.locked else None
+            self._drag_mode = "move"
+        self.document.selected_layer_id = layer.id if layer else None
+        self.selected_preview_item = self.document.selected_layer_id
         self._drag_start = (event.x, event.y)
         canvas.focus_set()
+        self._refresh_layers_panel()
         self._redraw_preview()
 
     def _on_canvas_drag(self, event) -> None:
         if self._drag_target is None or self._drag_start is None:
             return
+        layer = self.document.layer_by_id(self._drag_target)
+        if layer is None or layer.locked:
+            return
         try:
             layout = layout_from_values(self.layout_vars)
         except ValueError:
             return
-        canvas = self.preview_canvas
-        if canvas is None:
-            return
         scale, _offset_x, _offset_y = self._preview_transform(layout)
-        dx = round((event.x - self._drag_start[0]) / scale)
-        dy = round((event.y - self._drag_start[1]) / scale)
+        dx = (event.x - self._drag_start[0]) / scale
+        dy = (event.y - self._drag_start[1]) / scale
         self._drag_start = (event.x, event.y)
-
-        if self._drag_target == "flower_move":
-            self.layout_vars["flower_x"].set(str(max(0, layout.flower_x + dx)))
-            self.layout_vars["flower_y"].set(str(max(0, layout.flower_y + dy)))
-        elif self._drag_target == "flower_resize":
-            self.layout_vars["flower_width"].set(str(max(20, layout.flower_width + dx)))
-            self.layout_vars["flower_height"].set(str(max(20, layout.flower_height + dy)))
-        elif self._drag_target == "text_move":
-            self.layout_vars["text_x"].set(str(max(0, layout.text_x + dx)))
-            self.layout_vars["text_y"].set(str(max(0, layout.text_y + dy)))
-        elif self._drag_target == "text_resize":
-            self.layout_vars["text_width"].set(str(max(20, layout.text_width + dx)))
-            self.layout_vars["text_height"].set(str(max(20, layout.text_height + dy)))
+        if self._drag_mode == "resize":
+            layer.width = max(20, layer.width + dx)
+            layer.height = max(20, layer.height + dy)
+            if isinstance(layer, TextLayer):
+                layer.text_box_width = layer.width
+                layer.text_box_height = layer.height
+        else:
+            layer.x = max(0, layer.x + dx)
+            layer.y = max(0, layer.y + dy)
+        self._redraw_preview()
 
     def _on_canvas_release(self, _event) -> None:
         self._drag_target = None

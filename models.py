@@ -88,3 +88,217 @@ class FontAsset:
     family_name: str = ""
     file_size: int = 0
     has_ending_glyphs: bool = False
+
+
+def _new_layer_id() -> str:
+    """生成本地文档图层 ID；不依赖外部服务，方便测试和跨平台运行。"""
+    import uuid
+
+    return uuid.uuid4().hex
+
+
+@dataclass
+class Layer:
+    """Photoshop 风格图层基类，所有可编辑对象都继承这些通用变换字段。"""
+
+    id: str = field(default_factory=_new_layer_id)
+    name: str = "Layer"
+    type: str = "base"
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 100.0
+    height: float = 100.0
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    rotation: float = 0.0
+    opacity: float = 1.0
+    visible: bool = True
+    locked: bool = False
+    z_index: int = 0
+
+    @property
+    def bounds(self) -> tuple[float, float, float, float]:
+        """返回当前图层未旋转包围盒，供命中测试、选择框和基础缩放使用。"""
+        return (self.x, self.y, self.x + self.width * self.scale_x, self.y + self.height * self.scale_y)
+
+
+@dataclass
+class ImageLayer(Layer):
+    """PNG/JPG/SVG 素材图层；导出 SVG 时 SVG 素材尽量保留为独立结构。"""
+
+    path: Path | None = None
+    type: str = "image"
+    preserve_svg: bool = True
+
+
+@dataclass
+class TextLayer(Layer):
+    """可编辑文本图层；文字不会画死到背景，而是保存属性后每次重新渲染。"""
+
+    text: str = "Text"
+    font_path: Path | None = None
+    font_size: int = 120
+    color: str = "#111111"
+    align: str = "center"
+    line_spacing: float = 1.2
+    letter_spacing: float = 0.0
+    text_box_width: float = 400.0
+    text_box_height: float = 160.0
+    type: str = "text"
+
+
+@dataclass
+class GlyphLayer(Layer):
+    """预留 PUA 字形/装饰字形图层，后续可接入 glyph_service 的人工字形选择。"""
+
+    codepoint: str | None = None
+    font_path: Path | None = None
+    type: str = "glyph"
+
+
+@dataclass
+class Document:
+    """多图层文档，替代旧版单素材 current_asset 工作流。"""
+
+    canvas_width: int = 1732
+    canvas_height: int = 1280
+    layers: list[Layer] = field(default_factory=list)
+    selected_layer_id: str | None = None
+
+    def sorted_layers(self) -> list[Layer]:
+        """按 z_index 和列表顺序得到真实渲染顺序，低层先画，高层后画。"""
+        indexed_layers = sorted(enumerate(self.layers), key=lambda item: (item[1].z_index, item[0]))
+        return [layer for _, layer in indexed_layers]
+
+    def normalize_z_indexes(self) -> None:
+        """图层重排后同步 z_index，避免渲染顺序和面板顺序不一致。"""
+        for index, layer in enumerate(self.layers):
+            layer.z_index = index
+
+    def selected_layer(self) -> Layer | None:
+        return self.layer_by_id(self.selected_layer_id)
+
+    def layer_by_id(self, layer_id: str | None) -> Layer | None:
+        if layer_id is None:
+            return None
+        return next((layer for layer in self.layers if layer.id == layer_id), None)
+
+
+@dataclass
+class HistoryManager:
+    """预留撤销/重做栈；当前 UI 先接入快捷键，后续可存储 Document 快照。"""
+
+    undo_stack: list[Document] = field(default_factory=list)
+    redo_stack: list[Document] = field(default_factory=list)
+
+
+def add_image_layer(
+    document: Document,
+    path: Path | str,
+    *,
+    name: str | None = None,
+    x: float = 0,
+    y: float = 0,
+    width: float = 300,
+    height: float = 300,
+) -> ImageLayer:
+    """添加素材永远创建新 ImageLayer，绝不覆盖已有图层或旧选择。"""
+    asset_path = Path(path)
+    layer = ImageLayer(
+        name=name or asset_path.stem,
+        path=asset_path,
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        z_index=len(document.layers),
+    )
+    document.layers.append(layer)
+    document.selected_layer_id = layer.id
+    document.normalize_z_indexes()
+    return layer
+
+
+def add_text_layer(
+    document: Document,
+    text: str,
+    *,
+    font_path: Path | str | None = None,
+    name: str | None = None,
+    x: float = 0,
+    y: float = 0,
+    width: float = 400,
+    height: float = 160,
+    font_size: int = 120,
+) -> TextLayer:
+    """添加可编辑 TextLayer；文本属性保留在图层上，便于属性面板反复修改。"""
+    layer = TextLayer(
+        name=name or "Text",
+        text=text,
+        font_path=Path(font_path) if font_path else None,
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        text_box_width=width,
+        text_box_height=height,
+        font_size=font_size,
+        z_index=len(document.layers),
+    )
+    document.layers.append(layer)
+    document.selected_layer_id = layer.id
+    document.normalize_z_indexes()
+    return layer
+
+
+def delete_layer(document: Document, layer_id: str | None) -> Layer | None:
+    """删除图层并修复 selected_layer_id；锁定图层不可删除。"""
+    layer = document.layer_by_id(layer_id)
+    if layer is None or layer.locked:
+        return None
+    index = document.layers.index(layer)
+    removed = document.layers.pop(index)
+    document.normalize_z_indexes()
+    if document.layers:
+        next_index = min(index, len(document.layers) - 1)
+        document.selected_layer_id = document.layers[next_index].id
+    else:
+        document.selected_layer_id = None
+    return removed
+
+
+def move_layer(document: Document, layer_id: str | None, action: str) -> bool:
+    """支持上移、下移、置顶、置底；面板变化后渲染顺序随 z_index 更新。"""
+    layer = document.layer_by_id(layer_id)
+    if layer is None:
+        return False
+    old_index = document.layers.index(layer)
+    new_index = old_index
+    if action == "up":
+        new_index = min(len(document.layers) - 1, old_index + 1)
+    elif action == "down":
+        new_index = max(0, old_index - 1)
+    elif action == "top":
+        new_index = len(document.layers) - 1
+    elif action == "bottom":
+        new_index = 0
+    else:
+        return False
+    if new_index == old_index:
+        return False
+    document.layers.pop(old_index)
+    document.layers.insert(new_index, layer)
+    document.normalize_z_indexes()
+    document.selected_layer_id = layer.id
+    return True
+
+
+def hit_test(document: Document, x: float, y: float) -> Layer | None:
+    """从顶层向底层命中测试，只选择可见且未锁定的基础包围盒。"""
+    for layer in reversed(document.sorted_layers()):
+        if not layer.visible or layer.locked:
+            continue
+        left, top, right, bottom = layer.bounds
+        if left <= x <= right and top <= y <= bottom:
+            return layer
+    return None
