@@ -10,7 +10,7 @@ import re
 import xml.etree.ElementTree as ET
 
 from glyph_service import GlyphCandidate, render_glyph_thumbnail
-from models import BirthFlowerDesign, EngravingLayout
+from models import BirthFlowerDesign, Document, EngravingLayout, ImageLayer, TextLayer
 from text_layout import LINE_HEIGHT_RATIO, TextLayoutResult, layout_personalization_text
 from visual_layout import FitTransform, Rect, fit_content_bbox_to_target_rect
 
@@ -188,6 +188,184 @@ def render_png(design: BirthFlowerDesign, output_path: Path | str) -> Path:
     image.save(path)
     return path
 
+
+
+
+def render_document_png(document: Document, output_path: Path | str) -> Path:
+    """按多图层 Document 合成 PNG；这是新架构的最终位图导出入口。"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError("当前环境未安装 Pillow；无法导出多图层 PNG。") from exc
+    if not document.layers:
+        raise ValueError("当前文档没有任何图层，无法导出。")
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas = Image.new("RGBA", (document.canvas_width, document.canvas_height), (255, 248, 240, 255))
+    # 渲染流程：先清空画布，再按 z_index 从底到顶合成所有 visible 图层。
+    for layer in document.sorted_layers():
+        if not layer.visible:
+            continue
+        if isinstance(layer, ImageLayer):
+            _composite_image_layer(canvas, Image, ImageDraw, layer)
+        elif isinstance(layer, TextLayer):
+            _composite_text_layer(canvas, Image, ImageDraw, ImageFont, layer)
+        else:
+            # GlyphLayer 等后续图层先跳过，保持向后兼容。
+            continue
+    canvas.save(path)
+    return path
+
+
+def render_document_svg(document: Document, output_path: Path | str) -> Path:
+    """导出多图层 SVG；SVG 素材和 TextLayer 尽量保留结构，复杂旋转文字留 TODO。"""
+    if not document.layers:
+        raise ValueError("当前文档没有任何图层，无法导出。")
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body: list[str] = []
+    notes: list[str] = []
+    for layer in document.sorted_layers():
+        if not layer.visible:
+            continue
+        transform = _svg_layer_transform(layer)
+        opacity = max(0.0, min(1.0, layer.opacity))
+        if isinstance(layer, ImageLayer):
+            if layer.path is None or not layer.path.exists():
+                raise ValueError(f"素材文件不存在：{layer.path}")
+            suffix = layer.path.suffix.casefold()
+            if suffix == ".svg" and layer.preserve_svg:
+                # TODO：完整支持嵌套 SVG 的旋转中心和复杂 viewBox 裁切；当前以 <image> 保结构引用，PNG 导出为权威结果。
+                body.append(
+                    f'<image id="{escape(layer.id)}" href="{escape(layer.path.as_posix())}" x="0" y="0" '
+                    f'width="{layer.width}" height="{layer.height}" opacity="{opacity:.3f}" transform="{transform}" />'
+                )
+            else:
+                if suffix in BITMAP_ASSET_SUFFIXES:
+                    notes.append(f"图层 {layer.name} 嵌入位图素材，不是纯矢量。")
+                href = _data_uri(layer.path)
+                body.append(
+                    f'<image id="{escape(layer.id)}" href="{href}" x="0" y="0" width="{layer.width}" '
+                    f'height="{layer.height}" opacity="{opacity:.3f}" transform="{transform}" />'
+                )
+        elif isinstance(layer, TextLayer):
+            font_family = Path(layer.font_path).stem if layer.font_path else "serif"
+            text_x = _svg_text_x(layer)
+            # TODO：复杂文字、letter_spacing 与旋转组合依赖渲染器支持；PNG 使用 ink bounding box 保证正确。
+            body.append(
+                f'<text id="{escape(layer.id)}" x="{text_x:.3f}" y="{layer.font_size}" fill="{escape(layer.color)}" '
+                f'font-family="{escape(font_family)}" font-size="{layer.font_size}" text-anchor="{_svg_text_anchor(layer.align)}" '
+                f'opacity="{opacity:.3f}" transform="{transform}">{escape(layer.text)}</text>'
+            )
+    comment = "\n".join(f"<!-- {escape(note)} -->" for note in notes)
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{document.canvas_width}" height="{document.canvas_height}" '
+        f'viewBox="0 0 {document.canvas_width} {document.canvas_height}">\n'
+        f'<!-- 多图层文档导出；复杂文本排版可能受 RAQM 支持影响。 -->\n{comment}\n'
+        + "\n".join(body)
+        + "\n</svg>\n"
+    )
+    path.write_text(svg, encoding="utf-8")
+    return path
+
+
+def _composite_image_layer(canvas, image_module, draw_module, layer: ImageLayer) -> None:
+    """渲染素材图层；位图直接贴入，SVG 在无 cairosvg 时使用预览线段友好降级。"""
+    if layer.path is None or not layer.path.exists():
+        raise ValueError(f"素材文件不存在：{layer.path}")
+    suffix = layer.path.suffix.casefold()
+    if suffix in BITMAP_ASSET_SUFFIXES:
+        try:
+            image = image_module.open(layer.path).convert("RGBA")
+        except Exception as exc:
+            raise RuntimeError(f"素材渲染失败：{layer.path.name}") from exc
+        resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS", 1)
+        image = image.resize((max(1, round(layer.width * layer.scale_x)), max(1, round(layer.height * layer.scale_y))), resampling)
+        if layer.rotation:
+            image = image.rotate(-layer.rotation, expand=True, resample=resampling)
+        if layer.opacity < 1:
+            alpha = image.getchannel("A").point(lambda value: int(value * max(0, min(1, layer.opacity))))
+            image.putalpha(alpha)
+        canvas.alpha_composite(image, (round(layer.x), round(layer.y)))
+        return
+    if suffix == ".svg":
+        draw = draw_module.Draw(canvas)
+        layout = EngravingLayout(
+            canvas_width=canvas.size[0],
+            canvas_height=canvas.size[1],
+            flower_x=round(layer.x),
+            flower_y=round(layer.y),
+            flower_width=round(layer.width * layer.scale_x),
+            flower_height=round(layer.height * layer.scale_y),
+        )
+        try:
+            _draw_png_svg_flower(draw, layer.path, layout)
+        except Exception as exc:
+            raise RuntimeError(f"SVG 渲染失败：{layer.path.name}") from exc
+
+
+def _composite_text_layer(canvas, image_module, draw_module, font_module, layer: TextLayer) -> None:
+    """渲染文本图层；基于 Pillow ink bbox 居中，避免只用 ascent/descent 造成视觉不居中。"""
+    font = _png_font(font_module, layer.font_path, layer.font_size)
+    scratch = image_module.new("RGBA", (max(1, round(layer.text_box_width)), max(1, round(layer.text_box_height))), (0, 0, 0, 0))
+    draw = draw_module.Draw(scratch)
+    bbox = _text_ink_bbox(draw, layer.text, font)
+    text_width = max(1, bbox[2] - bbox[0])
+    text_height = max(1, bbox[3] - bbox[1])
+    if layer.align == "left":
+        x = -bbox[0]
+    elif layer.align == "right":
+        x = layer.text_box_width - text_width - bbox[0]
+    else:
+        x = (layer.text_box_width - text_width) / 2 - bbox[0]
+    y = (layer.text_box_height - text_height) / 2 - bbox[1]
+    draw.text((x, y), layer.text, font=font, fill=layer.color)
+    if layer.scale_x != 1 or layer.scale_y != 1:
+        resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS", 1)
+        scratch = scratch.resize((max(1, round(scratch.width * layer.scale_x)), max(1, round(scratch.height * layer.scale_y))), resampling)
+    if layer.rotation:
+        resampling = getattr(getattr(image_module, "Resampling", image_module), "BICUBIC", 3)
+        scratch = scratch.rotate(-layer.rotation, expand=True, resample=resampling)
+    if layer.opacity < 1:
+        alpha = scratch.getchannel("A").point(lambda value: int(value * max(0, min(1, layer.opacity))))
+        scratch.putalpha(alpha)
+    canvas.alpha_composite(scratch, (round(layer.x), round(layer.y)))
+
+
+def _text_ink_bbox(draw, text: str, font) -> tuple[int, int, int, int]:
+    try:
+        bbox = draw.textbbox((0, 0), text or " ", font=font)
+    except Exception:
+        width, height = draw.textsize(text or " ", font=font)
+        bbox = (0, 0, width, height)
+    return bbox
+
+
+def _svg_layer_transform(layer) -> str:
+    cx = layer.width * layer.scale_x / 2
+    cy = layer.height * layer.scale_y / 2
+    return (
+        f"translate({layer.x:.3f} {layer.y:.3f}) "
+        f"rotate({layer.rotation:.3f} {cx:.3f} {cy:.3f}) "
+        f"scale({layer.scale_x:.6f} {layer.scale_y:.6f})"
+    )
+
+
+def _svg_text_anchor(align: str) -> str:
+    return {"left": "start", "right": "end"}.get(align, "middle")
+
+
+def _svg_text_x(layer: TextLayer) -> float:
+    if layer.align == "left":
+        return 0.0
+    if layer.align == "right":
+        return layer.text_box_width
+    return layer.text_box_width / 2
+
+
+def _data_uri(path: Path) -> str:
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
 
 def flower_preview_polylines(asset_path: Path | str, layout: EngravingLayout) -> list[list[tuple[float, float]]]:
     """给 UI 预览使用的 SVG 轮廓坐标；坐标系保持 SVG 画布方向。"""
