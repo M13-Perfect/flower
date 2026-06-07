@@ -9,7 +9,7 @@ import pytest
 from config_store import AIProfile
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult
-from models import FlowerAsset, FontAsset
+from models import FlowerAsset, FontAsset, TextLayer, add_text_layer
 import ui_app as ui_app_module
 from ui_app import (
     APP_COLORS,
@@ -355,16 +355,74 @@ def test_double_click_text_opens_inline_editor_and_commits_content():
 
     try:
         app = BirthFlowerApp(root)
-        app.name_var.set("Rose")
-        app._start_inline_text_edit(SimpleNamespace(x=120, y=80))
+        layer = add_text_layer(app.document, "Rose", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._start_inline_text_edit(layer)
 
         assert app.inline_text_entry is not None
-        app.inline_text_entry.delete(0, "end")
-        app.inline_text_entry.insert(0, "Lily")
+        app.inline_text_entry.delete("1.0", "end")
+        app.inline_text_entry.insert("1.0", "Lily")
         app._commit_inline_text_edit()
 
-        assert app.name_var.get() == "Lily"
+        assert layer.text == "Lily"
         assert app.inline_text_entry is None
+        assert len([item for item in app.document.layers if isinstance(item, TextLayer)]) == 1
+    finally:
+        root.destroy()
+
+
+def test_inline_text_editor_updates_layer_live_and_preserves_pua(monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        layer = add_text_layer(app.document, "old", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._start_inline_text_edit(layer)
+
+        redraws = []
+        monkeypatch.setattr(app, "_schedule_canvas_render", lambda delay_ms=25: redraws.append(delay_ms))
+        assert app.inline_text_entry is not None
+        app.inline_text_entry.delete("1.0", "end")
+        app.inline_text_entry.insert("1.0", "h\ue014v")
+        app.inline_text_entry.edit_modified(True)
+        app._on_inline_text_modified(SimpleNamespace())
+
+        assert layer.text == "h\ue014v"
+        assert app.layer_text_var.get() == "h\ue014v"
+        assert redraws == [25]
+        assert len(app.document.layers) == 1
+    finally:
+        root.destroy()
+
+
+def test_inline_text_editor_escape_restores_original_text():
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        layer = add_text_layer(app.document, "Rose", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._start_inline_text_edit(layer)
+
+        assert app.inline_text_entry is not None
+        app.inline_text_entry.delete("1.0", "end")
+        app.inline_text_entry.insert("1.0", "Lily")
+        app.inline_text_entry.edit_modified(True)
+        app._on_inline_text_modified(SimpleNamespace())
+        assert layer.text == "Lily"
+
+        app._cancel_inline_text_edit()
+
+        assert layer.text == "Rose"
+        assert app.inline_text_entry is None
+        assert len(app.document.layers) == 1
     finally:
         root.destroy()
 
