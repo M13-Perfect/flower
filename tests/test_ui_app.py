@@ -9,7 +9,7 @@ import pytest
 from config_store import AIProfile
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult
-from models import FlowerAsset, FontAsset
+from models import FlowerAsset, FontAsset, ImageLayer, TextLayer
 import ui_app as ui_app_module
 from ui_app import (
     APP_COLORS,
@@ -305,7 +305,8 @@ def test_import_flower_file_selects_asset_and_flower(monkeypatch, tmp_path):
         assert app.flower_assets == [flower_asset]
         assert app.month_var.get() == "12"
         assert app.flower_var.get() == "9"
-        assert app.selected_preview_item == "flower"
+        assert app.pending_flower_asset_label == app._flower_label(flower_asset)
+        assert app.document.layers == []
     finally:
         root.destroy()
 
@@ -408,20 +409,137 @@ def test_preview_selection_draws_box_and_can_delete_selected_flower(tmp_path):
         }
         app.flower_asset_var.set(label)
 
-        app._select_preview_item("flower")
+        app._add_selected_flower_to_canvas()
+        layer = app.document.selected_layer()
+        assert isinstance(layer, ImageLayer)
         root.update_idletasks()
 
         assert app.preview_canvas.find_withtag("selection_box")
-        assert app.preview_canvas.find_withtag("flower_handle")
+        assert app.preview_canvas.find_withtag("selection_handle")
 
         app._delete_selected_preview_item()
 
-        assert app.flower_asset_var.get() == ""
-        assert app.flower_var.get() == "0"
+        assert app.document.layers == []
         assert app.selected_preview_item is None
     finally:
         root.destroy()
 
+
+
+def test_flower_combo_change_without_selected_layer_only_updates_pending_material(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        flower_path = tmp_path / "Rose.svg"
+        flower_path.write_text("<svg/>", encoding="utf-8")
+        asset = FlowerAsset(name="Rose", month=6, flower=1, path=flower_path, display_name="Rose")
+        app.flower_assets = [asset]
+        app._refresh_flower_choices()
+        label = app._flower_label(asset)
+
+        app._select_preview_item(None)
+        app.flower_asset_var.set(label)
+        app._on_flower_combo_selected()
+
+        assert app.document.layers == []
+        assert app.pending_flower_asset_label == label
+        assert app.flower_var.get() == "1"
+    finally:
+        root.destroy()
+
+
+def test_flower_combo_change_while_text_layer_selected_does_not_create_or_modify_text(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        flower_path = tmp_path / "Daisy.svg"
+        flower_path.write_text("<svg/>", encoding="utf-8")
+        asset = FlowerAsset(name="Daisy", month=4, flower=2, path=flower_path, display_name="Daisy")
+        app.flower_assets = [asset]
+        app._refresh_flower_choices()
+        label = app._flower_label(asset)
+        app.name_var.set("Original")
+        app._add_text_layer_from_fields()
+        layer = app.document.selected_layer()
+        assert isinstance(layer, TextLayer)
+
+        app.flower_asset_var.set(label)
+        app._on_flower_combo_selected()
+
+        assert len(app.document.layers) == 1
+        assert app.document.selected_layer() is layer
+        assert layer.text == "Original"
+        assert app.pending_flower_asset_label == label
+    finally:
+        root.destroy()
+
+
+def test_flower_combo_change_while_image_layer_selected_replaces_only_current_image(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        first_path = tmp_path / "Rose.svg"
+        second_path = tmp_path / "Lily.svg"
+        first_path.write_text("<svg/>", encoding="utf-8")
+        second_path.write_text("<svg/>", encoding="utf-8")
+        first = FlowerAsset(name="Rose", month=6, flower=1, path=first_path, display_name="Rose")
+        second = FlowerAsset(name="Lily", month=7, flower=2, path=second_path, display_name="Lily")
+        app.flower_assets = [first, second]
+        app._refresh_flower_choices()
+        first_label = app._flower_label(first)
+        second_label = app._flower_label(second)
+        app.flower_asset_var.set(first_label)
+        app._add_selected_flower_to_canvas()
+        layer = app.document.selected_layer()
+        assert isinstance(layer, ImageLayer)
+
+        app.flower_asset_var.set(second_label)
+        app._on_flower_combo_selected()
+
+        assert len(app.document.layers) == 1
+        assert app.document.selected_layer() is layer
+        assert layer.path == second_path
+        assert layer.name == "Lily"
+        assert app.pending_flower_asset_label == second_label
+    finally:
+        root.destroy()
+
+
+def test_programmatic_flower_refresh_and_parse_do_not_add_layers(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        flower_path = tmp_path / "Iris.svg"
+        flower_path.write_text("<svg/>", encoding="utf-8")
+        asset = FlowerAsset(name="Iris", month=5, flower=1, path=flower_path, display_name="Iris")
+        app.flower_assets = [asset]
+        warnings = []
+        monkeypatch.setattr(ui_app_module.messagebox, "showwarning", lambda title, message: warnings.append((title, message)))
+
+        app._refresh_flower_choices()
+        app._apply_parse_result(SimpleNamespace(text="Ivy", month=5, font=1, flower=1, warnings=[]))
+
+        assert app.document.layers == []
+        assert app.pending_flower_asset_label == app._flower_label(asset)
+        assert warnings == []
+    finally:
+        root.destroy()
 
 def test_font_settings_uses_one_choose_font_button():
     try:
