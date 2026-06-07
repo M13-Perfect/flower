@@ -460,6 +460,11 @@ class BirthFlowerApp:
         self._drag_start: tuple[int, int] | None = None
         self._drag_mode: str = "move"
         self.selected_preview_item: str | None = None
+        # 素材下拉框的当前值先作为待添加素材保存；只有点击“添加素材为新图层”才真正创建 ImageLayer。
+        self.pending_flower_asset_label: str = ""
+        # 初始化、刷新列表、解析订单等程序化更新期间，不让控件事件触发业务写入。
+        self._is_programmatic_update = False
+        self._is_loading = True
         self.last_parse_result: ParseResult | None = None
         self.glyph_config = GlyphMapConfig.load()
         self.current_glyph_result: GlyphApplyResult | None = None
@@ -472,6 +477,7 @@ class BirthFlowerApp:
         self._build_layout()
         self._scan_assets(show_errors=False)
         self._bind_preview_updates()
+        self._is_loading = False
         self._redraw_preview()
         if not self.runtime_dependency_status.ok:
             self.warning_var.set(self.runtime_dependency_status.message)
@@ -1067,12 +1073,10 @@ class BirthFlowerApp:
         if label not in self.flower_label_map:
             self.flower_label_map[label] = asset
             self.flower_combo.configure(values=list(self.flower_label_map))
-        self.flower_asset_var.set(label)
-        self.month_var.set(str(asset.month))
-        self.flower_var.set(str(asset.flower))
+        self._set_pending_flower_asset(label, sync_fields=True)
         if asset.embedded_raster_warnings:
             self._set_warnings(list(asset.embedded_raster_warnings))
-        self._add_selected_flower_to_canvas()
+        self.status_var.set("已导入素材，请点击“添加素材为新图层”添加到画布")
 
     def _select_imported_font_asset(self, asset: FontAsset) -> None:
         label = self._font_label(asset)
@@ -1524,8 +1528,9 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def _refresh_flower_choices(self) -> None:
+        # 刷新素材列表属于程序化 UI 更新，只能同步下拉框与 pending 素材，不能创建新图层。
         self.flower_label_map = {self._flower_label(asset): asset for asset in self.flower_assets}
-        self.flower_combo.configure(values=list(self.flower_label_map))
+        self._with_programmatic_update(lambda: self.flower_combo.configure(values=list(self.flower_label_map)))
         self._select_flower_by_current_fields()
         self._redraw_preview()
 
@@ -1535,7 +1540,50 @@ class BirthFlowerApp:
         self._select_font_by_current_field()
 
     def _on_flower_combo_selected(self) -> None:
-        self._add_selected_flower_to_canvas()
+        self._on_flower_selection_changed(self.flower_asset_var.get())
+
+    def _on_flower_selection_changed(self, material_id: str) -> None:
+        """处理素材下拉框变化：无素材图层时只记录待添加素材，选中素材图层时才替换资源。"""
+        if self._is_loading or self._is_programmatic_update:
+            return
+        asset = self.flower_label_map.get(material_id)
+        if asset is None:
+            self.pending_flower_asset_label = ""
+            return
+        selected_layer = self.document.selected_layer()
+        if isinstance(selected_layer, ImageLayer):
+            self._replace_selected_image_layer(asset)
+            return
+        # 未选中图层或当前选中的是文本图层时，下拉框仅更新 pending 素材，不能影响现有图层。
+        self._set_pending_flower_asset(material_id, sync_fields=True)
+        self.status_var.set("已选择待添加素材，请点击“添加素材为新图层”")
+
+    def _set_pending_flower_asset(self, material_id: str, *, sync_fields: bool = False) -> None:
+        """保存待添加素材；可选同步旧版月份/flower 字段但不触发新增图层。"""
+        self.pending_flower_asset_label = material_id
+        asset = self.flower_label_map.get(material_id)
+
+        def update_fields() -> None:
+            self.flower_asset_var.set(material_id)
+            if sync_fields and asset is not None:
+                self.month_var.set(str(asset.month))
+                self.flower_var.set(str(asset.flower))
+
+        self._with_programmatic_update(update_fields)
+
+    def _replace_selected_image_layer(self, asset: FlowerAsset) -> None:
+        """替换当前选中素材图层的图片资源；保持图层尺寸和层级不变。"""
+        layer = self.document.selected_layer()
+        if not isinstance(layer, ImageLayer):
+            return
+        if not asset.path.is_file():
+            messagebox.showerror("素材错误", f"素材文件不存在：{asset.path}")
+            return
+        layer.path = asset.path
+        layer.name = asset.display_name or asset.name
+        self._set_pending_flower_asset(self._flower_label(asset), sync_fields=True)
+        self._refresh_layers_panel()
+        self._redraw_preview()
 
     def _add_selected_flower_to_canvas(self) -> None:
         asset = self.flower_label_map.get(self.flower_asset_var.get())
@@ -1544,8 +1592,7 @@ class BirthFlowerApp:
         if not asset.path.is_file():
             messagebox.showerror("素材错误", f"素材文件不存在：{asset.path}")
             return
-        self.month_var.set(str(asset.month))
-        self.flower_var.set(str(asset.flower))
+        self._set_pending_flower_asset(self.flower_asset_var.get(), sync_fields=True)
         try:
             layout = layout_from_values(self.layout_vars)
         except ValueError:
@@ -1613,7 +1660,7 @@ class BirthFlowerApp:
             return
         label = self._flower_label(selected)
         if label in self.flower_label_map:
-            self.flower_asset_var.set(label)
+            self._set_pending_flower_asset(label)
 
     def _select_font_by_current_field(self) -> None:
         try:
@@ -1679,6 +1726,14 @@ class BirthFlowerApp:
         )
         save_config(self.config)
 
+    def _with_programmatic_update(self, callback):
+        previous = self._is_programmatic_update
+        self._is_programmatic_update = True
+        try:
+            return callback()
+        finally:
+            self._is_programmatic_update = previous
+
     def _bind_preview_updates(self) -> None:
         for var in self.layout_vars.values():
             var.trace_add("write", lambda *_: self._redraw_preview())
@@ -1695,6 +1750,8 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def _on_flower_field_change(self) -> None:
+        if self._is_programmatic_update:
+            return
         self._refresh_flower_choices()
 
     def _on_font_field_change(self) -> None:
