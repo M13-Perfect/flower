@@ -453,8 +453,12 @@ class BirthFlowerApp:
         self.preview_canvas: tk.Canvas | None = None
         self.remark_text: tk.Text | None = None
         self.confirm_button: ttk.Button | None = None
-        self.inline_text_entry: ttk.Entry | None = None
+        self.inline_text_entry: tk.Text | None = None
         self.inline_text_window: int | None = None
+        self.inline_text_layer_id: str | None = None
+        self.inline_text_original_text: str = ""
+        self.inline_text_render_after_id: str | None = None
+        self.inline_text_is_closing = False
         self.section_frames: dict[str, tk.Widget] = {}
         self._drag_target: str | None = None
         self._drag_start: tuple[int, int] | None = None
@@ -1465,6 +1469,8 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def _delete_selected_layer(self) -> None:
+        if self.inline_text_entry is not None:
+            return
         removed = delete_layer(self.document, self.document.selected_layer_id)
         if removed is None:
             self.status_var.set("未选择有效图层，或图层已锁定")
@@ -1496,6 +1502,8 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def _nudge_selected_layer(self, dx: int, dy: int) -> None:
+        if self.inline_text_entry is not None:
+            return
         layer = self.document.selected_layer()
         if layer is None or layer.locked:
             return
@@ -1760,6 +1768,10 @@ class BirthFlowerApp:
             name = glyph_result.render_text.strip() or "Name"
             text_layout = layout_personalization_text(name, layout, self.personalization_type_var.get(), self._selected_font_path())
             self._set_readiness_display(self._current_readiness_parse_result(), text_layout)
+        # 画布重绘会清空 window item；如果正在内联编辑，重建/移动覆盖编辑器以跟随缩放、平移和图层位置。
+        if self.inline_text_entry is not None and not self.inline_text_is_closing:
+            self.inline_text_window = None
+            self._place_inline_text_editor()
 
     def _draw_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
         """预览素材图层；每个 ImageLayer 独立绘制，不再读取单一 current_asset。"""
@@ -2022,46 +2034,156 @@ class BirthFlowerApp:
         if isinstance(layer, TextLayer):
             self.document.selected_layer_id = layer.id
             self._sync_layer_properties(layer)
-            self._start_inline_text_edit(event)
+            self._start_inline_text_edit(layer)
 
-    def _start_inline_text_edit(self, event) -> None:
+    def _start_inline_text_edit(self, layer_or_event=None) -> None:
+        """在画布文本框上方创建覆盖式编辑器；仅修改当前 TextLayer，不新增图层。"""
         canvas = self.preview_canvas
         if canvas is None:
             return
-        self._cancel_inline_text_edit()
-        entry = ttk.Entry(canvas, textvariable=self.layer_text_var)
-        entry.select_range(0, "end")
-        entry.bind("<Return>", lambda _event: self._commit_inline_text_edit())
-        entry.bind("<FocusOut>", lambda _event: self._commit_inline_text_edit())
-        entry.bind("<Escape>", lambda _event: self._cancel_inline_text_edit())
-        self.inline_text_entry = entry
-        self.inline_text_window = canvas.create_window(event.x, event.y, window=entry, anchor="center", width=220)
-        entry.focus_set()
-
-    def _commit_inline_text_edit(self) -> None:
-        entry = self.inline_text_entry
-        if entry is None:
+        layer = layer_or_event if isinstance(layer_or_event, TextLayer) else self.document.selected_layer()
+        if not isinstance(layer, TextLayer):
             return
-        layer = self.document.selected_layer()
+        self._destroy_inline_text_editor()
+        self.document.selected_layer_id = layer.id
+        self.inline_text_layer_id = layer.id
+        self.inline_text_original_text = layer.text
+        self.inline_text_is_closing = False
+
+        editor = tk.Text(
+            canvas,
+            wrap="word",
+            undo=False,
+            bg="white",
+            fg=layer.color or APP_COLORS["text"],
+            insertbackground=layer.color or APP_COLORS["text"],
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground="#4a90e2",
+            highlightcolor="#4a90e2",
+        )
+        # 保留 Unicode / PUA 私用区字符：不做任何输入过滤，直接写回 TextLayer.text。
+        editor.insert("1.0", layer.text)
+        editor.tag_add("sel", "1.0", "end-1c")
+        editor.edit_modified(False)
+        editor.bind("<<Modified>>", self._on_inline_text_modified)
+        editor.bind("<Return>", lambda _event: self._commit_inline_text_edit())
+        editor.bind("<Control-Return>", lambda _event: self._commit_inline_text_edit())
+        editor.bind("<Escape>", lambda _event: self._cancel_inline_text_edit())
+        self.inline_text_entry = editor
+        self._place_inline_text_editor()
+        editor.focus_set()
+        editor.mark_set("insert", "end-1c")
+        editor.see("insert")
+
+    def _on_inline_text_modified(self, event) -> str:
+        editor = self.inline_text_entry
+        if editor is None or self.inline_text_is_closing:
+            return "break"
+        try:
+            if not editor.edit_modified():
+                return "break"
+            editor.edit_modified(False)
+        except tk.TclError:
+            return "break"
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
         if isinstance(layer, TextLayer):
-            layer.text = entry.get()
-        self._cancel_inline_text_edit()
-        self._refresh_layers_panel()
+            # 每次输入立即同步到当前 TextLayer；这里只重绘预览，不触发最终 PNG/SVG/DXF 导出。
+            layer.text = editor.get("1.0", "end-1c")
+            self.layer_text_var.set(layer.text)
+            self._schedule_canvas_render()
+        return "break"
+
+    def _schedule_canvas_render(self, delay_ms: int = 25) -> None:
+        """对高频文字输入做 16-33ms 级防抖，避免 Pillow 字体预览频繁渲染导致卡顿。"""
+        if self.inline_text_render_after_id is not None:
+            try:
+                self.root.after_cancel(self.inline_text_render_after_id)
+            except tk.TclError:
+                pass
+        self.inline_text_render_after_id = self.root.after(delay_ms, self._run_scheduled_canvas_render)
+
+    def _run_scheduled_canvas_render(self) -> None:
+        self.inline_text_render_after_id = None
         self._redraw_preview()
 
-    def _cancel_inline_text_edit(self) -> None:
+    def _place_inline_text_editor(self) -> None:
+        """按当前缩放/平移把覆盖编辑器放到文本图层 bounding box 附近。"""
         canvas = self.preview_canvas
-        entry = self.inline_text_entry
+        editor = self.inline_text_entry
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
+        if canvas is None or editor is None or not isinstance(layer, TextLayer):
+            return
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        left, top, right, bottom = layer.bounds
+        x = offset_x + left * scale
+        y = offset_y + top * scale
+        width = max(160, int((right - left) * scale))
+        height = max(44, int((bottom - top) * scale))
+        try:
+            editor.configure(font=(self._selected_preview_font_family(), max(8, round(layer.font_size * scale))))
+        except tk.TclError:
+            pass
+        if self.inline_text_window is None:
+            self.inline_text_window = canvas.create_window(x, y, window=editor, anchor="nw", width=width, height=height)
+        else:
+            canvas.coords(self.inline_text_window, x, y)
+            canvas.itemconfigure(self.inline_text_window, width=width, height=height)
+        canvas.tag_raise(self.inline_text_window)
+
+    def _commit_inline_text_edit(self) -> str:
+        editor = self.inline_text_entry
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
+        if editor is not None and isinstance(layer, TextLayer):
+            layer.text = editor.get("1.0", "end-1c")
+            self.layer_text_var.set(layer.text)
+        self._destroy_inline_text_editor()
+        self._refresh_layers_panel()
+        self._redraw_preview()
+        return "break"
+
+    def _cancel_inline_text_edit(self) -> str:
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
+        if isinstance(layer, TextLayer):
+            layer.text = self.inline_text_original_text
+            self.layer_text_var.set(layer.text)
+        self._destroy_inline_text_editor()
+        self._refresh_layers_panel()
+        self._redraw_preview()
+        return "break"
+
+    def _destroy_inline_text_editor(self) -> None:
+        canvas = self.preview_canvas
+        editor = self.inline_text_entry
+        self.inline_text_is_closing = True
+        if self.inline_text_render_after_id is not None:
+            try:
+                self.root.after_cancel(self.inline_text_render_after_id)
+            except tk.TclError:
+                pass
+        self.inline_text_render_after_id = None
         self.inline_text_entry = None
         if self.inline_text_window is not None and canvas is not None:
             canvas.delete(self.inline_text_window)
-        if entry is not None:
-            entry.destroy()
+        if editor is not None:
+            editor.destroy()
         self.inline_text_window = None
+        self.inline_text_layer_id = None
+        self.inline_text_original_text = ""
+        self.inline_text_is_closing = False
 
     def _on_canvas_press(self, event) -> None:
         canvas = self.preview_canvas
         if canvas is None:
+            return
+        if self.inline_text_entry is not None:
+            # 点击画布空白/其他对象时结束内联编辑；Text 控件内部点击不会触发 Canvas 事件。
+            self._commit_inline_text_edit()
             return
         try:
             layout = layout_from_values(self.layout_vars)
