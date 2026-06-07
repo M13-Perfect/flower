@@ -428,7 +428,7 @@ class BirthFlowerApp:
         self.preview_cache = PreviewCache()
         # 保存 PhotoImage 引用，避免 Tk 垃圾回收后预览文字消失。
         self.preview_text_images: list[object] = []
-        default_layout = EngravingLayout()
+        default_layout = self.config.layout_defaults
         # 多图层文档是画布的真实数据源；旧版字段继续保留，保证订单解析和月份/字体选择兼容。
         self.document = Document(default_layout.canvas_width, default_layout.canvas_height)
         self.history_manager = None  # 预留 Ctrl+Z/Ctrl+Y 历史管理入口。
@@ -453,8 +453,12 @@ class BirthFlowerApp:
         self.preview_canvas: tk.Canvas | None = None
         self.remark_text: tk.Text | None = None
         self.confirm_button: ttk.Button | None = None
-        self.inline_text_entry: ttk.Entry | None = None
+        self.inline_text_entry: tk.Text | None = None
         self.inline_text_window: int | None = None
+        self.inline_text_layer_id: str | None = None
+        self.inline_text_original_text: str = ""
+        self.inline_text_render_after_id: str | None = None
+        self.inline_text_is_closing = False
         self.section_frames: dict[str, tk.Widget] = {}
         self._drag_target: str | None = None
         self._drag_start: tuple[int, int] | None = None
@@ -498,6 +502,7 @@ class BirthFlowerApp:
         file_menu.add_command(label="退出", command=self.root.destroy)
         menu_bar.add_cascade(label="文件", menu=file_menu)
         edit_menu = tk.Menu(menu_bar, tearoff=False)
+        edit_menu.add_command(label="布局设置...", command=self.open_layout_settings)
         edit_menu.add_command(label="字形...", command=self.open_glyph_panel)
         menu_bar.add_cascade(label="编辑", menu=edit_menu)
         view_menu = tk.Menu(menu_bar, tearoff=False)
@@ -623,6 +628,9 @@ class BirthFlowerApp:
         self.layers_listbox = tk.Listbox(panel, height=7, exportselection=False)
         self.layers_listbox.grid(row=0, column=0, columnspan=5, sticky="ew")
         self.layers_listbox.bind("<<ListboxSelect>>", self._on_layer_list_select)
+        self.layers_listbox.bind("<Double-Button-1>", self._on_layer_list_double_click)
+        self.layers_listbox.bind("<Button-3>", self._show_layer_context_menu)
+        self.layers_listbox.bind("<Button-2>", self._show_layer_context_menu)
         ttk.Button(panel, text="显/隐", command=self._toggle_selected_layer_visible).grid(row=1, column=0, sticky="ew", pady=3)
         ttk.Button(panel, text="锁/解", command=self._toggle_selected_layer_locked).grid(row=1, column=1, sticky="ew", pady=3)
         ttk.Button(panel, text="删除", command=self._delete_selected_layer).grid(row=1, column=2, sticky="ew", pady=3)
@@ -721,27 +729,12 @@ class BirthFlowerApp:
         ttk.Button(action_row, text="添加素材为新图层", command=self._add_selected_flower_to_canvas).pack(side="left")
         ttk.Button(action_row, text="添加文本", command=self._add_text_layer_from_fields).pack(side="left", padx=(8, 0))
 
-        layout_group = ttk.LabelFrame(panel, text="布局参数", padding=10, style="Panel.TLabelframe")
-        layout_group.grid(row=1, column=0, sticky="ew")
-        layout_fields = (
-            ("花 x", "flower_x"),
-            ("花 y", "flower_y"),
-            ("花宽", "flower_width"),
-            ("花高", "flower_height"),
-            ("字 x", "text_x"),
-            ("字 y", "text_y"),
-            ("字宽", "text_width"),
-            ("字高", "text_height"),
-        )
-        for row, (label, key) in enumerate(layout_fields):
-            ttk.Label(layout_group, text=label).grid(row=row, column=0, sticky="w", pady=3)
-            ttk.Entry(layout_group, textvariable=self.layout_vars[key], width=12).grid(
-                row=row, column=1, sticky="ew", pady=3
-            )
-        layout_group.columnconfigure(1, weight=1)
-        ttk.Button(layout_group, text="恢复默认布局", command=self._reset_layout).grid(
-            row=len(layout_fields), column=1, sticky="e", pady=(8, 0)
-        )
+        ttk.Label(
+            panel,
+            text="全局布局默认值已移至：编辑 -> 布局设置...；新建图层会读取该默认值。",
+            style="Status.TLabel",
+            wraplength=260,
+        ).grid(row=1, column=0, sticky="ew")
         return panel
 
     def _build_production_bar(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -910,11 +903,74 @@ class BirthFlowerApp:
             output_formats=self._selected_output_formats_or_default(),
             ai_profiles=(profile,),
             active_ai_profile=profile.name,
+            layout_defaults=layout_from_values(self.layout_vars),
         )
         save_config(self.config)
         self._scan_assets(show_errors=True)
         self.status_var.set("设置已保存")
         window.destroy()
+
+
+    def open_layout_settings(self) -> None:
+        """打开全局默认布局设置；这些值只用于之后新建图层，不回写已有图层。"""
+        window = tk.Toplevel(self.root)
+        window.title("布局设置")
+        window.transient(self.root)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        fields = (
+            ("画布宽", "canvas_width"),
+            ("画布高", "canvas_height"),
+            ("flower_x", "flower_x"),
+            ("flower_y", "flower_y"),
+            ("flower_width", "flower_width"),
+            ("flower_height", "flower_height"),
+            ("text_x", "text_x"),
+            ("text_y", "text_y"),
+            ("text_width", "text_width"),
+            ("text_height", "text_height"),
+            ("text_size", "text_size"),
+        )
+        dialog_vars = {key: tk.StringVar(value=self.layout_vars[key].get()) for _label, key in fields}
+        for row, (label, key) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(frame, textvariable=dialog_vars[key], width=14).grid(row=row, column=1, sticky="ew", pady=3)
+        ttk.Label(
+            frame,
+            text="保存后的全局默认值只会初始化新建图层，不会覆盖已有图层的位置和大小。",
+            style="Status.TLabel",
+            wraplength=360,
+        ).grid(row=len(fields), column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        frame.columnconfigure(1, weight=1)
+
+        def apply_values(close: bool = False) -> None:
+            try:
+                layout = layout_from_values(dialog_vars)
+            except ValueError as exc:
+                messagebox.showerror("布局设置", str(exc))
+                return
+            self._set_layout_vars(layout)
+            self._save_current_config()
+            self.status_var.set("全局布局默认值已保存；已有图层未被修改")
+            if close:
+                window.destroy()
+
+        def reset_defaults() -> None:
+            default = EngravingLayout()
+            for key in dialog_vars:
+                dialog_vars[key].set(str(getattr(default, key)))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="恢复默认值", command=reset_defaults).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="应用", command=lambda: apply_values(False)).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="保存", command=lambda: apply_values(True)).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="取消", command=window.destroy).pack(side="left")
+
+    def _set_layout_vars(self, layout: EngravingLayout) -> None:
+        """同步全局布局变量；注意不遍历 Document.layers，避免覆盖图层独立几何。"""
+        for key in self.layout_vars:
+            self.layout_vars[key].set(str(getattr(layout, key)))
 
     def test_ai_connection(self) -> None:
         profile = self._settings_ai_profile() if hasattr(self, "ai_provider_var") else active_ai_profile(self.config)
@@ -1409,6 +1465,155 @@ class BirthFlowerApp:
         self.warning_var.set(text)
 
 
+
+    def _layer_from_listbox_event(self, event) -> object | None:
+        listbox = self.layers_listbox
+        if listbox is None:
+            return None
+        index = listbox.nearest(event.y)
+        if index < 0:
+            return None
+        layer_index = len(self.document.layers) - 1 - index
+        if not 0 <= layer_index < len(self.document.layers):
+            return None
+        layer = self.document.layers[layer_index]
+        self.document.selected_layer_id = layer.id
+        self.selected_preview_item = layer.id
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(index)
+        self._sync_layer_properties(layer)
+        return layer
+
+    def _show_layer_context_menu(self, event) -> None:
+        """图层列表右键菜单；文本图层暂不进入素材编辑，后续单独做文字属性编辑。"""
+        layer = self._layer_from_listbox_event(event)
+        if layer is None:
+            return
+        menu = tk.Menu(self.root, tearoff=False)
+        edit_state = "normal" if isinstance(layer, ImageLayer) else "disabled"
+        menu.add_command(label="编辑素材...", state=edit_state, command=self.open_selected_material_editor)
+        menu.add_command(label="删除", command=self._delete_selected_layer)
+        menu.add_command(
+            label="解锁" if layer.locked else "锁定",
+            command=self._toggle_selected_layer_locked,
+        )
+        menu.add_separator()
+        menu.add_command(label="上移", command=lambda: self._move_selected_layer("up"))
+        menu.add_command(label="下移", command=lambda: self._move_selected_layer("down"))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_layer_list_double_click(self, event) -> None:
+        layer = self._layer_from_listbox_event(event)
+        if isinstance(layer, ImageLayer):
+            self.open_selected_material_editor()
+        elif layer is not None:
+            self.status_var.set("文本图层暂不使用素材编辑；请使用文本属性区域。")
+
+    def open_selected_material_editor(self) -> None:
+        layer = self.document.selected_layer()
+        if not isinstance(layer, ImageLayer):
+            self.status_var.set("当前选中图层不是素材图层")
+            return
+        self.open_material_editor(layer)
+
+    def open_material_editor(self, layer: ImageLayer) -> None:
+        """编辑单个素材图层；确定保留，取消恢复打开时的图层快照。"""
+        snapshot = {
+            "name": layer.name,
+            "material_id": layer.material_id,
+            "material_name": layer.material_name,
+            "x": layer.x,
+            "y": layer.y,
+            "width": layer.width,
+            "height": layer.height,
+            "lock_aspect_ratio": layer.lock_aspect_ratio,
+            "locked": layer.locked,
+        }
+        ratio = (layer.width / layer.height) if layer.height else 1.0
+        window = tk.Toplevel(self.root)
+        window.title("编辑素材")
+        window.transient(self.root)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        vars_map = {
+            "name": tk.StringVar(value=layer.name),
+            "material_id": tk.StringVar(value=layer.material_id),
+            "material_name": tk.StringVar(value=layer.material_name),
+            "x": tk.StringVar(value=str(layer.x)),
+            "y": tk.StringVar(value=str(layer.y)),
+            "width": tk.StringVar(value=str(layer.width)),
+            "height": tk.StringVar(value=str(layer.height)),
+            "lock_aspect_ratio": tk.BooleanVar(value=layer.lock_aspect_ratio),
+            "locked": tk.BooleanVar(value=layer.locked),
+        }
+        geometry_entries: list[ttk.Entry] = []
+        fields = (("图层名称", "name"), ("material_id", "material_id"), ("material_name", "material_name"), ("x", "x"), ("y", "y"), ("width", "width"), ("height", "height"))
+        for row, (label, key) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            entry = ttk.Entry(frame, textvariable=vars_map[key], width=24)
+            entry.grid(row=row, column=1, sticky="ew", pady=3)
+            if key in {"x", "y", "width", "height"}:
+                geometry_entries.append(entry)
+        ttk.Checkbutton(frame, text="锁定宽高比", variable=vars_map["lock_aspect_ratio"]).grid(row=len(fields), column=1, sticky="w", pady=3)
+        ttk.Checkbutton(frame, text="是否锁定", variable=vars_map["locked"], command=lambda: sync_entry_state()).grid(row=len(fields) + 1, column=1, sticky="w", pady=3)
+        frame.columnconfigure(1, weight=1)
+        applying = {"busy": False}
+
+        def sync_entry_state() -> None:
+            state = "disabled" if vars_map["locked"].get() else "normal"
+            for entry in geometry_entries:
+                entry.configure(state=state)
+
+        def apply_live(_name=None, _index=None, _mode=None) -> None:
+            if applying["busy"]:
+                return
+            applying["busy"] = True
+            try:
+                layer.name = vars_map["name"].get().strip() or snapshot["name"]
+                layer.material_id = vars_map["material_id"].get().strip()
+                layer.material_name = vars_map["material_name"].get().strip()
+                layer.lock_aspect_ratio = bool(vars_map["lock_aspect_ratio"].get())
+                layer.locked = bool(vars_map["locked"].get())
+                if not layer.locked:
+                    x = float(vars_map["x"].get())
+                    y = float(vars_map["y"].get())
+                    width = max(1.0, float(vars_map["width"].get()))
+                    height = max(1.0, float(vars_map["height"].get()))
+                    if layer.lock_aspect_ratio and ratio > 0:
+                        # 实时预览时保留初始宽高比，减少误操作造成的素材变形。
+                        height = width / ratio
+                        vars_map["height"].set(f"{height:g}")
+                    layer.x = x
+                    layer.y = y
+                    layer.width = width
+                    layer.height = height
+                sync_entry_state()
+                self._refresh_layers_panel()
+                self._redraw_preview()
+            except ValueError:
+                sync_entry_state()
+            finally:
+                applying["busy"] = False
+
+        def restore_snapshot() -> None:
+            for key, value in snapshot.items():
+                setattr(layer, key, value)
+            self._refresh_layers_panel()
+            self._redraw_preview()
+            window.destroy()
+
+        for var in vars_map.values():
+            var.trace_add("write", apply_live)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=len(fields) + 2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="确定", command=window.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="取消", command=restore_snapshot).pack(side="left")
+        window.protocol("WM_DELETE_WINDOW", restore_snapshot)
+        sync_entry_state()
+
     def _refresh_layers_panel(self) -> None:
         """刷新右下角图层面板，显示名称、类型、显隐和锁定状态。"""
         listbox = self.layers_listbox
@@ -1470,6 +1675,8 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def _delete_selected_layer(self) -> None:
+        if self.inline_text_entry is not None:
+            return
         removed = delete_layer(self.document, self.document.selected_layer_id)
         if removed is None:
             self.status_var.set("未选择有效图层，或图层已锁定")
@@ -1501,6 +1708,8 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def _nudge_selected_layer(self, dx: int, dy: int) -> None:
+        if self.inline_text_entry is not None:
+            return
         layer = self.document.selected_layer()
         if layer is None or layer.locked:
             return
@@ -1607,6 +1816,8 @@ class BirthFlowerApp:
             y=layout.flower_y,
             width=layout.flower_width,
             height=layout.flower_height,
+            material_id=asset.asset_key or asset.path.stem,
+            material_name=asset.display_name or asset.name,
         )
         self.selected_preview_item = layer.id
         self._refresh_layers_panel()
@@ -1724,6 +1935,7 @@ class BirthFlowerApp:
             output_formats=self._selected_output_formats_or_default(),
             ai_profiles=self.config.ai_profiles,
             active_ai_profile=self.config.active_ai_profile,
+            layout_defaults=layout_from_values(self.layout_vars),
         )
         save_config(self.config)
 
@@ -1818,6 +2030,10 @@ class BirthFlowerApp:
             name = glyph_result.render_text.strip() or "Name"
             text_layout = layout_personalization_text(name, layout, self.personalization_type_var.get(), self._selected_font_path())
             self._set_readiness_display(self._current_readiness_parse_result(), text_layout)
+        # 画布重绘会清空 window item；如果正在内联编辑，重建/移动覆盖编辑器以跟随缩放、平移和图层位置。
+        if self.inline_text_entry is not None and not self.inline_text_is_closing:
+            self.inline_text_window = None
+            self._place_inline_text_editor()
 
     def _draw_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
         """预览素材图层；每个 ImageLayer 独立绘制，不再读取单一 current_asset。"""
@@ -2080,46 +2296,156 @@ class BirthFlowerApp:
         if isinstance(layer, TextLayer):
             self.document.selected_layer_id = layer.id
             self._sync_layer_properties(layer)
-            self._start_inline_text_edit(event)
+            self._start_inline_text_edit(layer)
 
-    def _start_inline_text_edit(self, event) -> None:
+    def _start_inline_text_edit(self, layer_or_event=None) -> None:
+        """在画布文本框上方创建覆盖式编辑器；仅修改当前 TextLayer，不新增图层。"""
         canvas = self.preview_canvas
         if canvas is None:
             return
-        self._cancel_inline_text_edit()
-        entry = ttk.Entry(canvas, textvariable=self.layer_text_var)
-        entry.select_range(0, "end")
-        entry.bind("<Return>", lambda _event: self._commit_inline_text_edit())
-        entry.bind("<FocusOut>", lambda _event: self._commit_inline_text_edit())
-        entry.bind("<Escape>", lambda _event: self._cancel_inline_text_edit())
-        self.inline_text_entry = entry
-        self.inline_text_window = canvas.create_window(event.x, event.y, window=entry, anchor="center", width=220)
-        entry.focus_set()
-
-    def _commit_inline_text_edit(self) -> None:
-        entry = self.inline_text_entry
-        if entry is None:
+        layer = layer_or_event if isinstance(layer_or_event, TextLayer) else self.document.selected_layer()
+        if not isinstance(layer, TextLayer):
             return
-        layer = self.document.selected_layer()
+        self._destroy_inline_text_editor()
+        self.document.selected_layer_id = layer.id
+        self.inline_text_layer_id = layer.id
+        self.inline_text_original_text = layer.text
+        self.inline_text_is_closing = False
+
+        editor = tk.Text(
+            canvas,
+            wrap="word",
+            undo=False,
+            bg="white",
+            fg=layer.color or APP_COLORS["text"],
+            insertbackground=layer.color or APP_COLORS["text"],
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground="#4a90e2",
+            highlightcolor="#4a90e2",
+        )
+        # 保留 Unicode / PUA 私用区字符：不做任何输入过滤，直接写回 TextLayer.text。
+        editor.insert("1.0", layer.text)
+        editor.tag_add("sel", "1.0", "end-1c")
+        editor.edit_modified(False)
+        editor.bind("<<Modified>>", self._on_inline_text_modified)
+        editor.bind("<Return>", lambda _event: self._commit_inline_text_edit())
+        editor.bind("<Control-Return>", lambda _event: self._commit_inline_text_edit())
+        editor.bind("<Escape>", lambda _event: self._cancel_inline_text_edit())
+        self.inline_text_entry = editor
+        self._place_inline_text_editor()
+        editor.focus_set()
+        editor.mark_set("insert", "end-1c")
+        editor.see("insert")
+
+    def _on_inline_text_modified(self, event) -> str:
+        editor = self.inline_text_entry
+        if editor is None or self.inline_text_is_closing:
+            return "break"
+        try:
+            if not editor.edit_modified():
+                return "break"
+            editor.edit_modified(False)
+        except tk.TclError:
+            return "break"
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
         if isinstance(layer, TextLayer):
-            layer.text = entry.get()
-        self._cancel_inline_text_edit()
-        self._refresh_layers_panel()
+            # 每次输入立即同步到当前 TextLayer；这里只重绘预览，不触发最终 PNG/SVG/DXF 导出。
+            layer.text = editor.get("1.0", "end-1c")
+            self.layer_text_var.set(layer.text)
+            self._schedule_canvas_render()
+        return "break"
+
+    def _schedule_canvas_render(self, delay_ms: int = 25) -> None:
+        """对高频文字输入做 16-33ms 级防抖，避免 Pillow 字体预览频繁渲染导致卡顿。"""
+        if self.inline_text_render_after_id is not None:
+            try:
+                self.root.after_cancel(self.inline_text_render_after_id)
+            except tk.TclError:
+                pass
+        self.inline_text_render_after_id = self.root.after(delay_ms, self._run_scheduled_canvas_render)
+
+    def _run_scheduled_canvas_render(self) -> None:
+        self.inline_text_render_after_id = None
         self._redraw_preview()
 
-    def _cancel_inline_text_edit(self) -> None:
+    def _place_inline_text_editor(self) -> None:
+        """按当前缩放/平移把覆盖编辑器放到文本图层 bounding box 附近。"""
         canvas = self.preview_canvas
-        entry = self.inline_text_entry
+        editor = self.inline_text_entry
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
+        if canvas is None or editor is None or not isinstance(layer, TextLayer):
+            return
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        left, top, right, bottom = layer.bounds
+        x = offset_x + left * scale
+        y = offset_y + top * scale
+        width = max(160, int((right - left) * scale))
+        height = max(44, int((bottom - top) * scale))
+        try:
+            editor.configure(font=(self._selected_preview_font_family(), max(8, round(layer.font_size * scale))))
+        except tk.TclError:
+            pass
+        if self.inline_text_window is None:
+            self.inline_text_window = canvas.create_window(x, y, window=editor, anchor="nw", width=width, height=height)
+        else:
+            canvas.coords(self.inline_text_window, x, y)
+            canvas.itemconfigure(self.inline_text_window, width=width, height=height)
+        canvas.tag_raise(self.inline_text_window)
+
+    def _commit_inline_text_edit(self) -> str:
+        editor = self.inline_text_entry
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
+        if editor is not None and isinstance(layer, TextLayer):
+            layer.text = editor.get("1.0", "end-1c")
+            self.layer_text_var.set(layer.text)
+        self._destroy_inline_text_editor()
+        self._refresh_layers_panel()
+        self._redraw_preview()
+        return "break"
+
+    def _cancel_inline_text_edit(self) -> str:
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
+        if isinstance(layer, TextLayer):
+            layer.text = self.inline_text_original_text
+            self.layer_text_var.set(layer.text)
+        self._destroy_inline_text_editor()
+        self._refresh_layers_panel()
+        self._redraw_preview()
+        return "break"
+
+    def _destroy_inline_text_editor(self) -> None:
+        canvas = self.preview_canvas
+        editor = self.inline_text_entry
+        self.inline_text_is_closing = True
+        if self.inline_text_render_after_id is not None:
+            try:
+                self.root.after_cancel(self.inline_text_render_after_id)
+            except tk.TclError:
+                pass
+        self.inline_text_render_after_id = None
         self.inline_text_entry = None
         if self.inline_text_window is not None and canvas is not None:
             canvas.delete(self.inline_text_window)
-        if entry is not None:
-            entry.destroy()
+        if editor is not None:
+            editor.destroy()
         self.inline_text_window = None
+        self.inline_text_layer_id = None
+        self.inline_text_original_text = ""
+        self.inline_text_is_closing = False
 
     def _on_canvas_press(self, event) -> None:
         canvas = self.preview_canvas
         if canvas is None:
+            return
+        if self.inline_text_entry is not None:
+            # 点击画布空白/其他对象时结束内联编辑；Text 控件内部点击不会触发 Canvas 事件。
+            self._commit_inline_text_edit()
             return
         try:
             layout = layout_from_values(self.layout_vars)

@@ -10,6 +10,7 @@ from config_store import AIProfile
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult
 from models import FlowerAsset, FontAsset, ImageLayer, TextLayer
+from models import FlowerAsset, FontAsset, TextLayer, add_text_layer
 import ui_app as ui_app_module
 from ui_app import (
     APP_COLORS,
@@ -358,16 +359,74 @@ def test_double_click_text_opens_inline_editor_and_commits_content():
 
     try:
         app = BirthFlowerApp(root)
-        app.name_var.set("Rose")
-        app._start_inline_text_edit(SimpleNamespace(x=120, y=80))
+        layer = add_text_layer(app.document, "Rose", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._start_inline_text_edit(layer)
 
         assert app.inline_text_entry is not None
-        app.inline_text_entry.delete(0, "end")
-        app.inline_text_entry.insert(0, "Lily")
+        app.inline_text_entry.delete("1.0", "end")
+        app.inline_text_entry.insert("1.0", "Lily")
         app._commit_inline_text_edit()
 
-        assert app.name_var.get() == "Lily"
+        assert layer.text == "Lily"
         assert app.inline_text_entry is None
+        assert len([item for item in app.document.layers if isinstance(item, TextLayer)]) == 1
+    finally:
+        root.destroy()
+
+
+def test_inline_text_editor_updates_layer_live_and_preserves_pua(monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        layer = add_text_layer(app.document, "old", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._start_inline_text_edit(layer)
+
+        redraws = []
+        monkeypatch.setattr(app, "_schedule_canvas_render", lambda delay_ms=25: redraws.append(delay_ms))
+        assert app.inline_text_entry is not None
+        app.inline_text_entry.delete("1.0", "end")
+        app.inline_text_entry.insert("1.0", "h\ue014v")
+        app.inline_text_entry.edit_modified(True)
+        app._on_inline_text_modified(SimpleNamespace())
+
+        assert layer.text == "h\ue014v"
+        assert app.layer_text_var.get() == "h\ue014v"
+        assert redraws == [25]
+        assert len(app.document.layers) == 1
+    finally:
+        root.destroy()
+
+
+def test_inline_text_editor_escape_restores_original_text():
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        layer = add_text_layer(app.document, "Rose", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._start_inline_text_edit(layer)
+
+        assert app.inline_text_entry is not None
+        app.inline_text_entry.delete("1.0", "end")
+        app.inline_text_entry.insert("1.0", "Lily")
+        app.inline_text_entry.edit_modified(True)
+        app._on_inline_text_modified(SimpleNamespace())
+        assert layer.text == "Lily"
+
+        app._cancel_inline_text_edit()
+
+        assert layer.text == "Rose"
+        assert app.inline_text_entry is None
+        assert len(app.document.layers) == 1
     finally:
         root.destroy()
 
@@ -773,3 +832,48 @@ def test_run_background_returns_before_slow_work_finishes():
     callback()
     assert results == ["ok"]
     assert errors == []
+
+
+def test_global_layout_defaults_only_initialize_new_layers(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        monkeypatch.setattr(app, "_save_current_config", lambda: None)
+        first_path = tmp_path / "First.svg"
+        second_path = tmp_path / "Second.svg"
+        first_path.write_text('<svg viewBox="0 0 10 10" xmlns="http://www.w3.org/2000/svg"/>', encoding="utf-8")
+        second_path.write_text('<svg viewBox="0 0 10 10" xmlns="http://www.w3.org/2000/svg"/>', encoding="utf-8")
+        first = FlowerAsset(name="First", month=1, flower=1, path=first_path, display_name="First")
+        second = FlowerAsset(name="Second", month=2, flower=1, path=second_path, display_name="Second")
+        app.flower_label_map = {"first": first, "second": second}
+
+        app.layout_vars["flower_x"].set("10")
+        app.layout_vars["flower_y"].set("20")
+        app.layout_vars["flower_width"].set("300")
+        app.layout_vars["flower_height"].set("400")
+        app.flower_asset_var.set("first")
+        app._add_selected_flower_to_canvas()
+        first_layer = app.document.selected_layer()
+
+        app.layout_vars["flower_x"].set("700")
+        app.layout_vars["flower_y"].set("800")
+        app.layout_vars["flower_width"].set("90")
+        app.layout_vars["flower_height"].set("100")
+        app.flower_asset_var.set("second")
+        app._add_selected_flower_to_canvas()
+        second_layer = app.document.selected_layer()
+
+        assert first_layer.x == 10
+        assert first_layer.y == 20
+        assert first_layer.width == 300
+        assert first_layer.height == 400
+        assert second_layer.x == 700
+        assert second_layer.y == 800
+        assert second_layer.width == 90
+        assert second_layer.height == 100
+    finally:
+        root.destroy()
