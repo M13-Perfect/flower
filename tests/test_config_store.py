@@ -133,3 +133,20 @@ def test_load_config_supplies_default_ai_profile(tmp_path):
 def test_normalize_output_formats_rejects_unknown_and_keeps_order():
     assert normalize_output_formats(["svg", "bad", "png", "svg"]) == ("svg", "png")
     assert normalize_output_formats([]) == ("svg", "dxf")
+
+
+def test_save_and_load_config_keeps_layout_defaults(tmp_path):
+    from models import EngravingLayout
+
+    path = tmp_path / "config.json"
+    defaults = EngravingLayout(flower_x=111, flower_y=222, flower_width=333, flower_height=444, text_x=555)
+    config = AppConfig(layout_defaults=defaults)
+
+    save_config(config, path)
+    loaded = load_config(path)
+
+    assert loaded.layout_defaults.flower_x == 111
+    assert loaded.layout_defaults.flower_y == 222
+    assert loaded.layout_defaults.flower_width == 333
+    assert loaded.layout_defaults.flower_height == 444
+    assert loaded.layout_defaults.text_x == 555

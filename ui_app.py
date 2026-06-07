@@ -428,7 +428,7 @@ class BirthFlowerApp:
         self.preview_cache = PreviewCache()
         # 保存 PhotoImage 引用，避免 Tk 垃圾回收后预览文字消失。
         self.preview_text_images: list[object] = []
-        default_layout = EngravingLayout()
+        default_layout = self.config.layout_defaults
         # 多图层文档是画布的真实数据源；旧版字段继续保留，保证订单解析和月份/字体选择兼容。
         self.document = Document(default_layout.canvas_width, default_layout.canvas_height)
         self.history_manager = None  # 预留 Ctrl+Z/Ctrl+Y 历史管理入口。
@@ -492,6 +492,7 @@ class BirthFlowerApp:
         file_menu.add_command(label="退出", command=self.root.destroy)
         menu_bar.add_cascade(label="文件", menu=file_menu)
         edit_menu = tk.Menu(menu_bar, tearoff=False)
+        edit_menu.add_command(label="布局设置...", command=self.open_layout_settings)
         edit_menu.add_command(label="字形...", command=self.open_glyph_panel)
         menu_bar.add_cascade(label="编辑", menu=edit_menu)
         view_menu = tk.Menu(menu_bar, tearoff=False)
@@ -617,6 +618,9 @@ class BirthFlowerApp:
         self.layers_listbox = tk.Listbox(panel, height=7, exportselection=False)
         self.layers_listbox.grid(row=0, column=0, columnspan=5, sticky="ew")
         self.layers_listbox.bind("<<ListboxSelect>>", self._on_layer_list_select)
+        self.layers_listbox.bind("<Double-Button-1>", self._on_layer_list_double_click)
+        self.layers_listbox.bind("<Button-3>", self._show_layer_context_menu)
+        self.layers_listbox.bind("<Button-2>", self._show_layer_context_menu)
         ttk.Button(panel, text="显/隐", command=self._toggle_selected_layer_visible).grid(row=1, column=0, sticky="ew", pady=3)
         ttk.Button(panel, text="锁/解", command=self._toggle_selected_layer_locked).grid(row=1, column=1, sticky="ew", pady=3)
         ttk.Button(panel, text="删除", command=self._delete_selected_layer).grid(row=1, column=2, sticky="ew", pady=3)
@@ -715,27 +719,12 @@ class BirthFlowerApp:
         ttk.Button(action_row, text="添加素材为新图层", command=self._add_selected_flower_to_canvas).pack(side="left")
         ttk.Button(action_row, text="添加文本", command=self._add_text_layer_from_fields).pack(side="left", padx=(8, 0))
 
-        layout_group = ttk.LabelFrame(panel, text="布局参数", padding=10, style="Panel.TLabelframe")
-        layout_group.grid(row=1, column=0, sticky="ew")
-        layout_fields = (
-            ("花 x", "flower_x"),
-            ("花 y", "flower_y"),
-            ("花宽", "flower_width"),
-            ("花高", "flower_height"),
-            ("字 x", "text_x"),
-            ("字 y", "text_y"),
-            ("字宽", "text_width"),
-            ("字高", "text_height"),
-        )
-        for row, (label, key) in enumerate(layout_fields):
-            ttk.Label(layout_group, text=label).grid(row=row, column=0, sticky="w", pady=3)
-            ttk.Entry(layout_group, textvariable=self.layout_vars[key], width=12).grid(
-                row=row, column=1, sticky="ew", pady=3
-            )
-        layout_group.columnconfigure(1, weight=1)
-        ttk.Button(layout_group, text="恢复默认布局", command=self._reset_layout).grid(
-            row=len(layout_fields), column=1, sticky="e", pady=(8, 0)
-        )
+        ttk.Label(
+            panel,
+            text="全局布局默认值已移至：编辑 -> 布局设置...；新建图层会读取该默认值。",
+            style="Status.TLabel",
+            wraplength=260,
+        ).grid(row=1, column=0, sticky="ew")
         return panel
 
     def _build_production_bar(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -904,11 +893,74 @@ class BirthFlowerApp:
             output_formats=self._selected_output_formats_or_default(),
             ai_profiles=(profile,),
             active_ai_profile=profile.name,
+            layout_defaults=layout_from_values(self.layout_vars),
         )
         save_config(self.config)
         self._scan_assets(show_errors=True)
         self.status_var.set("设置已保存")
         window.destroy()
+
+
+    def open_layout_settings(self) -> None:
+        """打开全局默认布局设置；这些值只用于之后新建图层，不回写已有图层。"""
+        window = tk.Toplevel(self.root)
+        window.title("布局设置")
+        window.transient(self.root)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        fields = (
+            ("画布宽", "canvas_width"),
+            ("画布高", "canvas_height"),
+            ("flower_x", "flower_x"),
+            ("flower_y", "flower_y"),
+            ("flower_width", "flower_width"),
+            ("flower_height", "flower_height"),
+            ("text_x", "text_x"),
+            ("text_y", "text_y"),
+            ("text_width", "text_width"),
+            ("text_height", "text_height"),
+            ("text_size", "text_size"),
+        )
+        dialog_vars = {key: tk.StringVar(value=self.layout_vars[key].get()) for _label, key in fields}
+        for row, (label, key) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(frame, textvariable=dialog_vars[key], width=14).grid(row=row, column=1, sticky="ew", pady=3)
+        ttk.Label(
+            frame,
+            text="保存后的全局默认值只会初始化新建图层，不会覆盖已有图层的位置和大小。",
+            style="Status.TLabel",
+            wraplength=360,
+        ).grid(row=len(fields), column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        frame.columnconfigure(1, weight=1)
+
+        def apply_values(close: bool = False) -> None:
+            try:
+                layout = layout_from_values(dialog_vars)
+            except ValueError as exc:
+                messagebox.showerror("布局设置", str(exc))
+                return
+            self._set_layout_vars(layout)
+            self._save_current_config()
+            self.status_var.set("全局布局默认值已保存；已有图层未被修改")
+            if close:
+                window.destroy()
+
+        def reset_defaults() -> None:
+            default = EngravingLayout()
+            for key in dialog_vars:
+                dialog_vars[key].set(str(getattr(default, key)))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="恢复默认值", command=reset_defaults).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="应用", command=lambda: apply_values(False)).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="保存", command=lambda: apply_values(True)).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="取消", command=window.destroy).pack(side="left")
+
+    def _set_layout_vars(self, layout: EngravingLayout) -> None:
+        """同步全局布局变量；注意不遍历 Document.layers，避免覆盖图层独立几何。"""
+        for key in self.layout_vars:
+            self.layout_vars[key].set(str(getattr(layout, key)))
 
     def test_ai_connection(self) -> None:
         profile = self._settings_ai_profile() if hasattr(self, "ai_provider_var") else active_ai_profile(self.config)
@@ -1404,6 +1456,155 @@ class BirthFlowerApp:
         self.warning_var.set(text)
 
 
+
+    def _layer_from_listbox_event(self, event) -> object | None:
+        listbox = self.layers_listbox
+        if listbox is None:
+            return None
+        index = listbox.nearest(event.y)
+        if index < 0:
+            return None
+        layer_index = len(self.document.layers) - 1 - index
+        if not 0 <= layer_index < len(self.document.layers):
+            return None
+        layer = self.document.layers[layer_index]
+        self.document.selected_layer_id = layer.id
+        self.selected_preview_item = layer.id
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(index)
+        self._sync_layer_properties(layer)
+        return layer
+
+    def _show_layer_context_menu(self, event) -> None:
+        """图层列表右键菜单；文本图层暂不进入素材编辑，后续单独做文字属性编辑。"""
+        layer = self._layer_from_listbox_event(event)
+        if layer is None:
+            return
+        menu = tk.Menu(self.root, tearoff=False)
+        edit_state = "normal" if isinstance(layer, ImageLayer) else "disabled"
+        menu.add_command(label="编辑素材...", state=edit_state, command=self.open_selected_material_editor)
+        menu.add_command(label="删除", command=self._delete_selected_layer)
+        menu.add_command(
+            label="解锁" if layer.locked else "锁定",
+            command=self._toggle_selected_layer_locked,
+        )
+        menu.add_separator()
+        menu.add_command(label="上移", command=lambda: self._move_selected_layer("up"))
+        menu.add_command(label="下移", command=lambda: self._move_selected_layer("down"))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_layer_list_double_click(self, event) -> None:
+        layer = self._layer_from_listbox_event(event)
+        if isinstance(layer, ImageLayer):
+            self.open_selected_material_editor()
+        elif layer is not None:
+            self.status_var.set("文本图层暂不使用素材编辑；请使用文本属性区域。")
+
+    def open_selected_material_editor(self) -> None:
+        layer = self.document.selected_layer()
+        if not isinstance(layer, ImageLayer):
+            self.status_var.set("当前选中图层不是素材图层")
+            return
+        self.open_material_editor(layer)
+
+    def open_material_editor(self, layer: ImageLayer) -> None:
+        """编辑单个素材图层；确定保留，取消恢复打开时的图层快照。"""
+        snapshot = {
+            "name": layer.name,
+            "material_id": layer.material_id,
+            "material_name": layer.material_name,
+            "x": layer.x,
+            "y": layer.y,
+            "width": layer.width,
+            "height": layer.height,
+            "lock_aspect_ratio": layer.lock_aspect_ratio,
+            "locked": layer.locked,
+        }
+        ratio = (layer.width / layer.height) if layer.height else 1.0
+        window = tk.Toplevel(self.root)
+        window.title("编辑素材")
+        window.transient(self.root)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        vars_map = {
+            "name": tk.StringVar(value=layer.name),
+            "material_id": tk.StringVar(value=layer.material_id),
+            "material_name": tk.StringVar(value=layer.material_name),
+            "x": tk.StringVar(value=str(layer.x)),
+            "y": tk.StringVar(value=str(layer.y)),
+            "width": tk.StringVar(value=str(layer.width)),
+            "height": tk.StringVar(value=str(layer.height)),
+            "lock_aspect_ratio": tk.BooleanVar(value=layer.lock_aspect_ratio),
+            "locked": tk.BooleanVar(value=layer.locked),
+        }
+        geometry_entries: list[ttk.Entry] = []
+        fields = (("图层名称", "name"), ("material_id", "material_id"), ("material_name", "material_name"), ("x", "x"), ("y", "y"), ("width", "width"), ("height", "height"))
+        for row, (label, key) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            entry = ttk.Entry(frame, textvariable=vars_map[key], width=24)
+            entry.grid(row=row, column=1, sticky="ew", pady=3)
+            if key in {"x", "y", "width", "height"}:
+                geometry_entries.append(entry)
+        ttk.Checkbutton(frame, text="锁定宽高比", variable=vars_map["lock_aspect_ratio"]).grid(row=len(fields), column=1, sticky="w", pady=3)
+        ttk.Checkbutton(frame, text="是否锁定", variable=vars_map["locked"], command=lambda: sync_entry_state()).grid(row=len(fields) + 1, column=1, sticky="w", pady=3)
+        frame.columnconfigure(1, weight=1)
+        applying = {"busy": False}
+
+        def sync_entry_state() -> None:
+            state = "disabled" if vars_map["locked"].get() else "normal"
+            for entry in geometry_entries:
+                entry.configure(state=state)
+
+        def apply_live(_name=None, _index=None, _mode=None) -> None:
+            if applying["busy"]:
+                return
+            applying["busy"] = True
+            try:
+                layer.name = vars_map["name"].get().strip() or snapshot["name"]
+                layer.material_id = vars_map["material_id"].get().strip()
+                layer.material_name = vars_map["material_name"].get().strip()
+                layer.lock_aspect_ratio = bool(vars_map["lock_aspect_ratio"].get())
+                layer.locked = bool(vars_map["locked"].get())
+                if not layer.locked:
+                    x = float(vars_map["x"].get())
+                    y = float(vars_map["y"].get())
+                    width = max(1.0, float(vars_map["width"].get()))
+                    height = max(1.0, float(vars_map["height"].get()))
+                    if layer.lock_aspect_ratio and ratio > 0:
+                        # 实时预览时保留初始宽高比，减少误操作造成的素材变形。
+                        height = width / ratio
+                        vars_map["height"].set(f"{height:g}")
+                    layer.x = x
+                    layer.y = y
+                    layer.width = width
+                    layer.height = height
+                sync_entry_state()
+                self._refresh_layers_panel()
+                self._redraw_preview()
+            except ValueError:
+                sync_entry_state()
+            finally:
+                applying["busy"] = False
+
+        def restore_snapshot() -> None:
+            for key, value in snapshot.items():
+                setattr(layer, key, value)
+            self._refresh_layers_panel()
+            self._redraw_preview()
+            window.destroy()
+
+        for var in vars_map.values():
+            var.trace_add("write", apply_live)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=len(fields) + 2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="确定", command=window.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="取消", command=restore_snapshot).pack(side="left")
+        window.protocol("WM_DELETE_WINDOW", restore_snapshot)
+        sync_entry_state()
+
     def _refresh_layers_panel(self) -> None:
         """刷新右下角图层面板，显示名称、类型、显隐和锁定状态。"""
         listbox = self.layers_listbox
@@ -1559,6 +1760,8 @@ class BirthFlowerApp:
             y=layout.flower_y,
             width=layout.flower_width,
             height=layout.flower_height,
+            material_id=asset.asset_key or asset.path.stem,
+            material_name=asset.display_name or asset.name,
         )
         self.selected_preview_item = layer.id
         self._refresh_layers_panel()
@@ -1676,6 +1879,7 @@ class BirthFlowerApp:
             output_formats=self._selected_output_formats_or_default(),
             ai_profiles=self.config.ai_profiles,
             active_ai_profile=self.config.active_ai_profile,
+            layout_defaults=layout_from_values(self.layout_vars),
         )
         save_config(self.config)
 
