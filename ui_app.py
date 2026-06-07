@@ -1076,7 +1076,8 @@ class BirthFlowerApp:
         self._set_pending_flower_asset(label, sync_fields=True)
         if asset.embedded_raster_warnings:
             self._set_warnings(list(asset.embedded_raster_warnings))
-        self.status_var.set("已导入素材，请点击“添加素材为新图层”添加到画布")
+        # 导入素材是独立的显式菜单动作，保留既有行为：导入后立即追加为新图层。
+        self._add_selected_flower_to_canvas()
 
     def _select_imported_font_asset(self, asset: FontAsset) -> None:
         label = self._font_label(asset)
