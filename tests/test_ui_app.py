@@ -306,7 +306,9 @@ def test_import_flower_file_selects_asset_and_flower(monkeypatch, tmp_path):
         assert app.month_var.get() == "12"
         assert app.flower_var.get() == "9"
         assert app.pending_flower_asset_label == app._flower_label(flower_asset)
-        assert app.document.layers == []
+        assert len(app.document.layers) == 1
+        assert isinstance(app.document.selected_layer(), ImageLayer)
+        assert app.document.selected_layer().path == flower_path
     finally:
         root.destroy()
 
