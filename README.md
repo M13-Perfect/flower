@@ -308,3 +308,66 @@ choco install ripgrep
 - `*.jpg`、`*.png`、`*.psd`、`*.dxf`、`*.ttf`、`*.otf`
 
 源码、测试、README、配置结构和文档仍会上传。缺少私有字体时，相关字体细节测试会自动跳过；运行桌面应用时需要在本地设置窗口重新选择花朵素材目录和字体来源。
+
+## Glyph 应用系统
+
+新版字形系统把字体浏览器扩展为可应用的 Glyph 面板：
+
+- `TextLayer` 同时保存 `original_text`、`render_text` 和 `glyph_overrides`。
+  - `original_text` 是订单/用户输入的原始文字，用于 UI 可读展示。
+  - `render_text` 由 `original_text + glyph_overrides` 计算得到，用于预览和导出。
+  - `glyph_overrides` 按字符 index 保存 base 字符、替换字符、codepoint、glyph name、font id、usage 和 source，便于恢复和重新渲染。
+- Glyph 面板支持“推荐字形”和“全部字形”两种模式：
+  - 推荐字形只展示当前选中字符的人工绑定、命名字形或明确可归属变体。
+  - 无法判断归属的 PUA 字形不会被强行推荐，只在全部字形中显示。
+- 用户先选择文本图层中的字符位置，再点击 glyph，即可把该字形应用到当前字符；画布会立即重建 `render_text` 并刷新预览。
+- “恢复普通字符”会删除对应 index 的 override，并让 `render_text` 回到 `original_text` 对应字符。
+- 如果用户修改了文本内容，当前实现采用稳妥方案：清空该 TextLayer 上已有 glyph overrides，并提示需要重新应用，避免 index 错位后替换到错误字符。
+
+### glyph_bindings.json
+
+人工绑定配置位于 `glyph_maps/glyph_bindings.json`，结构示例：
+
+```json
+{
+  "fonts": {
+    "Font 4": {
+      "font_path": "...",
+      "bindings": {
+        "E123": {
+          "base_char": "n",
+          "usage": "end",
+          "display_name": "n 尾花",
+          "glyph_name": "uniE123"
+        }
+      }
+    }
+  }
+}
+```
+
+配置损坏时会自动备份为 `glyph_bindings.broken.YYYYMMDD_HHMMSS.json` 并重建空配置；保存使用临时文件原子替换，避免写入中断造成损坏。
+
+### glyph_rules.json
+
+自动字形规则位于 `glyph_maps/glyph_rules.json`，用于 Font 2 / Font 4 等明确配置过的字体自动替换首尾字符：
+
+```json
+{
+  "enabled": true,
+  "fonts": {
+    "Font 4": {
+      "end_char_rules": {
+        "n": "E123"
+      },
+      "start_char_rules": {}
+    }
+  }
+}
+```
+
+规则只处理明确配置过的 codepoint，不猜测未知字母。用户手动 override 优先级高于自动规则；规则失败只产生 warning，不阻塞订单渲染。
+
+## 批量订单识别预留模型
+
+`order_batch.py` 新增 `ParsedOrderResult`、本地校验和批量渲染报告结构，为后续 AI 一次返回多个订单结果预留接口。AI 结果只作为结构化输入；本地程序继续负责素材匹配、字体校验、自动字形应用和最终渲染。批量渲染时单个订单失败会记录为 `failed`，不会中断其他订单。

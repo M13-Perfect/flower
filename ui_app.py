@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 from pathlib import Path
 import struct
@@ -16,7 +17,20 @@ from typing import TypeVar
 from asset_resolver import find_flower_asset, scan_flower_assets, scan_font_assets
 from config_store import AIProfile, AppConfig, active_ai_profile, load_config, normalize_output_path, save_config
 from generation_readiness import GenerationReadiness, build_generation_readiness
-from glyph_service import GlyphApplyResult, GlyphMapConfig, check_runtime_dependencies, codepoint_to_char, normalize_codepoint, resolve_glyph
+from glyph_service import (
+    GlyphApplyResult,
+    GlyphBindingsConfig,
+    GlyphMapConfig,
+    GlyphRulesConfig,
+    apply_automatic_glyph_rules,
+    apply_glyph_variant_to_text,
+    check_runtime_dependencies,
+    codepoint_to_char,
+    normalize_codepoint,
+    rebuild_render_text,
+    remove_glyph_override,
+    resolve_glyph,
+)
 from models import AIParseConfig, BirthFlowerDesign, Document, EngravingLayout, FlowerAsset, FontAsset, ImageLayer, TextLayer, ParseResult, add_image_layer, add_text_layer, delete_layer, hit_test, move_layer
 from order_importer import load_order_remark_from_file
 from parse_pipeline import parse_order_remark_auto
@@ -40,6 +54,7 @@ APP_COLORS = {
     "warning": "#9a5b00",
 }
 T = TypeVar("T")
+LOGGER = logging.getLogger(__name__)
 
 
 def run_background(
@@ -471,6 +486,8 @@ class BirthFlowerApp:
         self._is_loading = True
         self.last_parse_result: ParseResult | None = None
         self.glyph_config = GlyphMapConfig.load()
+        self.glyph_bindings = GlyphBindingsConfig.load()
+        self.glyph_rules = GlyphRulesConfig.load()
         self.current_glyph_result: GlyphApplyResult | None = None
         self.current_manual_glyph_override: dict[str, str] | None = None
         self.current_glyph_overrides: dict[int, dict[str, object]] = {}
@@ -485,8 +502,9 @@ class BirthFlowerApp:
         self._redraw_preview()
         if not self.runtime_dependency_status.ok:
             self.warning_var.set(self.runtime_dependency_status.message)
-        if self.glyph_config.load_warning:
-            self.root.after(0, lambda: messagebox.showwarning("字形配置", self.glyph_config.load_warning))
+        for warning in (self.glyph_config.load_warning, self.glyph_bindings.load_warning, self.glyph_rules.load_warning):
+            if warning:
+                self.root.after(0, lambda warning=warning: messagebox.showwarning("字形配置", warning))
 
     def _build_menu(self) -> None:
         menu_bar = tk.Menu(self.root)
@@ -503,7 +521,11 @@ class BirthFlowerApp:
         menu_bar.add_cascade(label="文件", menu=file_menu)
         edit_menu = tk.Menu(menu_bar, tearoff=False)
         edit_menu.add_command(label="布局设置...", command=self.open_layout_settings)
-        edit_menu.add_command(label="字形...", command=self.open_glyph_panel)
+        edit_menu.add_command(label="打开字形面板", command=self.open_glyph_panel)
+        edit_menu.add_command(label="应用推荐字形", command=self.apply_recommended_glyph_to_selection)
+        edit_menu.add_command(label="恢复普通字符", command=self.restore_selected_glyph_override)
+        edit_menu.add_command(label="管理字形绑定", command=self.open_glyph_mapping_settings)
+        edit_menu.add_command(label="管理自动字形规则", command=self.show_glyph_rules_info)
         menu_bar.add_cascade(label="编辑", menu=edit_menu)
         view_menu = tk.Menu(menu_bar, tearoff=False)
         view_menu.add_command(label="刷新预览", command=self._redraw_preview)
@@ -1261,7 +1283,7 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def select_glyph_position(self, index: int) -> None:
-        text = self.name_var.get()
+        text = self._current_edit_text()
         if index < 0 or index >= len(text):
             messagebox.showerror("字符位置", "请选择当前文字中的有效字符。")
             return
@@ -1270,30 +1292,56 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def set_position_glyph_override(self, index: int, override: dict[str, object]) -> None:
-        text = self.name_var.get()
+        text = self._current_edit_text()
         if index < 0 or index >= len(text):
             messagebox.showerror("字形绑定失败", "请选择当前文字中的有效字符。")
             return
         self.current_manual_glyph_override = None
         self.selected_glyph_position = index
         clean_override = dict(override)
+        clean_override["index"] = index
+        clean_override["base_char"] = text[index]
         clean_override["original_char"] = text[index]
-        self.current_glyph_overrides[index] = clean_override
+        if clean_override.get("char") and not clean_override.get("replacement_char"):
+            clean_override["replacement_char"] = clean_override.get("char")
+        layer = self._selected_text_layer()
+        if layer is not None:
+            layer.glyph_overrides[index] = clean_override
+            self._apply_text_layer_render_text(layer)
+            self.current_glyph_overrides = dict(layer.glyph_overrides)
+        else:
+            self.current_glyph_overrides[index] = clean_override
         codepoint = clean_override.get("codepoint") or "无 Unicode"
         self.status_var.set(f"已绑定位置 {index}:{text[index]} -> {clean_override.get('glyph_name')} ({codepoint})")
+        self._refresh_layers_panel()
         self._redraw_preview()
 
     def clear_current_position_glyph_override(self) -> None:
         if self.selected_glyph_position is None:
             self.status_var.set("未选择字符位置")
             return
-        self.current_glyph_overrides.pop(self.selected_glyph_position, None)
+        layer = self._selected_text_layer()
+        if layer is not None:
+            render_text, clean_overrides, warnings = remove_glyph_override(layer.original_text, layer.glyph_overrides, self.selected_glyph_position, font_path=layer.font_path, text_layer_id=layer.id)
+            layer.render_text = render_text
+            layer.glyph_overrides = clean_overrides
+            if warnings:
+                self.warning_var.set("；".join(warnings))
+            self.current_glyph_overrides = dict(clean_overrides)
+        else:
+            self.current_glyph_overrides.pop(self.selected_glyph_position, None)
         self.status_var.set(f"已清除位置 {self.selected_glyph_position} 的字形绑定")
+        self._refresh_layers_panel()
         self._redraw_preview()
 
     def clear_all_position_glyph_overrides(self) -> None:
+        layer = self._selected_text_layer()
+        if layer is not None:
+            layer.glyph_overrides.clear()
+            layer.render_text = layer.original_text
         self.current_glyph_overrides.clear()
         self.status_var.set("已清除全部按位置字形绑定")
+        self._refresh_layers_panel()
         self._redraw_preview()
 
     def set_manual_glyph_override(self, letter: str, codepoint: str, apply_mode: str) -> None:
@@ -1311,6 +1359,104 @@ class BirthFlowerApp:
         self.current_glyph_overrides.clear()
         self.selected_glyph_position = None
         self.status_var.set(f"已应用人工字形：{letter} -> {clean_codepoint}")
+        self._redraw_preview()
+
+    def apply_recommended_glyph_to_selection(self) -> None:
+        """菜单入口：打开字形面板，面板会按当前字符显示推荐字形。"""
+        self.open_glyph_panel()
+
+    def show_glyph_rules_info(self) -> None:
+        enabled = "开启" if self.glyph_rules.enabled else "关闭"
+        messagebox.showinfo("自动字形规则", f"自动字形规则当前：{enabled}\n配置文件：{self.glyph_rules.path}")
+
+    def _selected_text_layer(self) -> TextLayer | None:
+        layer = self.document.selected_layer()
+        return layer if isinstance(layer, TextLayer) else None
+
+    def _current_edit_text(self) -> str:
+        layer = self._selected_text_layer()
+        return layer.original_text if layer is not None else self.name_var.get()
+
+    def _current_glyph_overrides(self) -> dict[int, dict[str, object]]:
+        layer = self._selected_text_layer()
+        return layer.glyph_overrides if layer is not None else self.current_glyph_overrides
+
+    def _apply_text_layer_render_text(self, layer: TextLayer) -> list[str]:
+        render_text, clean_overrides, warnings = rebuild_render_text(
+            layer.original_text,
+            layer.glyph_overrides,
+            font_path=layer.font_path,
+            text_layer_id=layer.id,
+        )
+        layer.render_text = render_text
+        layer.glyph_overrides = clean_overrides
+        layer.text = layer.original_text
+        if warnings:
+            LOGGER.warning("TextLayer 字形覆盖降级：layer_id=%s warnings=%s", layer.id, "; ".join(warnings))
+            self.warning_var.set("；".join(warnings))
+        return warnings
+
+    def apply_glyph_variant_to_current_text(self, variant) -> None:
+        layer = self._selected_text_layer()
+        if layer is None:
+            messagebox.showwarning("字形应用", "请先选择一个文本图层。")
+            return
+        index = self.selected_glyph_position
+        if index is None:
+            messagebox.showwarning("字形应用", "请先选择文本中的一个字符。")
+            return
+        try:
+            render_text, clean_overrides, warnings = apply_glyph_variant_to_text(
+                layer.original_text,
+                layer.glyph_overrides,
+                index,
+                variant,
+                font_path=layer.font_path,
+                text_layer_id=layer.id,
+            )
+        except ValueError as exc:
+            LOGGER.warning(
+                "字形替换失败：text_layer_id=%s original_text=%r index=%s glyph_name=%s error=%s",
+                layer.id,
+                layer.original_text,
+                index,
+                getattr(variant, "glyph_name", ""),
+                exc,
+            )
+            messagebox.showerror("字形应用失败", str(exc))
+            return
+        layer.render_text = render_text
+        layer.glyph_overrides = clean_overrides
+        self.current_glyph_overrides = clean_overrides
+        self.status_var.set("已应用特殊字形" if not warnings else "已应用特殊字形，但存在警告")
+        if warnings:
+            self.warning_var.set("；".join(warnings))
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def restore_selected_glyph_override(self) -> None:
+        index = self.selected_glyph_position
+        if index is None:
+            messagebox.showwarning("恢复普通字符", "请先选择文本中的一个字符。")
+            return
+        layer = self._selected_text_layer()
+        if layer is not None:
+            render_text, clean_overrides, warnings = remove_glyph_override(
+                layer.original_text,
+                layer.glyph_overrides,
+                index,
+                font_path=layer.font_path,
+                text_layer_id=layer.id,
+            )
+            layer.render_text = render_text
+            layer.glyph_overrides = clean_overrides
+            self.current_glyph_overrides = clean_overrides
+            if warnings:
+                self.warning_var.set("；".join(warnings))
+        else:
+            self.current_glyph_overrides.pop(index, None)
+        self.status_var.set("已恢复普通字符")
+        self._refresh_layers_panel()
         self._redraw_preview()
 
     def show_glyph_help(self) -> None:
@@ -1650,7 +1796,7 @@ class BirthFlowerApp:
 
     def _sync_layer_properties(self, layer) -> None:
         if isinstance(layer, TextLayer):
-            self.layer_text_var.set(layer.text)
+            self.layer_text_var.set(layer.original_text)
             self.layer_font_size_var.set(str(layer.font_size))
             self.layer_color_var.set(layer.color)
         else:
@@ -1696,7 +1842,15 @@ class BirthFlowerApp:
         if not isinstance(layer, TextLayer):
             self.status_var.set("当前选中图层不是文本图层")
             return
-        layer.text = self.layer_text_var.get()
+        old_text = layer.original_text
+        new_text = self.layer_text_var.get()
+        layer.original_text = new_text
+        layer.text = new_text
+        if old_text != new_text and layer.glyph_overrides:
+            LOGGER.info("文本内容变化，清空特殊字形绑定：layer_id=%s", layer.id)
+            layer.glyph_overrides.clear()
+            self.status_var.set("文本内容已变化，特殊字形需要重新应用")
+        layer.render_text = new_text
         try:
             layer.font_size = max(1, int(self.layer_font_size_var.get()))
         except ValueError:
@@ -1823,6 +1977,28 @@ class BirthFlowerApp:
         self._refresh_layers_panel()
         self._redraw_preview()
 
+    def _apply_auto_glyph_rules_to_layer(self, layer: TextLayer) -> None:
+        """按当前字体规则自动应用首尾字形；失败只提示 warning，不阻塞渲染。"""
+        try:
+            render_text, overrides, warnings, applied = apply_automatic_glyph_rules(
+                layer.original_text,
+                self._font_design_label(),
+                layer.font_path,
+                layer.glyph_overrides,
+                self.glyph_rules,
+            )
+        except Exception as exc:
+            LOGGER.warning("自动字形规则失败：font_id=%s reason=%s", self._font_design_label(), exc)
+            self.warning_var.set(f"自动字形应用失败：{exc}")
+            return
+        layer.render_text = render_text
+        layer.glyph_overrides = overrides
+        if applied:
+            self.current_glyph_overrides = dict(overrides)
+            self.status_var.set("已自动应用字形")
+        if warnings:
+            self.warning_var.set("；".join(warnings))
+
     def _add_text_layer_from_fields(self) -> None:
         try:
             layout = layout_from_values(self.layout_vars)
@@ -1839,6 +2015,7 @@ class BirthFlowerApp:
             height=layout.text_height,
             font_size=layout.text_size,
         )
+        self._apply_auto_glyph_rules_to_layer(layer)
         self.selected_preview_item = layer.id
         self._sync_layer_properties(layer)
         self._refresh_layers_panel()
@@ -1858,6 +2035,7 @@ class BirthFlowerApp:
         layer = self.document.selected_layer()
         if isinstance(layer, TextLayer):
             layer.font_path = asset.path
+            self._apply_auto_glyph_rules_to_layer(layer)
             self._sync_layer_properties(layer)
         self._redraw_preview()
 
@@ -2083,9 +2261,10 @@ class BirthFlowerApp:
 
     def _draw_text_layer_preview(self, canvas: tk.Canvas, layer: TextLayer, scale: float, offset_x: float, offset_y: float) -> None:
         """预览文本图层；使用 Pillow 墨迹边界实现真实视觉居中。"""
+        self._apply_text_layer_render_text(layer)
         if self._draw_ink_aligned_preview_text(
             canvas,
-            layer.text,
+            layer.render_text,
             layer.x,
             layer.y,
             layer.font_size,
@@ -2099,7 +2278,7 @@ class BirthFlowerApp:
         canvas.create_text(
             offset_x + layer.x * scale,
             offset_y + layer.y * scale,
-            text=layer.text,
+            text=layer.render_text,
             fill=layer.color,
             anchor="nw",
             font=(self._selected_preview_font_family(), max(8, round(layer.font_size * scale))),
@@ -2352,8 +2531,14 @@ class BirthFlowerApp:
         layer = self.document.layer_by_id(self.inline_text_layer_id)
         if isinstance(layer, TextLayer):
             # 每次输入立即同步到当前 TextLayer；这里只重绘预览，不触发最终 PNG/SVG/DXF 导出。
-            layer.text = editor.get("1.0", "end-1c")
-            self.layer_text_var.set(layer.text)
+            new_text = editor.get("1.0", "end-1c")
+            if new_text != layer.original_text and layer.glyph_overrides:
+                LOGGER.info("文本内容变化，清空特殊字形绑定：layer_id=%s", layer.id)
+                layer.glyph_overrides.clear()
+            layer.original_text = new_text
+            layer.text = new_text
+            layer.render_text = new_text
+            self.layer_text_var.set(layer.original_text)
             self._schedule_canvas_render()
         return "break"
 
@@ -2402,8 +2587,14 @@ class BirthFlowerApp:
         editor = self.inline_text_entry
         layer = self.document.layer_by_id(self.inline_text_layer_id)
         if editor is not None and isinstance(layer, TextLayer):
-            layer.text = editor.get("1.0", "end-1c")
-            self.layer_text_var.set(layer.text)
+            new_text = editor.get("1.0", "end-1c")
+            if new_text != layer.original_text and layer.glyph_overrides:
+                LOGGER.info("文本内容变化，清空特殊字形绑定：layer_id=%s", layer.id)
+                layer.glyph_overrides.clear()
+            layer.original_text = new_text
+            layer.text = new_text
+            layer.render_text = new_text
+            self.layer_text_var.set(layer.original_text)
         self._destroy_inline_text_editor()
         self._refresh_layers_panel()
         self._redraw_preview()
@@ -2412,8 +2603,10 @@ class BirthFlowerApp:
     def _cancel_inline_text_edit(self) -> str:
         layer = self.document.layer_by_id(self.inline_text_layer_id)
         if isinstance(layer, TextLayer):
+            layer.original_text = self.inline_text_original_text
             layer.text = self.inline_text_original_text
-            self.layer_text_var.set(layer.text)
+            layer.render_text = self.inline_text_original_text
+            self.layer_text_var.set(layer.original_text)
         self._destroy_inline_text_editor()
         self._refresh_layers_panel()
         self._redraw_preview()

@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -136,9 +139,12 @@ class ImageLayer(Layer):
 
 @dataclass
 class TextLayer(Layer):
-    """可编辑文本图层；文字不会画死到背景，而是保存属性后每次重新渲染。"""
+    """可编辑文本图层；保留原始文字，并用 render_text 承载字形替换后的视觉输出。"""
 
     text: str = "Text"
+    original_text: str = ""
+    render_text: str = ""
+    glyph_overrides: dict[int, dict[str, Any]] = field(default_factory=dict)
     font_path: Path | None = None
     font_size: int = 120
     color: str = "#111111"
@@ -148,6 +154,20 @@ class TextLayer(Layer):
     text_box_width: float = 400.0
     text_box_height: float = 160.0
     type: str = "text"
+
+    def __post_init__(self) -> None:
+        """兼容旧 TextLayer：旧数据只有 text 时，迁移出 original_text/render_text。"""
+        if not self.original_text:
+            self.original_text = self.text
+            logger.info("迁移旧文本图层到 original_text：layer_id=%s", self.id)
+        if not self.render_text:
+            self.render_text = self.original_text
+        if self.text != self.original_text:
+            self.text = self.original_text
+
+    def display_text(self) -> str:
+        """UI 可读文本：避免直接展示 PUA 乱码。"""
+        return f"{self.original_text}（已应用特殊字形）" if self.glyph_overrides else self.original_text
 
 
 @dataclass
@@ -244,6 +264,8 @@ def add_text_layer(
     layer = TextLayer(
         name=name or "Text",
         text=text,
+        original_text=text,
+        render_text=text,
         font_path=Path(font_path) if font_path else None,
         x=x,
         y=y,

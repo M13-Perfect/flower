@@ -6,9 +6,13 @@ from tkinter import messagebox, ttk
 
 from glyph_service import (
     GlyphCandidate,
+    GlyphVariant,
+    build_glyph_catalog,
+    candidate_to_variant,
     filter_glyph_candidates,
     font_contains_codepoint,
     glyph_candidate_to_override,
+    recommended_glyph_variants,
     int_to_codepoint,
     normalize_codepoint,
     render_glyph_thumbnail,
@@ -22,6 +26,21 @@ THUMB_SIZE = 72
 LOGGER = logging.getLogger(__name__)
 
 
+def _current_text(app) -> str:
+    layer = app.document.selected_layer()
+    if getattr(layer, "type", "") == "text" and hasattr(layer, "original_text"):
+        return layer.original_text
+    return app.name_var.get()
+
+
+def _current_selected_char(app) -> str:
+    text = _current_text(app)
+    index = app.selected_glyph_position
+    if index is None or index < 0 or index >= len(text):
+        return ""
+    return text[index]
+
+
 def open_glyph_panel(app, mapping_only: bool = False) -> tk.Toplevel:
     window = tk.Toplevel(app.root)
     window.title("字形")
@@ -33,7 +52,7 @@ def open_glyph_panel(app, mapping_only: bool = False) -> tk.Toplevel:
     apply_mode = tk.StringVar(value="manual_per_character" if not mapping_only else "replace_last_letter")
     manual_codepoint = tk.StringVar(value=selected_codepoint.get())
     batch_glyphs = tk.StringVar()
-    glyph_filter = tk.StringVar(value="All glyphs")
+    glyph_filter = tk.StringVar(value="推荐字形" if not mapping_only else "All glyphs")
     glyph_search = tk.StringVar()
     page_index = tk.IntVar(value=0)
     state: dict[str, object] = {"images": [], "scan_warning": ""}
@@ -146,7 +165,7 @@ def _build_current_info(app, parent: ttk.Frame) -> None:
     info.columnconfigure(1, weight=1)
     result = app.current_glyph_result
     values = (
-        ("当前", f"{app._font_design_label()} | {app.name_var.get() or '-'}"),
+        ("当前", f"{app._font_design_label()} | {_current_text(app) or '-'}"),
         ("状态", _source_label(result.glyph_source if result else "")),
         ("识别字母", result.source_letter if result and result.source_letter else "-"),
         ("字形码位", result.glyph_codepoint if result and result.glyph_codepoint else "-"),
@@ -161,7 +180,7 @@ def _build_current_info(app, parent: ttk.Frame) -> None:
 def _build_position_picker(app, parent: ttk.Frame, on_change) -> None:
     group = ttk.LabelFrame(parent, text="按文字位置替换", padding=8)
     group.pack(fill="x")
-    text = app.name_var.get()
+    text = _current_text(app)
     if not text:
         ttk.Label(group, text="请先输入 personalization 文字。").pack(anchor="w")
         return
@@ -285,13 +304,29 @@ def _build_glyph_grid(
     try:
         all_candidates = scan_font_glyphs(font_path, pua_only=False)
     except (RuntimeError, ValueError) as exc:
-        ttk.Label(grid, text=str(exc), wraplength=850).grid(row=0, column=0, sticky="w")
+        ttk.Label(grid, text=f"字体加载失败：{font_path}\n{exc}", wraplength=850).grid(row=0, column=0, sticky="w")
+        LOGGER.exception("字体扫描失败：font_path=%s", font_path)
         if state.get("scan_warning") != str(exc):
             state["scan_warning"] = str(exc)
             messagebox.showerror("字体扫描失败", str(exc))
         return
 
-    candidates = filter_glyph_candidates(all_candidates, glyph_search.get(), glyph_filter.get())
+    if glyph_filter.get() == "推荐字形":
+        current_char = _current_selected_char(app)
+        try:
+            catalog = build_glyph_catalog(font_path, app._font_design_label(), app.glyph_bindings)
+            variants = recommended_glyph_variants(catalog, current_char)
+            variant_codes = {variant.codepoint for variant in variants if variant.codepoint}
+            candidates = [candidate for candidate in all_candidates if (candidate.unicode or "").replace("U+", "").upper() in variant_codes]
+        except Exception as exc:
+            LOGGER.exception("推荐字形构建失败：font_path=%s char=%s", font_path, current_char)
+            ttk.Label(grid, text=f"推荐字形加载失败：{exc}", wraplength=850).grid(row=0, column=0, sticky="w")
+            return
+        if not current_char or not candidates:
+            ttk.Label(grid, text="当前字符暂无已识别的替代字形，可切换到全部字形或手动绑定。", wraplength=850).grid(row=0, column=0, sticky="w")
+            return
+    else:
+        candidates = filter_glyph_candidates(all_candidates, glyph_search.get(), glyph_filter.get())
     page_count = max(1, (len(candidates) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page_index.get(), page_count - 1))
     page_index.set(page)
@@ -378,12 +413,13 @@ def _select_grid_glyph(
         if app.selected_glyph_position is None:
             messagebox.showwarning("字形绑定", "请先点击 personalization 中的字符位置。")
             return
-        text = app.name_var.get()
+        text = _current_text(app)
         index = app.selected_glyph_position
         if index < 0 or index >= len(text):
             messagebox.showerror("字形绑定失败", "当前字符位置已失效，请重新选择。")
             return
-        app.set_position_glyph_override(index, glyph_candidate_to_override(glyph, text[index]))
+        variant = candidate_to_variant(glyph, font_id=app._font_design_label(), font_path=app._selected_font_path(), base_char=text[index])
+        app.apply_glyph_variant_to_current_text(variant)
         refresh_positions()
         return
     if not glyph.unicode:
@@ -409,6 +445,22 @@ def _bind_selected(app, letter: str, codepoint: str) -> None:
         _warn_if_codepoint_unverified(app, clean_codepoint)
         app.glyph_config.set_glyph_for_letter(app._font_design_label(), letter, clean_codepoint, f"{letter} ending glyph")
         app.glyph_config.save()
+        font_path = app._selected_font_path()
+        if font_path is not None:
+            variant = GlyphVariant.from_mapping(
+                {
+                    "base_char": letter,
+                    "codepoint": clean_codepoint,
+                    "glyph_name": f"uni{clean_codepoint.replace('U+', '')}",
+                    "font_id": app._font_design_label(),
+                    "font_path": str(font_path),
+                    "display_name": f"{letter} ending glyph",
+                    "usage": "end",
+                    "source": "manual_binding",
+                }
+            )
+            app.glyph_bindings.set_binding(app._font_design_label(), font_path, variant, letter, "end", f"{letter} ending glyph")
+            app.glyph_bindings.save()
     except (RuntimeError, ValueError) as exc:
         messagebox.showerror("字形绑定失败", str(exc))
         return
