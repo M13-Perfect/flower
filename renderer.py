@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
-from glyph_service import GlyphCandidate, render_glyph_thumbnail
+from glyph_service import GlyphCandidate, rebuild_render_text, render_glyph_thumbnail
 from models import BirthFlowerDesign, Document, EngravingLayout, ImageLayer, TextLayer
 from text_layout import LINE_HEIGHT_RATIO, TextLayoutResult, layout_personalization_text
 from visual_layout import FitTransform, Rect, fit_content_bbox_to_target_rect
@@ -250,12 +250,17 @@ def render_document_svg(document: Document, output_path: Path | str) -> Path:
                 )
         elif isinstance(layer, TextLayer):
             font_family = Path(layer.font_path).stem if layer.font_path else "serif"
+            render_text, clean_overrides, warnings = rebuild_render_text(layer.original_text, layer.glyph_overrides, font_path=layer.font_path, text_layer_id=layer.id)
+            layer.render_text = render_text
+            layer.glyph_overrides = clean_overrides
+            if warnings:
+                notes.extend(warnings)
             text_x = _svg_text_x(layer)
             # TODO：复杂文字、letter_spacing 与旋转组合依赖渲染器支持；PNG 使用 ink bounding box 保证正确。
             body.append(
                 f'<text id="{escape(layer.id)}" x="{text_x:.3f}" y="{layer.font_size}" fill="{escape(layer.color)}" '
                 f'font-family="{escape(font_family)}" font-size="{layer.font_size}" text-anchor="{_svg_text_anchor(layer.align)}" '
-                f'opacity="{opacity:.3f}" transform="{transform}">{escape(layer.text)}</text>'
+                f'opacity="{opacity:.3f}" transform="{transform}">{escape(render_text)}</text>'
             )
     comment = "\n".join(f"<!-- {escape(note)} -->" for note in notes)
     svg = (
@@ -307,9 +312,16 @@ def _composite_image_layer(canvas, image_module, draw_module, layer: ImageLayer)
 def _composite_text_layer(canvas, image_module, draw_module, font_module, layer: TextLayer) -> None:
     """渲染文本图层；基于 Pillow ink bbox 居中，避免只用 ascent/descent 造成视觉不居中。"""
     font = _png_font(font_module, layer.font_path, layer.font_size)
+    render_text, clean_overrides, warnings = rebuild_render_text(layer.original_text, layer.glyph_overrides, font_path=layer.font_path, text_layer_id=layer.id)
+    layer.render_text = render_text
+    layer.glyph_overrides = clean_overrides
+    if warnings:
+        import logging
+
+        logging.getLogger(__name__).warning("TextLayer 字形覆盖降级：layer_id=%s warnings=%s", layer.id, "; ".join(warnings))
     scratch = image_module.new("RGBA", (max(1, round(layer.text_box_width)), max(1, round(layer.text_box_height))), (0, 0, 0, 0))
     draw = draw_module.Draw(scratch)
-    bbox = _text_ink_bbox(draw, layer.text, font)
+    bbox = _text_ink_bbox(draw, render_text, font)
     text_width = max(1, bbox[2] - bbox[0])
     text_height = max(1, bbox[3] - bbox[1])
     if layer.align == "left":
@@ -319,7 +331,7 @@ def _composite_text_layer(canvas, image_module, draw_module, font_module, layer:
     else:
         x = (layer.text_box_width - text_width) / 2 - bbox[0]
     y = (layer.text_box_height - text_height) / 2 - bbox[1]
-    draw.text((x, y), layer.text, font=font, fill=layer.color)
+    draw.text((x, y), render_text, font=font, fill=layer.color)
     if layer.scale_x != 1 or layer.scale_y != 1:
         resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS", 1)
         scratch = scratch.resize((max(1, round(scratch.width * layer.scale_x)), max(1, round(scratch.height * layer.scale_y))), resampling)
