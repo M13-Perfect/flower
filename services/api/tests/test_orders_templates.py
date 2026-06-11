@@ -1,4 +1,6 @@
 import pytest
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -211,11 +213,73 @@ def test_apply_template_returns_editable_layer_document() -> None:
     assert text_layer["fontRef"]["family"] == "Font 2"
     assert text_layer["exportable"] is True
     assert flower_layer["type"] == "svg"
-    assert flower_layer["assetRef"] == {
-        "assetId": "flower-june-rose",
-        "path": "assets/flowers/june-rose.svg",
-    }
+    assert flower_layer["assetRef"]["assetId"] == "flower-june-rose"
+    assert flower_layer["assetRef"]["path"].endswith(".svg")
+    assert not flower_layer["assetRef"]["path"].startswith("/")
     assert flower_layer["preserveVector"] is True
+
+
+def test_apply_template_resolves_birth_month_flower_asset_from_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = tmp_path
+    template_dir = project_root / "templates" / "products"
+    asset_dir = project_root / "BirthMonth flowers"
+    template_dir.mkdir(parents=True)
+    asset_dir.mkdir()
+    (template_dir / "birth-flower-card.json").write_text(
+        """
+        {
+          "schemaVersion": "1.0",
+          "templateId": "birth-flower-card",
+          "version": "1.0.0",
+          "productType": "birth-flower",
+          "displayName": "Birth Flower Card",
+          "canvas": {
+            "width": 3000,
+            "height": 3000,
+            "unit": "px",
+            "background": { "type": "solid", "color": "#ffffff" }
+          },
+          "slots": [
+            { "slotId": "customer_name", "kind": "text", "required": true },
+            { "slotId": "flower", "kind": "svg", "required": true }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    (asset_dir / "AsterSeptember .svg").write_text(
+        '<svg viewBox="0 0 10 10"><path d="M0 0 L10 0 L10 10 Z"/></svg>',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(project_root))
+    client = TestClient(app)
+
+    response = client.post(
+        "/templates/apply",
+        json={
+            "templateId": "birth-flower-card",
+            "parsedOrder": {
+                "orderId": "order-lacey",
+                "customerName": "Lacey",
+                "month": 9,
+                "monthName": "September",
+                "flower": {"choice": 1, "name": "Aster"},
+                "fontPreference": {"choice": 3, "label": "Font 3"},
+                "specialNotes": "",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    document = response.json()["document"]
+    flower_layer = next(layer for layer in document["layers"] if layer["slotId"] == "flower")
+    assert flower_layer["assetRef"] == {
+        "assetId": "flower-september-aster",
+        "path": "BirthMonth flowers/AsterSeptember .svg",
+    }
 
 
 def test_apply_template_returns_structured_error_for_missing_required_order_data() -> None:

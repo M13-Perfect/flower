@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,34 @@ from app.schemas.orders import ParsedOrder
 
 APP_VERSION = "0.1.0"
 SUPPORTED_TEMPLATE_SCHEMA_VERSION = "1.0"
+MONTH_NAMES = {
+    1: "January",
+    2: "February",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "August",
+    9: "September",
+    10: "October",
+    11: "November",
+    12: "December",
+}
+MONTH_SHORT_NAMES = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
 
 
 def apply_template(
@@ -135,15 +164,63 @@ def _build_layers(parsed_order: ParsedOrder) -> list[dict[str, Any]]:
     assert parsed_order.flower is not None
     assert parsed_order.font_preference is not None
 
-    flower_slug = _slug(parsed_order.flower.name)
-    month_slug = parsed_order.month_name.casefold() if parsed_order.month_name else str(parsed_order.month)
-    flower_asset_id = f"flower-{month_slug}-{flower_slug}"
-    flower_path = f"assets/flowers/{month_slug}-{flower_slug}.svg"
+    flower_asset_id, flower_path = _resolve_flower_asset_ref(
+        parsed_order.month,
+        parsed_order.month_name,
+        parsed_order.flower.name,
+    )
 
     return [
         _text_layer(parsed_order.customer_name, parsed_order.font_preference.label),
         _flower_layer(parsed_order.flower.name, flower_asset_id, flower_path),
     ]
+
+
+def _resolve_flower_asset_ref(
+    month: int,
+    month_name: str | None,
+    flower_name: str,
+) -> tuple[str, str]:
+    month_slug = _slug(month_name or str(month))
+    flower_slug = _slug(flower_name)
+    asset_id = f"flower-{month_slug}-{flower_slug}"
+    default_path = Path("assets") / "flowers" / f"{month_slug}-{flower_slug}.svg"
+
+    if (_project_root() / default_path).is_file():
+        return asset_id, default_path.as_posix()
+
+    legacy_asset = _find_legacy_flower_asset(month, month_name, flower_name)
+    if legacy_asset is not None:
+        return asset_id, _relative_project_path(legacy_asset)
+
+    return asset_id, default_path.as_posix()
+
+
+def _find_legacy_flower_asset(
+    month: int,
+    month_name: str | None,
+    flower_name: str,
+) -> Path | None:
+    legacy_dir = _project_root() / "BirthMonth flowers"
+    if not legacy_dir.is_dir():
+        return None
+
+    # 业务素材目录来自店铺原始文件包，文件名不是统一 slug，只能按花名和月份做确定性匹配。
+    month_keys = {_compact(month_name or ""), _compact(MONTH_NAMES[month]), _compact(MONTH_SHORT_NAMES[month])}
+    flower_keys = _flower_match_keys(flower_name)
+    for asset_path in sorted(legacy_dir.glob("*.svg"), key=lambda path: path.name.casefold()):
+        compact_stem = _compact(asset_path.stem)
+        has_month = any(month_key and month_key in compact_stem for month_key in month_keys)
+        has_flower = any(flower_key and flower_key in compact_stem for flower_key in flower_keys)
+        if has_month and has_flower:
+            return asset_path
+    return None
+
+
+def _flower_match_keys(flower_name: str) -> set[str]:
+    compact_name = _compact(flower_name)
+    words = re.findall(r"[a-z0-9]+", flower_name.casefold())
+    return {compact_name, *(word for word in words if word)}
 
 
 def _text_layer(text: str, font_label: str) -> dict[str, Any]:
@@ -279,7 +356,8 @@ def _missing_order_fields(parsed_order: ParsedOrder) -> list[str]:
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[5]
+    default_root = Path(__file__).resolve().parents[5]
+    return Path(os.environ.get("FLOWER_PROJECT_ROOT", default_root)).resolve()
 
 
 def _utc_now() -> str:
@@ -289,3 +367,20 @@ def _utc_now() -> str:
 def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
 
+
+def _compact(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _relative_project_path(path: Path) -> str:
+    resolved = path.resolve()
+    root = _project_root()
+    try:
+        return resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise DomainError(
+            code="PATH_TRAVERSAL_BLOCKED",
+            message="Template asset path is outside the project root.",
+            details={"path": str(path)},
+            recoverable=True,
+        ) from exc
