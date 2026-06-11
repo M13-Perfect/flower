@@ -1,0 +1,29 @@
+{
+  "name": "@flower/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173 --configLoader runner",
+    "lint": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "test": "vitest run --config vitest.config.ts --configLoader runner",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.node.json && vite build --configLoader runner"
+  },
+  "dependencies": {
+    "@flower/design-core": "0.1.0",
+    "fabric": "^7.4.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "^39.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0",
+    "vitest": "^4.0.0"
+  }
+}

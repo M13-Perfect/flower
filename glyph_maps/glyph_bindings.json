@@ -1,0 +1,165 @@
+{
+  "fonts": {
+    "Font 2": {
+      "font_path": "",
+      "bindings": {
+        "E068": {
+          "base_char": "a",
+          "usage": "end",
+          "display_name": "a.005 ending glyph",
+          "glyph_name": "a.005"
+        },
+        "E069": {
+          "base_char": "b",
+          "usage": "end",
+          "display_name": "b.005 ending glyph",
+          "glyph_name": "b.005"
+        },
+        "E06A": {
+          "base_char": "c",
+          "usage": "end",
+          "display_name": "c.005 ending glyph",
+          "glyph_name": "c.005"
+        },
+        "E06B": {
+          "base_char": "d",
+          "usage": "end",
+          "display_name": "d.005 ending glyph",
+          "glyph_name": "d.005"
+        },
+        "E06C": {
+          "base_char": "e",
+          "usage": "end",
+          "display_name": "e.005 ending glyph",
+          "glyph_name": "e.005"
+        },
+        "E06D": {
+          "base_char": "f",
+          "usage": "end",
+          "display_name": "f.005 ending glyph",
+          "glyph_name": "f.005"
+        },
+        "E06E": {
+          "base_char": "g",
+          "usage": "end",
+          "display_name": "g.005 ending glyph",
+          "glyph_name": "g.005"
+        },
+        "E06F": {
+          "base_char": "h",
+          "usage": "end",
+          "display_name": "h.005 ending glyph",
+          "glyph_name": "h.005"
+        },
+        "E070": {
+          "base_char": "i",
+          "usage": "end",
+          "display_name": "i.005 ending glyph",
+          "glyph_name": "i.005"
+        },
+        "E071": {
+          "base_char": "j",
+          "usage": "end",
+          "display_name": "j.005 ending glyph",
+          "glyph_name": "j.005"
+        },
+        "E072": {
+          "base_char": "k",
+          "usage": "end",
+          "display_name": "k.005 ending glyph",
+          "glyph_name": "k.005"
+        },
+        "E073": {
+          "base_char": "l",
+          "usage": "end",
+          "display_name": "l.005 ending glyph",
+          "glyph_name": "l.005"
+        },
+        "E074": {
+          "base_char": "m",
+          "usage": "end",
+          "display_name": "m.005 ending glyph",
+          "glyph_name": "m.005"
+        },
+        "E075": {
+          "base_char": "n",
+          "usage": "end",
+          "display_name": "n.005 ending glyph",
+          "glyph_name": "n.005"
+        },
+        "E076": {
+          "base_char": "o",
+          "usage": "end",
+          "display_name": "o.005 ending glyph",
+          "glyph_name": "o.005"
+        },
+        "E077": {
+          "base_char": "p",
+          "usage": "end",
+          "display_name": "p.005 ending glyph",
+          "glyph_name": "p.005"
+        },
+        "E078": {
+          "base_char": "q",
+          "usage": "end",
+          "display_name": "q.005 ending glyph",
+          "glyph_name": "q.005"
+        },
+        "E079": {
+          "base_char": "r",
+          "usage": "end",
+          "display_name": "r.005 ending glyph",
+          "glyph_name": "r.005"
+        },
+        "E07A": {
+          "base_char": "s",
+          "usage": "end",
+          "display_name": "s.005 ending glyph",
+          "glyph_name": "s.005"
+        },
+        "E07B": {
+          "base_char": "t",
+          "usage": "end",
+          "display_name": "t.005 ending glyph",
+          "glyph_name": "t.005"
+        },
+        "E07C": {
+          "base_char": "u",
+          "usage": "end",
+          "display_name": "u.005 ending glyph",
+          "glyph_name": "u.005"
+        },
+        "E07D": {
+          "base_char": "v",
+          "usage": "end",
+          "display_name": "v.005 ending glyph",
+          "glyph_name": "v.005"
+        },
+        "E07E": {
+          "base_char": "w",
+          "usage": "end",
+          "display_name": "w.005 ending glyph",
+          "glyph_name": "w.005"
+        },
+        "E07F": {
+          "base_char": "x",
+          "usage": "end",
+          "display_name": "x.005 ending glyph",
+          "glyph_name": "x.005"
+        },
+        "E080": {
+          "base_char": "y",
+          "usage": "end",
+          "display_name": "y.005 ending glyph",
+          "glyph_name": "y.005"
+        },
+        "E081": {
+          "base_char": "z",
+          "usage": "end",
+          "display_name": "z.005 ending glyph",
+          "glyph_name": "z.005"
+        }
+      }
+    }
+  }
+}

@@ -9,6 +9,111 @@
     "enabled": true,
     "apply_mode": "replace_last_letter",
     "description": "Font 2 ending swash glyphs",
-    "letters": {}
+    "letters": {
+      "a": {
+        "codepoint": "U+E068",
+        "label": "a.005 ending glyph"
+      },
+      "b": {
+        "codepoint": "U+E069",
+        "label": "b.005 ending glyph"
+      },
+      "c": {
+        "codepoint": "U+E06A",
+        "label": "c.005 ending glyph"
+      },
+      "d": {
+        "codepoint": "U+E06B",
+        "label": "d.005 ending glyph"
+      },
+      "e": {
+        "codepoint": "U+E06C",
+        "label": "e.005 ending glyph"
+      },
+      "f": {
+        "codepoint": "U+E06D",
+        "label": "f.005 ending glyph"
+      },
+      "g": {
+        "codepoint": "U+E06E",
+        "label": "g.005 ending glyph"
+      },
+      "h": {
+        "codepoint": "U+E06F",
+        "label": "h.005 ending glyph"
+      },
+      "i": {
+        "codepoint": "U+E070",
+        "label": "i.005 ending glyph"
+      },
+      "j": {
+        "codepoint": "U+E071",
+        "label": "j.005 ending glyph"
+      },
+      "k": {
+        "codepoint": "U+E072",
+        "label": "k.005 ending glyph"
+      },
+      "l": {
+        "codepoint": "U+E073",
+        "label": "l.005 ending glyph"
+      },
+      "m": {
+        "codepoint": "U+E074",
+        "label": "m.005 ending glyph"
+      },
+      "n": {
+        "codepoint": "U+E075",
+        "label": "n.005 ending glyph"
+      },
+      "o": {
+        "codepoint": "U+E076",
+        "label": "o.005 ending glyph"
+      },
+      "p": {
+        "codepoint": "U+E077",
+        "label": "p.005 ending glyph"
+      },
+      "q": {
+        "codepoint": "U+E078",
+        "label": "q.005 ending glyph"
+      },
+      "r": {
+        "codepoint": "U+E079",
+        "label": "r.005 ending glyph"
+      },
+      "s": {
+        "codepoint": "U+E07A",
+        "label": "s.005 ending glyph"
+      },
+      "t": {
+        "codepoint": "U+E07B",
+        "label": "t.005 ending glyph"
+      },
+      "u": {
+        "codepoint": "U+E07C",
+        "label": "u.005 ending glyph"
+      },
+      "v": {
+        "codepoint": "U+E07D",
+        "label": "v.005 ending glyph"
+      },
+      "w": {
+        "codepoint": "U+E07E",
+        "label": "w.005 ending glyph"
+      },
+      "x": {
+        "codepoint": "U+E07F",
+        "label": "x.005 ending glyph"
+      },
+      "y": {
+        "codepoint": "U+E080",
+        "label": "y.005 ending glyph"
+      },
+      "z": {
+        "codepoint": "U+E081",
+        "label": "z.005 ending glyph"
+      }
+    }
   }
 }

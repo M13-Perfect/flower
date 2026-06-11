@@ -1,5 +1,74 @@
 # Birth Flower MVP
 
+## New monorepo skeleton
+
+The next version is scaffolded as a small monorepo while the current Tkinter MVP
+remains in place.
+
+```text
+apps/desktop          Electron + React + TypeScript + Vite shell
+services/api          Local Python FastAPI backend
+packages/design-core  Shared TypeScript document and template schemas
+```
+
+Setup:
+
+```powershell
+npm install
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m venv .venv-win
+.\.venv-win\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Project npm scripts use `tools/python.mjs`, which prefers `.venv-win` before the
+legacy `.venv` directory. Avoid the MSYS Python layout for the React/FastAPI
+stack because compiled dependencies such as `pydantic-core`, `ruff`, and
+`numpy` may not provide compatible wheels for that platform.
+
+If the local virtual environment uses the existing MSYS layout, it is only
+suitable for legacy checks that do not need those compiled dependencies:
+
+```powershell
+.\.venv\bin\python.exe -m pip install -r requirements.txt
+```
+
+Run the local backend:
+
+```powershell
+npm run dev --workspace @flower/api
+```
+
+Run the renderer dev server:
+
+```powershell
+npm run dev --workspace @flower/desktop
+```
+
+Run all root checks:
+
+```powershell
+npm run lint
+npm run test
+npm run build
+```
+
+Health check:
+
+```powershell
+curl http://127.0.0.1:8765/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok",
+  "service": "flower-api",
+  "version": "0.1.0"
+}
+```
+
+Canvas editing is intentionally not implemented in this skeleton.
+
 ## 当前版本说明
 
 - 主界面采用经典菜单栏：`文件 / 编辑 / 查看 / 帮助`。
@@ -21,13 +90,15 @@
 
 - `Document` 保存画布宽高、`layers` 和 `selected_layer_id`。
 - `ImageLayer` 用于 PNG/JPG/SVG 素材；每次点击“添加素材为新图层”都会 append 一个新图层，并把当时的全局默认布局复制到该图层自己的 `x/y/width/height`。
-- `TextLayer` 用于可编辑文本框；点击“添加文本”后文字、字体、字号、颜色、对齐、行距、字距和文本框尺寸都会保存在图层上，后续修改会重新渲染，不会画死到背景。
+- `TextLayer` 是数据层，不再把 Tkinter `Text/Entry` 当作最终文字图层；文字、字体、字号、颜色、水平/垂直对齐、行距、字距、文本框尺寸和 `glyph_overrides` 都保存在图层数据中。
+- `TextRenderer` 是统一渲染层；画布预览、PNG 导出和多图层 SVG 中的文本图层都从同一个透明文字 PNG 结果生成，先裁剪真实 ink bbox，再把墨迹边界映射到 TextLayer 文本框四边，避免字体行框空白造成不居中或铺不满。
+- `CanvasTextItem` 负责文本层普通状态的移动、缩放和重渲染；`FloatingTextEditor` 只在双击时作为临时编辑层出现，退出后销毁，不会进入 Document 或最终导出。
 - `GlyphLayer` 已预留给未来 PUA 字形或装饰字形工作流。
 - 图层面板可选择图层、显示/隐藏、锁定/解锁、删除、上移、下移、置顶、置底；右键素材图层或双击素材图层可打开“编辑素材...”，实时修改该图层名称、素材标识、位置、尺寸、锁定宽高比和锁定状态。锁定图层不可拖动、缩放或删除，素材编辑窗口也会禁用位置和尺寸输入。
-- 画布点击会从顶层向底层做 hit test；拖拽只移动当前选中图层，右下角控制点支持基础缩放，Delete/Backspace 可删除当前未锁定图层，方向键可微调位置。
+- 画布点击会从顶层向底层做 hit test；拖拽只移动当前选中图层，右下角控制点支持基础缩放，Delete/Backspace 可删除当前未锁定图层，方向键可微调位置。画布右键会选中命中的图层，并提供编辑、删除、锁定、层级移动、字形面板、应用推荐字形和恢复普通字符。
 - Ctrl+Z / Ctrl+Y 已预留 HistoryManager 接入口，当前版本会提示历史功能待启用。
-- PNG 导出按图层顺序合成所有可见图层；SVG 导出会尽量保留 SVG 图层引用和文本结构。复杂旋转文字、字距和部分 SVG transform 仍在代码中标注 TODO，生产准确性以 PNG 导出为准。
-- 文本预览和 PNG 渲染使用 Pillow 的 ink bounding box 做真实视觉居中；复杂文字排版仍可能受 RAQM 支持影响。
+- PNG 导出按图层顺序合成所有可见图层；多图层 SVG 会尽量保留 SVG 素材引用，但 TextLayer 会以 TextRenderer 输出的透明 PNG 嵌入并写入“不是纯矢量”的提示，确保视觉结果与预览一致。
+- 文本预览、PNG 导出和多图层 SVG 文本嵌入使用 Pillow 的 ink bounding box 做真实视觉居中和铺满；复杂文字排版仍可能受 RAQM 支持影响。
 
 ### 全局布局默认值与图层独立编辑
 
@@ -103,7 +174,7 @@ $env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
 - `文件 -> 设置... -> 输出设置` 可设置画布宽高；例如设置为 `1372 x 1280` 时，最终导出的 SVG/DXF/PNG 都使用同一画布比例。
 - 右侧 `布局参数` 可设置字宽/字高；单行姓名会按真实墨迹 bbox 非等比铺满该方框，使文字墨迹上下左右贴合边框，字号由方框自动推导，主界面暂不显示独立字号输入。
 - 主界面素材与字体区只保留下拉选择；导入新素材或字体统一通过 `文件 -> 导入 -> 导入素材...` 完成。
-- 双击画布内已有文字会进入画布覆盖式 inline text editing：编辑器贴近当前 TextLayer 边界框，输入内容会实时写回该图层并仅重绘预览；Enter / Ctrl+Enter / 点击画布提交，Esc 取消并恢复编辑前文本，不会新增文本图层。
+- 双击画布内已有文字会进入画布覆盖式 inline text editing：编辑器贴近当前 TextLayer 边界框，编辑时不显示虚线选择框或实线输入边框；输入内容会实时写回该图层并仅重绘预览；Enter / Ctrl+Enter / 点击画布提交，Esc 取消并恢复编辑前文本，不会新增文本图层。选中文本框内单个字符后，可通过右键或字形面板应用推荐字形、恢复普通字符。
 - 人工确认字段中的 `内容` 支持 `区分大小写` 勾选；取消勾选时最终预览和导出统一转为小写。
 - `编辑 -> 字形...` 会集中显示字形状态、识别字母、字形码位、应用方式和人工确认提醒。
 - 最终文件只会在用户点击“人工确认并生成 SVG+DXF”后生成。
@@ -205,6 +276,20 @@ $env:OPENAI_ORG_ID="org_xxx"
 
 默认只启用 `Font 2` 和 `Font 4`，默认应用方式为 `replace_last_letter`：例如 `Jazmin` 会渲染为 `Jazmi + n字形`，不会渲染为 `Jazmin + n字形`。也支持 `append_suffix` 和 `manual_per_character`。
 
+Font 2 已内置截图中的 26 个常用结尾字形，glyph name 为 `a.005` 到 `z.005`，PUA 码位从 `U+E068` 到 `U+E081`，按 a-z 顺序连续递增：
+
+| 字母 | 码位 | 字母 | 码位 | 字母 | 码位 | 字母 | 码位 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| a | U+E068 | b | U+E069 | c | U+E06A | d | U+E06B |
+| e | U+E06C | f | U+E06D | g | U+E06E | h | U+E06F |
+| i | U+E070 | j | U+E071 | k | U+E072 | l | U+E073 |
+| m | U+E074 | n | U+E075 | o | U+E076 | p | U+E077 |
+| q | U+E078 | r | U+E079 | s | U+E07A | t | U+E07B |
+| u | U+E07C | v | U+E07D | w | U+E07E | x | U+E07F |
+| y | U+E080 | z | U+E081 |  |  |  |  |
+
+Font 2 自动结尾规则也已绑定同一套码位：新增 TextLayer 或最终生成时，会按最后一个英文字母自动替换对应 `.005` 字形；仍必须由用户点击“人工确认并生成”后才会输出最终文件。
+
 配置 Font 4 的 `n` 字形示例：
 
 ```json
@@ -222,7 +307,7 @@ $env:OPENAI_ORG_ID="org_xxx"
 
 也可以在 UI 中维护：
 
-- `编辑 -> 字形...`：打开类似 Photoshop 的字形窗口，选择字体、切换完整字体/PUA 字形网格，并把选中的字形应用到当前订单。
+- `编辑 -> 字形...`：打开类似 Photoshop 的字形窗口，选择字体、切换完整字体/PUA 字形网格，并把选中的字形应用到当前订单；主菜单只保留这一处字形入口，画布右键提供快捷的“应用推荐字形”和“恢复普通字符”。
 
 字形窗口支持：
 
@@ -233,6 +318,20 @@ $env:OPENAI_ORG_ID="org_xxx"
 - 按文字位置绑定：例如 `Jazmin` 会显示 `[0:J] [1:a] [2:z] [3:m] [4:i] [5:n]`，先点位置，再点 glyph。
 - 清除当前字符绑定和清除全部绑定。
 - 手动输入 `U+E014` 这类 codepoint，也支持按 a-z 顺序批量粘贴 26 个字形字符。
+
+### 如何绑定字形
+
+如果需要重新绑定或替换字体里的码位：
+
+1. 进入 `编辑 -> 管理字形绑定`。
+2. 在字体下拉中选择 `Font 2`。
+3. 筛选选择 `PUA only`，用于只看私用区字形。
+4. 单个绑定：选择“映射字母”，在“手动 codepoint”输入 `U+E068` 这类码位，点击“使用输入码位”，再点击“绑定到映射字母”。
+5. 批量绑定：按 a-z 顺序粘贴 26 个 PUA 字符到“批量 26 字形”，点击“按 a-z 绑定”。顺序必须是 a、b、c ... z。
+6. 回到主界面选择 Font 2，输入姓名，预览会把最后一个英文字母替换成对应 `.005` 结尾字形。
+7. 生成前检查预览和确认弹窗；解析或绑定不会自动生成最终文件。
+
+注意：SVG/DXF 当前仍输出字体字符，不会把 PUA 字形转曲线。换电脑或换雕刻软件时必须保证同一 Font 2 字体文件可用；否则优先导出 PNG 或后续增加文字轮廓化。
 
 按位置绑定的内存结构示例：
 
@@ -315,12 +414,12 @@ choco install ripgrep
 
 - `TextLayer` 同时保存 `original_text`、`render_text` 和 `glyph_overrides`。
   - `original_text` 是订单/用户输入的原始文字，用于 UI 可读展示。
-  - `render_text` 由 `original_text + glyph_overrides` 计算得到，用于预览和导出。
-  - `glyph_overrides` 按字符 index 保存 base 字符、替换字符、codepoint、glyph name、font id、usage 和 source，便于恢复和重新渲染。
+  - `render_text` 由 `original_text + glyph_overrides` 计算得到，再交给 `TextRenderer` 生成透明文字图，用于预览和导出。
+  - `glyph_overrides` 按字符 index 保存 base 字符、替换字符、codepoint、glyph id、glyph name、font id、usage 和 source，便于恢复和重新渲染。
 - Glyph 面板支持“推荐字形”和“全部字形”两种模式：
   - 推荐字形只展示当前选中字符的人工绑定、命名字形或明确可归属变体。
   - 无法判断归属的 PUA 字形不会被强行推荐，只在全部字形中显示。
-- 用户先选择文本图层中的字符位置，再点击 glyph，即可把该字形应用到当前字符；画布会立即重建 `render_text` 并刷新预览。
+- 用户先选择文本图层中的字符位置，再点击 glyph，即可把该字形应用到当前字符；画布会立即重建 `render_text`，并通过 `TextRenderer` 刷新透明文字图。
 - “恢复普通字符”会删除对应 index 的 override，并让 `render_text` 回到 `original_text` 对应字符。
 - 如果用户修改了文本内容，当前实现采用稳妥方案：清空该 TextLayer 上已有 glyph overrides，并提示需要重新应用，避免 index 错位后替换到错误字符。
 

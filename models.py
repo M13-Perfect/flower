@@ -148,8 +148,11 @@ class TextLayer(Layer):
     font_path: Path | None = None
     font_size: int = 120
     color: str = "#111111"
+    fill_color: str = ""
     align: str = "center"
+    vertical_align: str = "middle"
     line_spacing: float = 1.2
+    tracking: float = 0.0
     letter_spacing: float = 0.0
     text_box_width: float = 400.0
     text_box_height: float = 160.0
@@ -164,6 +167,15 @@ class TextLayer(Layer):
             self.render_text = self.original_text
         if self.text != self.original_text:
             self.text = self.original_text
+        # 新旧字段并存：旧 UI 仍读写 color/letter_spacing，新渲染器使用 fill_color/tracking。
+        if not self.fill_color:
+            self.fill_color = self.color or "#111111"
+        if not self.color:
+            self.color = self.fill_color or "#111111"
+        if self.tracking == 0 and self.letter_spacing != 0:
+            self.tracking = self.letter_spacing
+        elif self.letter_spacing == 0 and self.tracking != 0:
+            self.letter_spacing = self.tracking
 
     def display_text(self) -> str:
         """UI 可读文本：避免直接展示 PUA 乱码。"""
