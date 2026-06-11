@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   EXPORT_SETTINGS_SCHEMA_VERSION,
@@ -8,6 +8,10 @@ import {
 import { createApiClient } from "./client";
 
 describe("desktop API client", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("calls the backend health endpoint", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const fetchImpl: typeof fetch = async (input, init) => {
@@ -37,6 +41,30 @@ describe("desktop API client", () => {
     });
     expect(String(calls[0].input)).toBe("http://127.0.0.1:8765/health");
     expect(calls[0].init?.method).toBe("GET");
+  });
+
+  it("uses the Vite API base URL when no explicit base URL is provided", async () => {
+    vi.stubEnv("VITE_FLOWER_API_BASE_URL", "http://127.0.0.1:8766/");
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      calls.push({ input, init });
+      return new Response(
+        JSON.stringify({
+          status: "ok",
+          service: "flower-api",
+          version: "0.1.0",
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    };
+
+    const client = createApiClient({ fetch: fetchImpl });
+
+    await expect(client.health()).resolves.toMatchObject({ status: "ok" });
+    expect(String(calls[0].input)).toBe("http://127.0.0.1:8766/health");
   });
 
   it("calls the backend font catalog endpoint", async () => {
