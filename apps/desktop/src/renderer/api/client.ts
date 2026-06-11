@@ -1,3 +1,5 @@
+import type { LayerDocument } from "@flower/design-core";
+
 export interface HealthResponse {
   status: "ok";
   service: "flower-api";
@@ -67,6 +69,90 @@ export interface FontGlyphsResponse {
   glyphCount: number;
 }
 
+export interface FlowerChoice {
+  choice: number;
+  name: string;
+}
+
+export interface FontPreference {
+  choice: number;
+  label: string;
+}
+
+export interface ParsedOrder {
+  orderId?: string | null;
+  customerName?: string | null;
+  month?: number | null;
+  monthName?: string | null;
+  flower?: FlowerChoice | null;
+  fontPreference?: FontPreference | null;
+  specialNotes: string;
+}
+
+export interface ParseOrderRequest {
+  orderNote: string;
+  orderId?: string | null;
+}
+
+export interface ParseOrderResponse {
+  parsedOrder: ParsedOrder;
+  warnings: string[];
+  requiresManualConfirmation: boolean;
+}
+
+export interface ApplyTemplateRequest {
+  templateId: string;
+  parsedOrder: ParsedOrder;
+  projectId?: string | null;
+  jobId?: string | null;
+}
+
+export interface ApplyTemplateResponse {
+  document: LayerDocument;
+  warnings: string[];
+  requiresManualConfirmation: boolean;
+}
+
+export interface DxfExportRequest {
+  document: LayerDocument;
+  units?: "px" | "mm" | "in" | null;
+  exportedAt?: string | null;
+}
+
+export interface ExportWarning {
+  code: string;
+  message: string;
+  layerId?: string | null;
+}
+
+export interface DxfExportResponse {
+  fileName: string;
+  mimeType: "application/dxf";
+  contentBase64: string;
+  metadata: Record<string, string>;
+  warnings: ExportWarning[];
+}
+
+export interface SaveOutputsRequest {
+  orderName: string;
+  document: LayerDocument;
+  svg: string;
+  pngDataUrl: string;
+  dxfContentBase64?: string | null;
+}
+
+export interface SavedOutputFile {
+  kind: "json" | "png" | "svg" | "dxf";
+  fileName: string;
+  relativePath: string;
+  bytesWritten: number;
+}
+
+export interface SaveOutputsResponse {
+  outputDir: string;
+  files: SavedOutputFile[];
+}
+
 export interface ApiClientOptions {
   baseUrl?: string;
   fetch?: typeof globalThis.fetch;
@@ -104,6 +190,42 @@ export function createApiClient(options: ApiClientOptions = {}) {
         "Font glyph scan failed",
       );
     },
+
+    async parseOrder(request: ParseOrderRequest): Promise<ParseOrderResponse> {
+      return postJson<ParseOrderResponse>(
+        fetchImpl,
+        `${baseUrl}/orders/parse`,
+        request,
+        "Order parse failed",
+      );
+    },
+
+    async applyTemplate(request: ApplyTemplateRequest): Promise<ApplyTemplateResponse> {
+      return postJson<ApplyTemplateResponse>(
+        fetchImpl,
+        `${baseUrl}/templates/apply`,
+        request,
+        "Template apply failed",
+      );
+    },
+
+    async exportDxf(request: DxfExportRequest): Promise<DxfExportResponse> {
+      return postJson<DxfExportResponse>(
+        fetchImpl,
+        `${baseUrl}/exports/dxf`,
+        request,
+        "DXF export failed",
+      );
+    },
+
+    async saveOutputs(request: SaveOutputsRequest): Promise<SaveOutputsResponse> {
+      return postJson<SaveOutputsResponse>(
+        fetchImpl,
+        `${baseUrl}/outputs/save`,
+        request,
+        "Output save failed",
+      );
+    },
   };
 }
 
@@ -119,6 +241,28 @@ async function requestJson<T>(
     headers: {
       accept: "application/json",
     },
+  });
+
+  if (!response.ok) {
+    throw new ApiError(`${failureMessage} with HTTP ${response.status}`, response.status);
+  }
+
+  return (await response.json()) as T;
+}
+
+async function postJson<T>(
+  fetchImpl: typeof globalThis.fetch,
+  url: string,
+  body: unknown,
+  failureMessage: string,
+): Promise<T> {
+  const response = await fetchImpl(url, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
