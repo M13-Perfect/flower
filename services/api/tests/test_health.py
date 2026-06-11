@@ -23,3 +23,12 @@ def test_health_allows_desktop_dev_origin() -> None:
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+
+
+def test_health_allows_alternate_loopback_dev_origin() -> None:
+    client = TestClient(app)
+
+    response = client.get("/health", headers={"Origin": "http://127.0.0.1:5199"})
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5199"
