@@ -53,6 +53,30 @@ describe("export pipeline", () => {
     expect(exported.content).not.toContain("<rect width=\"300\" height=\"200\"");
   });
 
+  it("removes unsafe inline SVG wrapper and namespace attributes before export", () => {
+    const document = createDocument();
+    const flowerLayer = document.layers[1];
+    if (flowerLayer.type !== "svg") {
+      throw new Error("Expected fixture layer to be SVG");
+    }
+
+    document.layers[1] = {
+      ...flowerLayer,
+      inlineSvg:
+        '<?xml version="1.0"?><!DOCTYPE svg><svg viewBox="0 0 10 10" xml:space="preserve" xmlns:serif="http://www.serif.com/"><g serif:id="20.svg"><path d="M0 0h10v10z" fill="#d74862"/></g></svg>',
+    };
+
+    const exported = createSvgExport(document, {
+      exportedAt: EXPORTED_AT,
+    });
+
+    expect(exported.content).not.toContain("<!DOCTYPE");
+    expect(exported.content.match(/<\?xml/g)).toHaveLength(1);
+    expect(exported.content).not.toContain("xml:space");
+    expect(exported.content).not.toContain("serif:id");
+    expect(exported.content).toContain('<path d="M0 0h10v10z" fill="#d74862"/>');
+  });
+
   it("rasterizes PNG from the exported SVG with requested scale and transparent background", async () => {
     const calls: PngRasterizeInput[] = [];
 
