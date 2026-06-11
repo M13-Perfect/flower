@@ -5,14 +5,17 @@ import {
   LAYER_DOCUMENT_SCHEMA_VERSION,
   type Layer,
   type LayerDocument,
+  type TextLayer,
   validateLayerDocument,
 } from "@flower/design-core";
-import { createApiClient, type HealthResponse } from "./api/client";
+import { createApiClient, type FontSummary, type HealthResponse, type ParsedOrder } from "./api/client";
 import { FabricCanvas } from "./canvas/FabricCanvas";
 import {
   applyGlyphOverrideToTextLayer,
   listLayersForDisplay,
   updateLayerProperty,
+  updateTextLayerContent,
+  updateTextLayerFont,
   type TextGlyphOverrideInput,
 } from "./canvas/layerFabricModel";
 import {
@@ -23,6 +26,7 @@ import {
   type ExportBackground,
 } from "./export/exportPipeline";
 import { GlyphPicker } from "./GlyphPicker";
+import { createDxfDataUrl, createOutputOrderName, selectInitialEditableLayerId } from "./orderWorkflow";
 import "./styles.css";
 
 type HealthState =
@@ -38,6 +42,12 @@ export function App() {
   const [selectedLayerId, setSelectedLayerId] = useState<string | null>("layer_text");
   const [savedJson, setSavedJson] = useState(() => JSON.stringify(createSampleLayerDocument(), null, 2));
   const [saveMessage, setSaveMessage] = useState("valid");
+  const [orderId, setOrderId] = useState("");
+  const [orderNote, setOrderNote] = useState("");
+  const [orderMessage, setOrderMessage] = useState("ready");
+  const [parsedOrder, setParsedOrder] = useState<ParsedOrder | null>(null);
+  const [fonts, setFonts] = useState<FontSummary[]>([]);
+  const [fontMessage, setFontMessage] = useState("loading");
   const [exportScale, setExportScale] = useState(() => document.exportSettings.png.scale);
   const [transparentExport, setTransparentExport] = useState(
     () => document.exportSettings.png.background === "transparent",
@@ -60,6 +70,30 @@ export function App() {
             status: "error",
             message: error instanceof Error ? error.message : "Backend health check failed",
           });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFontMessage("loading");
+
+    apiClient
+      .listFonts()
+      .then((response) => {
+        if (!cancelled) {
+          setFonts(response.fonts);
+          setFontMessage(response.fonts.length > 0 ? `${response.fonts.length} fonts` : "no fonts");
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setFonts([]);
+          setFontMessage(error instanceof Error ? error.message : "Font scan failed");
         }
       });
 
@@ -93,6 +127,83 @@ export function App() {
       setDocument((currentDocument) => updateLayerProperty(currentDocument, selectedLayerId, patch));
     },
     [selectedLayerId],
+  );
+
+  const handleParseAndApplyOrder = useCallback(() => {
+    const trimmedNote = orderNote.trim();
+    if (!trimmedNote) {
+      setOrderMessage("order note required");
+      return;
+    }
+
+    setOrderMessage("parsing");
+    void apiClient
+      .parseOrder({
+        orderNote: trimmedNote,
+        orderId: orderId.trim() || undefined,
+      })
+      .then((parseResponse) => {
+        setParsedOrder(parseResponse.parsedOrder);
+        setOrderMessage("applying template");
+        return apiClient.applyTemplate({
+          templateId: "birth-flower-card",
+          parsedOrder: parseResponse.parsedOrder,
+        });
+      })
+      .then((templateResponse) => {
+        setDocument(templateResponse.document);
+        setSelectedLayerId(selectInitialEditableLayerId(templateResponse.document));
+        setSavedJson(JSON.stringify(templateResponse.document, null, 2));
+        setSaveMessage("template applied");
+        setExportScale(templateResponse.document.exportSettings.png.scale);
+        setTransparentExport(templateResponse.document.exportSettings.png.background === "transparent");
+        setOrderMessage("template applied");
+      })
+      .catch((error: unknown) => {
+        setOrderMessage(error instanceof Error ? error.message : "Order workflow failed");
+      });
+  }, [orderId, orderNote]);
+
+  const handleTextContentChange = useCallback(
+    (text: string) => {
+      if (!selectedLayerId) {
+        return;
+      }
+      try {
+        setDocument((currentDocument) => updateTextLayerContent(currentDocument, selectedLayerId, text));
+        setSaveMessage("text updated");
+      } catch (error) {
+        setSaveMessage(error instanceof Error ? error.message : "text update failed");
+      }
+    },
+    [selectedLayerId],
+  );
+
+  const handleTextFontChange = useCallback(
+    (fontId: string) => {
+      if (!selectedLayerId) {
+        return;
+      }
+      const font = fonts.find((candidate) => candidate.id === fontId);
+      if (!font) {
+        setSaveMessage("font not found");
+        return;
+      }
+      try {
+        setDocument((currentDocument) =>
+          updateTextLayerFont(currentDocument, selectedLayerId, {
+            family: font.familyName,
+            source: "asset",
+            assetId: font.id,
+            fallbackFamilies: ["serif"],
+          }),
+        );
+        setSaveMessage("font updated");
+      } catch (error) {
+        setSaveMessage(error instanceof Error ? error.message : "font update failed");
+      }
+    },
+    [fonts, selectedLayerId],
   );
 
   const handleSaveJson = () => {
@@ -146,6 +257,48 @@ export function App() {
       });
   }, [document, exportBackground, exportScale]);
 
+  const handleExportDxf = useCallback(() => {
+    setExportMessage("DXF exporting");
+    void apiClient
+      .exportDxf({
+        document,
+        units: document.exportSettings.dxf.units,
+      })
+      .then((exported) => {
+        downloadDataUrl(createDxfDataUrl(exported.mimeType, exported.contentBase64), exported.fileName);
+        setExportMessage(exported.warnings.length > 0 ? `DXF ${exported.warnings.length} warnings` : "DXF ready");
+      })
+      .catch((error: unknown) => {
+        setExportMessage(error instanceof Error ? error.message : "DXF export failed");
+      });
+  }, [document]);
+
+  const handleSaveAllOutputs = useCallback(() => {
+    setExportMessage("saving outputs");
+    void Promise.all([
+      Promise.resolve(createSvgExport(document, { background: exportBackground })),
+      createPngExport(document, { background: exportBackground, scale: exportScale }),
+      apiClient.exportDxf({ document, units: document.exportSettings.dxf.units }),
+    ])
+      .then(([svgExport, pngExport, dxfExport]) =>
+        apiClient.saveOutputs({
+          orderName: createOutputOrderName(document, parsedOrder?.customerName ?? ""),
+          document,
+          svg: svgExport.content,
+          pngDataUrl: pngExport.dataUrl,
+          dxfContentBase64: dxfExport.contentBase64,
+        }),
+      )
+      .then((saved) => {
+        setSavedJson(JSON.stringify(document, null, 2));
+        setSaveMessage("outputs saved");
+        setExportMessage(`saved ${saved.outputDir}`);
+      })
+      .catch((error: unknown) => {
+        setExportMessage(error instanceof Error ? error.message : "Output save failed");
+      });
+  }, [document, exportBackground, exportScale, parsedOrder?.customerName]);
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -158,6 +311,16 @@ export function App() {
 
       <section className="editor-grid" aria-label="Fabric layer editor">
         <aside className="sidebar" aria-label="Layers">
+          <OrderPanel
+            message={orderMessage}
+            orderId={orderId}
+            orderNote={orderNote}
+            parsedOrder={parsedOrder}
+            onChangeOrderId={setOrderId}
+            onChangeOrderNote={setOrderNote}
+            onParseAndApply={handleParseAndApplyOrder}
+          />
+
           <div className="panel-header">
             <h2>Layers</h2>
             <span>{document.layers.length}</span>
@@ -198,6 +361,14 @@ export function App() {
             <p className="empty-state">No layer selected.</p>
           )}
 
+          <TextLayerPanel
+            fonts={fonts}
+            fontMessage={fontMessage}
+            layer={selectedTextLayer}
+            onChangeFont={handleTextFontChange}
+            onChangeText={handleTextContentChange}
+          />
+
           <GlyphPicker
             apiClient={apiClient}
             layer={selectedTextLayer}
@@ -210,8 +381,10 @@ export function App() {
             transparent={transparentExport}
             onChangeScale={setExportScale}
             onChangeTransparent={setTransparentExport}
+            onExportDxf={handleExportDxf}
             onExportPng={handleExportPng}
             onExportSvg={handleExportSvg}
+            onSaveAll={handleSaveAllOutputs}
           />
 
           <div className="save-panel">
@@ -230,20 +403,138 @@ export function App() {
   );
 }
 
+function OrderPanel({
+  message,
+  onChangeOrderId,
+  onChangeOrderNote,
+  onParseAndApply,
+  orderId,
+  orderNote,
+  parsedOrder,
+}: {
+  message: string;
+  onChangeOrderId: (value: string) => void;
+  onChangeOrderNote: (value: string) => void;
+  onParseAndApply: () => void;
+  orderId: string;
+  orderNote: string;
+  parsedOrder: ParsedOrder | null;
+}) {
+  return (
+    <section className="order-panel" aria-label="Order workflow">
+      <div className="panel-header">
+        <h2>Order</h2>
+        <span>{message}</span>
+      </div>
+      <label className="text-field">
+        <span>id</span>
+        <input
+          onChange={(event) => onChangeOrderId(event.currentTarget.value)}
+          placeholder="optional"
+          value={orderId}
+        />
+      </label>
+      <label className="stack-field">
+        <span>note</span>
+        <textarea
+          onChange={(event) => onChangeOrderNote(event.currentTarget.value)}
+          value={orderNote}
+        />
+      </label>
+      <button className="primary-action" onClick={onParseAndApply} type="button">
+        Parse + apply
+      </button>
+      {parsedOrder ? (
+        <dl className="order-summary">
+          <div>
+            <dt>name</dt>
+            <dd>{parsedOrder.customerName}</dd>
+          </div>
+          <div>
+            <dt>flower</dt>
+            <dd>{parsedOrder.flower?.name}</dd>
+          </div>
+          <div>
+            <dt>font</dt>
+            <dd>{parsedOrder.fontPreference?.label}</dd>
+          </div>
+        </dl>
+      ) : null}
+    </section>
+  );
+}
+
+function TextLayerPanel({
+  fontMessage,
+  fonts,
+  layer,
+  onChangeFont,
+  onChangeText,
+}: {
+  fontMessage: string;
+  fonts: FontSummary[];
+  layer: TextLayer | null;
+  onChangeFont: (fontId: string) => void;
+  onChangeText: (text: string) => void;
+}) {
+  const selectedFontId = layer ? matchLayerFontId(layer, fonts) : "";
+
+  return (
+    <section className="text-panel" aria-label="Text layer editor">
+      <div className="panel-header">
+        <h2>Text</h2>
+        <span>{layer ? layer.fontRef.family : "text only"}</span>
+      </div>
+      {!layer ? <p className="empty-state">No text layer selected.</p> : null}
+      {layer ? (
+        <>
+          <label className="stack-field">
+            <span>content</span>
+            <textarea
+              onChange={(event) => onChangeText(event.currentTarget.value)}
+              value={layer.text}
+            />
+          </label>
+          <label className="select-field">
+            <span>font</span>
+            <select
+              disabled={fonts.length === 0}
+              onChange={(event) => onChangeFont(event.currentTarget.value)}
+              value={selectedFontId}
+            >
+              {selectedFontId === "" ? <option value="">Current: {layer.fontRef.family}</option> : null}
+              {fonts.map((font) => (
+                <option key={font.id} value={font.id}>
+                  {font.familyName}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="field-note">{fontMessage}</p>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
 function ExportPanel({
   message,
   onChangeScale,
   onChangeTransparent,
+  onExportDxf,
   onExportPng,
   onExportSvg,
+  onSaveAll,
   scale,
   transparent,
 }: {
   message: string;
   onChangeScale: (scale: number) => void;
   onChangeTransparent: (transparent: boolean) => void;
+  onExportDxf: () => void;
   onExportPng: () => void;
   onExportSvg: () => void;
+  onSaveAll: () => void;
   scale: number;
   transparent: boolean;
 }) {
@@ -278,8 +569,14 @@ function ExportPanel({
         <button className="secondary-action" onClick={onExportSvg} type="button">
           SVG
         </button>
+        <button className="secondary-action" onClick={onExportDxf} type="button">
+          DXF
+        </button>
         <button className="primary-action" onClick={onExportPng} type="button">
           PNG
+        </button>
+        <button className="primary-action" onClick={onSaveAll} type="button">
+          Save all
         </button>
       </div>
     </div>
@@ -414,6 +711,18 @@ function findLayerById(layers: readonly Layer[], layerId: string | null): Layer 
   }
 
   return null;
+}
+
+function matchLayerFontId(layer: TextLayer, fonts: readonly FontSummary[]): string {
+  const normalizedFamily = layer.fontRef.family.trim().toLocaleLowerCase();
+  return (
+    fonts.find(
+      (font) =>
+        font.id === layer.fontRef.assetId ||
+        font.familyName.trim().toLocaleLowerCase() === normalizedFamily ||
+        font.fullName.trim().toLocaleLowerCase() === normalizedFamily,
+    )?.id ?? ""
+  );
 }
 
 function createSampleLayerDocument(): LayerDocument {
