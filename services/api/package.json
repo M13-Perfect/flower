@@ -1,0 +1,11 @@
+{
+  "name": "@flower/api",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "node ../../tools/python.mjs -m uvicorn app.main:app --host 127.0.0.1 --port 8765 --reload",
+    "lint": "node ../../tools/python.mjs -m ruff check .",
+    "test": "node ../../tools/python.mjs -m pytest tests -q",
+    "build": "node ../../tools/python.mjs -m compileall app"
+  }
+}

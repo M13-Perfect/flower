@@ -11,10 +11,10 @@ import threading
 from collections.abc import Callable, Mapping
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from types import SimpleNamespace
 from typing import TypeVar
 
 from asset_resolver import find_flower_asset, scan_flower_assets, scan_font_assets
+from canvas_text_item import CanvasTextItem, FloatingTextEditor
 from config_store import AIProfile, AppConfig, active_ai_profile, load_config, normalize_output_path, save_config
 from generation_readiness import GenerationReadiness, build_generation_readiness
 from glyph_service import (
@@ -24,10 +24,12 @@ from glyph_service import (
     GlyphRulesConfig,
     apply_automatic_glyph_rules,
     apply_glyph_variant_to_text,
+    build_glyph_catalog,
     check_runtime_dependencies,
     codepoint_to_char,
     normalize_codepoint,
     rebuild_render_text,
+    recommended_glyph_variants,
     remove_glyph_override,
     resolve_glyph,
 )
@@ -474,6 +476,7 @@ class BirthFlowerApp:
         self.inline_text_original_text: str = ""
         self.inline_text_render_after_id: str | None = None
         self.inline_text_is_closing = False
+        self.floating_text_editor: FloatingTextEditor | None = None
         self.section_frames: dict[str, tk.Widget] = {}
         self._drag_target: str | None = None
         self._drag_start: tuple[int, int] | None = None
@@ -521,11 +524,7 @@ class BirthFlowerApp:
         menu_bar.add_cascade(label="文件", menu=file_menu)
         edit_menu = tk.Menu(menu_bar, tearoff=False)
         edit_menu.add_command(label="布局设置...", command=self.open_layout_settings)
-        edit_menu.add_command(label="打开字形面板", command=self.open_glyph_panel)
-        edit_menu.add_command(label="应用推荐字形", command=self.apply_recommended_glyph_to_selection)
-        edit_menu.add_command(label="恢复普通字符", command=self.restore_selected_glyph_override)
-        edit_menu.add_command(label="管理字形绑定", command=self.open_glyph_mapping_settings)
-        edit_menu.add_command(label="管理自动字形规则", command=self.show_glyph_rules_info)
+        edit_menu.add_command(label="字形...", command=self.open_glyph_panel)
         menu_bar.add_cascade(label="编辑", menu=edit_menu)
         view_menu = tk.Menu(menu_bar, tearoff=False)
         view_menu.add_command(label="刷新预览", command=self._redraw_preview)
@@ -724,6 +723,8 @@ class BirthFlowerApp:
         self.preview_canvas.grid(row=0, column=0, sticky="nsew")
         self.preview_canvas.bind("<Button-1>", self._on_canvas_press)
         self.preview_canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
+        self.preview_canvas.bind("<Button-3>", self._show_canvas_context_menu)
+        self.preview_canvas.bind("<Button-2>", self._show_canvas_context_menu)
         self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", lambda _event: self._redraw_preview())
@@ -1361,9 +1362,51 @@ class BirthFlowerApp:
         self.status_var.set(f"已应用人工字形：{letter} -> {clean_codepoint}")
         self._redraw_preview()
 
+    def _sync_selected_glyph_position_from_inline_selection(self) -> bool:
+        """把画布内联文本框的选区起点同步为字形覆盖 index。"""
+        editor = self.inline_text_entry
+        layer = self.document.layer_by_id(self.inline_text_layer_id)
+        if editor is None or not isinstance(layer, TextLayer):
+            return False
+        try:
+            selection_start = editor.index("sel.first")
+            count = editor.count("1.0", selection_start, "chars")
+        except tk.TclError:
+            return False
+        if not count:
+            return False
+        index = int(count[0])
+        if index < 0 or index >= len(layer.original_text):
+            return False
+        self.document.selected_layer_id = layer.id
+        self.selected_preview_item = layer.id
+        self.selected_glyph_position = index
+        self.status_var.set(f"已选择字符位置：{index}:{layer.original_text[index]}")
+        return True
+
     def apply_recommended_glyph_to_selection(self) -> None:
-        """菜单入口：打开字形面板，面板会按当前字符显示推荐字形。"""
-        self.open_glyph_panel()
+        """把当前字符的首个推荐字形直接应用；无推荐时打开完整字形面板。"""
+        self._sync_selected_glyph_position_from_inline_selection()
+        layer = self._selected_text_layer()
+        index = self.selected_glyph_position
+        if layer is None or index is None or index < 0 or index >= len(layer.original_text):
+            self.open_glyph_panel()
+            return
+        font_path = layer.font_path or self._selected_font_path()
+        if font_path is None:
+            self.open_glyph_panel()
+            return
+        try:
+            catalog = build_glyph_catalog(font_path, self._font_design_label(), self.glyph_bindings)
+            variants = recommended_glyph_variants(catalog, layer.original_text[index])
+        except Exception as exc:
+            LOGGER.warning("推荐字形加载失败：font_path=%s index=%s error=%s", font_path, index, exc)
+            self.open_glyph_panel()
+            return
+        if not variants:
+            self.open_glyph_panel()
+            return
+        self.apply_glyph_variant_to_current_text(variants[0])
 
     def show_glyph_rules_info(self) -> None:
         enabled = "开启" if self.glyph_rules.enabled else "关闭"
@@ -1435,6 +1478,7 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def restore_selected_glyph_override(self) -> None:
+        self._sync_selected_glyph_position_from_inline_selection()
         index = self.selected_glyph_position
         if index is None:
             messagebox.showwarning("恢复普通字符", "请先选择文本中的一个字符。")
@@ -1462,9 +1506,11 @@ class BirthFlowerApp:
     def show_glyph_help(self) -> None:
         messagebox.showinfo(
             "字形使用说明",
-            "Font 2 和 Font 4 可启用结尾字形。\n"
-            "默认模式会用配置的 PUA 字形替换最后一个英文字母。\n"
-            "人工覆盖只影响当前订单；映射绑定会保存到 glyph_maps/glyph_maps.json。\n"
+            "Font 2 已内置 a-z 26 个结尾字形：a=U+E068，z=U+E081，中间按字母顺序连续递增。\n"
+            "默认模式 replace_last_letter 会用配置的 PUA 字形替换最后一个英文字母，例如 Jazmin -> Jazmi + n.005。\n"
+            "人工绑定：编辑 -> 管理字形绑定，选择 Font 2，筛选 PUA only；单个绑定时选择映射字母、输入 U+E068 这类 codepoint，再点绑定到映射字母。\n"
+            "批量绑定：按 a-z 顺序粘贴 26 个 PUA 字符，再点按 a-z 绑定。\n"
+            "按位置替换只影响当前订单；映射绑定会保存到 glyph_maps/glyph_maps.json。\n"
             "SVG 和 DXF 当前仍依赖字体文件显示 PUA 字符，换环境可能显示异常。",
         )
 
@@ -1651,6 +1697,75 @@ class BirthFlowerApp:
         finally:
             menu.grab_release()
 
+    def _show_canvas_context_menu(self, event) -> str:
+        """画布右键菜单：命中图层后复用图层操作和字形操作。"""
+        canvas = self.preview_canvas
+        if canvas is None:
+            return "break"
+        if self.inline_text_entry is not None:
+            self._commit_inline_text_edit()
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        doc_x = (event.x - offset_x) / scale
+        doc_y = (event.y - offset_y) / scale
+        layer = hit_test(self.document, doc_x, doc_y)
+        self.document.selected_layer_id = layer.id if layer else None
+        self.selected_preview_item = self.document.selected_layer_id
+        if layer is not None:
+            self._sync_layer_properties(layer)
+        canvas.focus_set()
+        self._refresh_layers_panel()
+        self._redraw_preview()
+        menu = self._build_canvas_context_menu(layer)
+        self._popup_context_menu(menu, event)
+        return "break"
+
+    def _show_inline_text_context_menu(self, event) -> str:
+        """内联文本框右键：不提交编辑，直接对当前选区做字形操作。"""
+        self._sync_selected_glyph_position_from_inline_selection()
+        menu = self._build_canvas_context_menu(self._selected_text_layer())
+        self._popup_context_menu(menu, event)
+        return "break"
+
+    def _popup_context_menu(self, menu: tk.Menu, event) -> None:
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _build_canvas_context_menu(self, layer) -> tk.Menu:
+        menu = tk.Menu(self.root, tearoff=False)
+        is_text = isinstance(layer, TextLayer)
+        is_image = isinstance(layer, ImageLayer)
+        has_layer = layer is not None
+        unlocked = has_layer and not layer.locked
+        if is_text:
+            menu.add_command(label="编辑文本", command=lambda layer=layer: self._start_inline_text_edit(layer))
+        elif is_image:
+            menu.add_command(label="编辑素材...", command=self.open_selected_material_editor)
+        else:
+            menu.add_command(label="编辑文本", state="disabled", command=self._start_inline_text_edit)
+        menu.add_command(label="删除", state="normal" if unlocked else "disabled", command=self._delete_selected_layer)
+        menu.add_command(
+            label="解锁" if has_layer and layer.locked else "锁定",
+            state="normal" if has_layer else "disabled",
+            command=self._toggle_selected_layer_locked,
+        )
+        menu.add_separator()
+        menu.add_command(label="上移", state="normal" if has_layer else "disabled", command=lambda: self._move_selected_layer("up"))
+        menu.add_command(label="下移", state="normal" if has_layer else "disabled", command=lambda: self._move_selected_layer("down"))
+        menu.add_command(label="置顶", state="normal" if has_layer else "disabled", command=lambda: self._move_selected_layer("top"))
+        menu.add_command(label="置底", state="normal" if has_layer else "disabled", command=lambda: self._move_selected_layer("bottom"))
+        menu.add_separator()
+        glyph_state = "normal" if is_text else "disabled"
+        menu.add_command(label="字形...", state=glyph_state, command=self.open_glyph_panel)
+        menu.add_command(label="应用推荐字形", state=glyph_state, command=self.apply_recommended_glyph_to_selection)
+        menu.add_command(label="恢复普通字符", state=glyph_state, command=self.restore_selected_glyph_override)
+        return menu
+
     def _on_layer_list_double_click(self, event) -> None:
         layer = self._layer_from_listbox_event(event)
         if isinstance(layer, ImageLayer):
@@ -1798,7 +1913,7 @@ class BirthFlowerApp:
         if isinstance(layer, TextLayer):
             self.layer_text_var.set(layer.original_text)
             self.layer_font_size_var.set(str(layer.font_size))
-            self.layer_color_var.set(layer.color)
+            self.layer_color_var.set(layer.fill_color or layer.color)
         else:
             self.layer_text_var.set("")
 
@@ -1856,7 +1971,8 @@ class BirthFlowerApp:
         except ValueError:
             messagebox.showerror("文本属性", "字号必须是整数")
             return
-        layer.color = self.layer_color_var.get().strip() or "#111111"
+        layer.fill_color = self.layer_color_var.get().strip() or "#111111"
+        layer.color = layer.fill_color
         # 文本修改后只更新 TextLayer，自身仍可继续编辑并重新渲染。
         self._refresh_layers_panel()
         self._redraw_preview()
@@ -2260,29 +2376,45 @@ class BirthFlowerApp:
         canvas.create_image(sx(layer.x), sy(layer.y), image=photo, anchor="nw", tags=("layer_art", f"layer:{layer.id}"))
 
     def _draw_text_layer_preview(self, canvas: tk.Canvas, layer: TextLayer, scale: float, offset_x: float, offset_y: float) -> None:
-        """预览文本图层；使用 Pillow 墨迹边界实现真实视觉居中。"""
-        self._apply_text_layer_render_text(layer)
-        if self._draw_ink_aligned_preview_text(
-            canvas,
-            layer.render_text,
-            layer.x,
-            layer.y,
-            layer.font_size,
-            layer.font_path,
-            scale,
-            offset_x,
-            offset_y,
-            SimpleNamespace(left=layer.x, top=layer.y, width=layer.text_box_width, height=layer.text_box_height),
-        ):
+        """普通状态只显示 TextRenderer 输出的透明文字图；输入控件不进入最终画布。"""
+        try:
+            from PIL import ImageTk
+        except Exception:
             return
-        canvas.create_text(
+        result = CanvasTextItem(layer).render()
+        if result.warnings:
+            LOGGER.warning("TextLayer 预览降级：layer_id=%s warnings=%s", layer.id, "; ".join(result.warnings))
+            self.warning_var.set("；".join(result.warnings))
+        image = result.image
+        target_width = max(1, round(image.width * layer.scale_x * scale))
+        target_height = max(1, round(image.height * layer.scale_y * scale))
+        if image.size != (target_width, target_height):
+            try:
+                from PIL import Image
+
+                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+                image = image.resize((target_width, target_height), resampling)
+            except Exception:
+                image = image.resize((target_width, target_height))
+        if layer.rotation:
+            try:
+                from PIL import Image
+
+                resampling = getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
+                image = image.rotate(-layer.rotation, expand=True, resample=resampling)
+            except Exception:
+                image = image.rotate(-layer.rotation, expand=True)
+        try:
+            photo = ImageTk.PhotoImage(image)
+        except Exception:
+            return
+        self.preview_text_images.append(photo)
+        canvas.create_image(
             offset_x + layer.x * scale,
             offset_y + layer.y * scale,
-            text=layer.render_text,
-            fill=layer.color,
+            image=photo,
             anchor="nw",
-            font=(self._selected_preview_font_family(), max(8, round(layer.font_size * scale))),
-            tags=("layer_art", f"layer:{layer.id}"),
+            tags=("text_art", "layer_art", f"layer:{layer.id}"),
         )
 
     def _draw_ink_aligned_preview_text(
@@ -2418,6 +2550,8 @@ class BirthFlowerApp:
         return scale, offset_x, offset_y
 
     def _draw_selection_controls(self, canvas: tk.Canvas, layout: EngravingLayout, sx, sy) -> None:
+        if self.inline_text_entry is not None:
+            return
         layer = self.document.selected_layer()
         if layer is None:
             return
@@ -2489,6 +2623,7 @@ class BirthFlowerApp:
         self.document.selected_layer_id = layer.id
         self.inline_text_layer_id = layer.id
         self.inline_text_original_text = layer.text
+        self.floating_text_editor = FloatingTextEditor(layer.id, layer.text)
         self.inline_text_is_closing = False
 
         editor = tk.Text(
@@ -2498,11 +2633,9 @@ class BirthFlowerApp:
             bg="white",
             fg=layer.color or APP_COLORS["text"],
             insertbackground=layer.color or APP_COLORS["text"],
-            relief="solid",
-            borderwidth=1,
-            highlightthickness=1,
-            highlightbackground="#4a90e2",
-            highlightcolor="#4a90e2",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
         )
         # 保留 Unicode / PUA 私用区字符：不做任何输入过滤，直接写回 TextLayer.text。
         editor.insert("1.0", layer.text)
@@ -2512,6 +2645,9 @@ class BirthFlowerApp:
         editor.bind("<Return>", lambda _event: self._commit_inline_text_edit())
         editor.bind("<Control-Return>", lambda _event: self._commit_inline_text_edit())
         editor.bind("<Escape>", lambda _event: self._cancel_inline_text_edit())
+        editor.bind("<FocusOut>", lambda _event: self._commit_inline_text_edit() if not self.inline_text_is_closing else "break")
+        editor.bind("<Button-3>", self._show_inline_text_context_menu)
+        editor.bind("<Button-2>", self._show_inline_text_context_menu)
         self.inline_text_entry = editor
         self._place_inline_text_editor()
         editor.focus_set()
@@ -2537,7 +2673,10 @@ class BirthFlowerApp:
                 layer.glyph_overrides.clear()
             layer.original_text = new_text
             layer.text = new_text
-            layer.render_text = new_text
+            if layer.glyph_overrides:
+                self._apply_text_layer_render_text(layer)
+            else:
+                layer.render_text = new_text
             self.layer_text_var.set(layer.original_text)
             self._schedule_canvas_render()
         return "break"
@@ -2577,7 +2716,17 @@ class BirthFlowerApp:
         except tk.TclError:
             pass
         if self.inline_text_window is None:
-            self.inline_text_window = canvas.create_window(x, y, window=editor, anchor="nw", width=width, height=height)
+            self.inline_text_window = canvas.create_window(
+                x,
+                y,
+                window=editor,
+                anchor="nw",
+                width=width,
+                height=height,
+                tags=("inline_text_editor",),
+            )
+            if self.floating_text_editor is not None:
+                self.floating_text_editor.window_id = self.inline_text_window
         else:
             canvas.coords(self.inline_text_window, x, y)
             canvas.itemconfigure(self.inline_text_window, width=width, height=height)
@@ -2593,7 +2742,10 @@ class BirthFlowerApp:
                 layer.glyph_overrides.clear()
             layer.original_text = new_text
             layer.text = new_text
-            layer.render_text = new_text
+            if layer.glyph_overrides:
+                self._apply_text_layer_render_text(layer)
+            else:
+                layer.render_text = new_text
             self.layer_text_var.set(layer.original_text)
         self._destroy_inline_text_editor()
         self._refresh_layers_panel()
@@ -2605,7 +2757,10 @@ class BirthFlowerApp:
         if isinstance(layer, TextLayer):
             layer.original_text = self.inline_text_original_text
             layer.text = self.inline_text_original_text
-            layer.render_text = self.inline_text_original_text
+            if layer.glyph_overrides:
+                self._apply_text_layer_render_text(layer)
+            else:
+                layer.render_text = self.inline_text_original_text
             self.layer_text_var.set(layer.original_text)
         self._destroy_inline_text_editor()
         self._refresh_layers_panel()
@@ -2625,11 +2780,14 @@ class BirthFlowerApp:
         self.inline_text_entry = None
         if self.inline_text_window is not None and canvas is not None:
             canvas.delete(self.inline_text_window)
+        if canvas is not None:
+            canvas.delete("inline_text_editor")
         if editor is not None:
             editor.destroy()
         self.inline_text_window = None
         self.inline_text_layer_id = None
         self.inline_text_original_text = ""
+        self.floating_text_editor = None
         self.inline_text_is_closing = False
 
     def _on_canvas_press(self, event) -> None:
@@ -2678,14 +2836,17 @@ class BirthFlowerApp:
         dy = (event.y - self._drag_start[1]) / scale
         self._drag_start = (event.x, event.y)
         if self._drag_mode == "resize":
-            layer.width = max(20, layer.width + dx)
-            layer.height = max(20, layer.height + dy)
             if isinstance(layer, TextLayer):
-                layer.text_box_width = layer.width
-                layer.text_box_height = layer.height
+                CanvasTextItem(layer).resize_by(dx, dy)
+            else:
+                layer.width = max(20, layer.width + dx)
+                layer.height = max(20, layer.height + dy)
         else:
-            layer.x = max(0, layer.x + dx)
-            layer.y = max(0, layer.y + dy)
+            if isinstance(layer, TextLayer):
+                CanvasTextItem(layer).move_by(dx, dy)
+            else:
+                layer.x = max(0, layer.x + dx)
+                layer.y = max(0, layer.y + dy)
         self._redraw_preview()
 
     def _on_canvas_release(self, _event) -> None:

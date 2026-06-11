@@ -9,6 +9,8 @@ from glyph_service import (
     GlyphVariant,
     apply_automatic_glyph_rules,
     apply_glyph_variant_to_text,
+    default_glyph_bindings_payload,
+    default_glyph_rules_payload,
     rebuild_render_text,
     remove_glyph_override,
 )
@@ -97,6 +99,29 @@ def test_automatic_end_rule_applies_and_can_be_disabled():
     assert (render_text, overrides, warnings, applied) == ("Jazmin", {}, [], False)
 
 
+def test_font2_default_bindings_and_rules_cover_common_ending_glyphs():
+    bindings = default_glyph_bindings_payload()["fonts"]["Font 2"]["bindings"]
+    rules = default_glyph_rules_payload()["fonts"]["Font 2"]["end_char_rules"]
+
+    assert bindings["E068"]["base_char"] == "a"
+    assert bindings["E081"]["base_char"] == "z"
+    assert rules["a"] == "E068"
+    assert rules["z"] == "E081"
+
+    render_text, overrides, warnings, applied = apply_automatic_glyph_rules(
+        "Jazmin",
+        "Font 2",
+        None,
+        {},
+        GlyphRulesConfig(data=default_glyph_rules_payload()),
+    )
+
+    assert warnings == []
+    assert applied is True
+    assert render_text == "Jazmi\ue075"
+    assert overrides[5]["codepoint"] == "E075"
+
+
 def test_manual_override_wins_over_automatic_rule():
     manual = {5: {"index": 5, "base_char": "n", "replacement_char": "\ue999", "codepoint": "E999", "source": "manual"}}
     rules = GlyphRulesConfig(data={"enabled": True, "fonts": {"Font 4": {"end_char_rules": {"n": "E123"}}}})
@@ -117,8 +142,9 @@ def test_corrupt_bindings_and_rules_are_backed_up_and_rebuilt(tmp_path):
     bindings = GlyphBindingsConfig.load(bindings_path)
     rules = GlyphRulesConfig.load(rules_path)
 
-    assert bindings.data == {"fonts": {}}
+    assert bindings.data == default_glyph_bindings_payload()
     assert rules.data["enabled"] is True
+    assert rules.data["fonts"]["Font 2"]["end_char_rules"]["n"] == "E075"
     assert list(tmp_path.glob("glyph_bindings.broken.*.json"))
     assert list(tmp_path.glob("glyph_rules.broken.*.json"))
 

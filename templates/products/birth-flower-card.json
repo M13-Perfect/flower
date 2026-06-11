@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "1.0",
+  "templateId": "birth-flower-card",
+  "version": "1.0.0",
+  "productType": "birth-flower",
+  "displayName": "Birth Flower Card",
+  "canvas": {
+    "width": 3000,
+    "height": 3000,
+    "unit": "px",
+    "background": {
+      "type": "solid",
+      "color": "#ffffff"
+    }
+  },
+  "slots": [
+    {
+      "slotId": "customer_name",
+      "kind": "text",
+      "required": true
+    },
+    {
+      "slotId": "flower",
+      "kind": "svg",
+      "required": true
+    },
+    {
+      "slotId": "product_photo",
+      "kind": "image",
+      "required": false
+    }
+  ]
+}

@@ -8,7 +8,7 @@ import pytest
 
 from config_store import AIProfile
 from generation_readiness import GenerationReadiness
-from glyph_service import GlyphApplyResult
+from glyph_service import GlyphApplyResult, GlyphVariant
 from models import FlowerAsset, FontAsset, ImageLayer, TextLayer
 from models import FlowerAsset, FontAsset, TextLayer, add_text_layer
 import ui_app as ui_app_module
@@ -209,16 +209,15 @@ def test_birth_flower_app_initializes_desktop_ui_state():
             for index in range(edit_menu.index("end") + 1)
             if edit_menu.type(index) != "separator"
         ]
-        assert edit_labels == ["字形..."]
+        assert edit_labels == ["布局设置...", "字形..."]
+        assert app.preview_canvas.bind("<Button-3>")
+        assert app.preview_canvas.bind("<Button-2>")
         visible_texts = _widget_texts(root)
         assert "内容" in visible_texts
         assert "区分大小写" in visible_texts
         assert "添加" not in visible_texts
         assert "画布宽" not in visible_texts
         assert "画布高" not in visible_texts
-        assert "字宽" in visible_texts
-        assert "字高" in visible_texts
-        assert "字号" not in visible_texts
         assert "生产输出" in visible_texts
         assert "人工确认并生成" in visible_texts
         assert "姓名/文字" not in visible_texts
@@ -281,7 +280,9 @@ def test_import_font_file_selects_font_and_text(monkeypatch, tmp_path):
         assert app.font_source_var.get() == str(font_path)
         assert app.font_assets == [font_asset]
         assert app.font_var.get() == "5"
-        assert app.selected_preview_item == "text"
+        layer = app.document.selected_layer()
+        assert isinstance(layer, TextLayer)
+        assert app.selected_preview_item == layer.id
     finally:
         root.destroy()
 
@@ -375,6 +376,33 @@ def test_double_click_text_opens_inline_editor_and_commits_content():
         root.destroy()
 
 
+def test_inline_text_editor_has_no_visual_frame_and_hides_selection_box():
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        layer = add_text_layer(app.document, "Rose", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._redraw_preview()
+        assert app.preview_canvas is not None
+        assert app.preview_canvas.find_withtag("selection_box")
+
+        app._start_inline_text_edit(layer)
+        app._redraw_preview()
+
+        assert app.inline_text_entry is not None
+        assert app.inline_text_entry.cget("relief") == "flat"
+        assert int(app.inline_text_entry.cget("borderwidth")) == 0
+        assert int(app.inline_text_entry.cget("highlightthickness")) == 0
+        assert not app.preview_canvas.find_withtag("selection_box")
+        assert not app.preview_canvas.find_withtag("selection_handle")
+    finally:
+        root.destroy()
+
+
 def test_inline_text_editor_updates_layer_live_and_preserves_pua(monkeypatch):
     try:
         root = tk.Tk()
@@ -403,6 +431,96 @@ def test_inline_text_editor_updates_layer_live_and_preserves_pua(monkeypatch):
         root.destroy()
 
 
+def test_restore_glyph_uses_inline_text_selection(monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    warnings = []
+    monkeypatch.setattr(ui_app_module.messagebox, "showwarning", lambda title, message: warnings.append((title, message)))
+
+    try:
+        app = BirthFlowerApp(root)
+        layer = add_text_layer(app.document, "Jazmin", x=100, y=80, width=240, height=90, font_size=72)
+        layer.glyph_overrides[5] = {
+            "index": 5,
+            "base_char": "n",
+            "original_char": "n",
+            "replacement_char": "\ue123",
+            "char": "\ue123",
+            "codepoint": "E123",
+            "glyph_name": "uniE123",
+            "source": "manual",
+        }
+        app.document.selected_layer_id = layer.id
+        app._apply_text_layer_render_text(layer)
+        assert layer.render_text == "Jazmi\ue123"
+
+        app._start_inline_text_edit(layer)
+        assert app.inline_text_entry is not None
+        app.inline_text_entry.tag_remove("sel", "1.0", "end")
+        app.inline_text_entry.tag_add("sel", "1.5", "1.6")
+        app.selected_glyph_position = None
+
+        app.restore_selected_glyph_override()
+
+        assert warnings == []
+        assert app.selected_glyph_position == 5
+        assert layer.glyph_overrides == {}
+        assert layer.render_text == "Jazmin"
+    finally:
+        root.destroy()
+
+
+def test_apply_recommended_glyph_uses_inline_text_selection(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    font_path = tmp_path / "Font2.ttf"
+    font_path.write_bytes(b"fake font")
+    variant = GlyphVariant.from_mapping(
+        {
+            "base_char": "n",
+            "replacement_char": "\ue123",
+            "codepoint": "E123",
+            "glyph_name": "uniE123",
+            "font_id": "Font 2",
+            "font_path": str(font_path),
+            "display_name": "n ending glyph",
+            "usage": "end",
+            "source": "manual_binding",
+        }
+    )
+
+    monkeypatch.setattr(ui_app_module, "build_glyph_catalog", lambda *_args, **_kwargs: object(), raising=False)
+    monkeypatch.setattr(ui_app_module, "recommended_glyph_variants", lambda _catalog, char: [variant] if char == "n" else [], raising=False)
+
+    opened = []
+
+    try:
+        app = BirthFlowerApp(root)
+        monkeypatch.setattr(app, "_selected_font_path", lambda: font_path)
+        monkeypatch.setattr(app, "open_glyph_panel", lambda: opened.append(True))
+        layer = add_text_layer(app.document, "Jazmin", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._start_inline_text_edit(layer)
+        assert app.inline_text_entry is not None
+        app.inline_text_entry.tag_remove("sel", "1.0", "end")
+        app.inline_text_entry.tag_add("sel", "1.5", "1.6")
+
+        app.apply_recommended_glyph_to_selection()
+
+        assert opened == []
+        assert app.selected_glyph_position == 5
+        assert layer.glyph_overrides[5]["glyph_name"] == "uniE123"
+        assert layer.render_text == "Jazmi\ue123"
+    finally:
+        root.destroy()
+
+
 def test_inline_text_editor_escape_restores_original_text():
     try:
         root = tk.Tk()
@@ -427,6 +545,33 @@ def test_inline_text_editor_escape_restores_original_text():
         assert layer.text == "Rose"
         assert app.inline_text_entry is None
         assert len(app.document.layers) == 1
+    finally:
+        root.destroy()
+
+
+def test_inline_text_editor_exit_removes_canvas_window_and_border():
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        layer = add_text_layer(app.document, "Rose", x=100, y=80, width=240, height=90, font_size=72)
+        app.document.selected_layer_id = layer.id
+        app._start_inline_text_edit(layer)
+
+        assert app.inline_text_entry is not None
+        assert app.preview_canvas is not None
+        assert any(app.preview_canvas.type(item) == "window" for item in app.preview_canvas.find_all())
+
+        app._commit_inline_text_edit()
+        app._redraw_preview()
+
+        assert app.inline_text_entry is None
+        assert app.inline_text_window is None
+        assert not any(app.preview_canvas.type(item) == "window" for item in app.preview_canvas.find_all())
+        assert not app.preview_canvas.find_withtag("inline_text_editor")
     finally:
         root.destroy()
 
@@ -482,6 +627,65 @@ def test_preview_selection_draws_box_and_can_delete_selected_flower(tmp_path):
 
         assert app.document.layers == []
         assert app.selected_preview_item is None
+    finally:
+        root.destroy()
+
+
+def test_canvas_context_menu_selects_layer_and_exposes_canvas_and_glyph_actions(monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    menus = []
+
+    class FakeMenu:
+        def __init__(self, *_args, **_kwargs):
+            self.labels = []
+            menus.append(self)
+
+        def add_command(self, **kwargs):
+            self.labels.append(kwargs.get("label"))
+
+        def add_separator(self):
+            self.labels.append("---")
+
+        def tk_popup(self, *_args):
+            self.popup_called = True
+
+        def grab_release(self):
+            self.released = True
+
+    try:
+        app = BirthFlowerApp(root)
+        monkeypatch.setattr(ui_app_module.tk, "Menu", FakeMenu)
+        layer = add_text_layer(app.document, "Rose", x=100, y=80, width=240, height=90, font_size=72)
+        assert app.preview_canvas is not None
+        app._redraw_preview()
+        layout = layout_from_values(app.layout_vars)
+        scale, offset_x, offset_y = app._preview_transform(layout)
+        event = SimpleNamespace(
+            x=int(offset_x + (layer.x + 10) * scale),
+            y=int(offset_y + (layer.y + 10) * scale),
+            x_root=300,
+            y_root=240,
+        )
+
+        app._show_canvas_context_menu(event)
+
+        assert app.document.selected_layer_id == layer.id
+        assert menus
+        labels = menus[-1].labels
+        assert "编辑文本" in labels
+        assert "删除" in labels
+        assert "锁定" in labels
+        assert "上移" in labels
+        assert "下移" in labels
+        assert "置顶" in labels
+        assert "置底" in labels
+        assert "字形..." in labels
+        assert "应用推荐字形" in labels
+        assert "恢复普通字符" in labels
     finally:
         root.destroy()
 
@@ -586,9 +790,10 @@ def test_programmatic_flower_refresh_and_parse_do_not_add_layers(monkeypatch, tm
 
     try:
         app = BirthFlowerApp(root)
-        flower_path = tmp_path / "Iris.svg"
+        flower_path = tmp_path / "IrisMay.svg"
         flower_path.write_text("<svg/>", encoding="utf-8")
         asset = FlowerAsset(name="Iris", month=5, flower=1, path=flower_path, display_name="Iris")
+        app.flower_dir_var.set(str(tmp_path))
         app.flower_assets = [asset]
         warnings = []
         monkeypatch.setattr(ui_app_module.messagebox, "showwarning", lambda title, message: warnings.append((title, message)))
@@ -673,6 +878,34 @@ def test_glyph_menu_opens_ps_like_glyph_window():
         assert "字形网格" in texts
         assert "字母 a-z" not in texts
         assert "当前字体 PUA glyph" not in texts
+    finally:
+        root.destroy()
+
+
+def test_glyph_help_explains_font2_default_binding(monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    captured = {}
+
+    def fake_showinfo(title, message):
+        captured["title"] = title
+        captured["message"] = message
+
+    monkeypatch.setattr(ui_app_module.messagebox, "showinfo", fake_showinfo)
+
+    try:
+        app = BirthFlowerApp(root)
+        app.show_glyph_help()
+
+        assert captured["title"] == "字形使用说明"
+        assert "Font 2 已内置 a-z 26 个结尾字形" in captured["message"]
+        assert "a=U+E068" in captured["message"]
+        assert "z=U+E081" in captured["message"]
+        assert "编辑 -> 管理字形绑定" in captured["message"]
+        assert "按 a-z 绑定" in captured["message"]
     finally:
         root.destroy()
 

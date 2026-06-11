@@ -1,0 +1,21 @@
+{
+  "name": "flower",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "npm@11.9.0",
+  "description": "Order-driven material generation editor monorepo.",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node tools/dev.mjs",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

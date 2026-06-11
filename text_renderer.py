@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from glyph_service import rebuild_render_text
+from models import TextLayer
+
+
+@dataclass(frozen=True)
+class InkBounds:
+    left: int
+    top: int
+    right: int
+    bottom: int
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
+
+
+@dataclass(frozen=True)
+class TextRenderResult:
+    image: Any
+    render_text: str
+    glyph_overrides: dict[int, dict[str, Any]]
+    ink_bbox: InkBounds | None
+    warnings: list[str]
+
+
+class TextRenderer:
+    """文本层统一渲染器；预览和 PNG 导出都必须通过这里生成透明文字图。"""
+
+    def render_layer(self, layer: TextLayer) -> TextRenderResult:
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError as exc:
+            raise RuntimeError("当前环境未安装 Pillow，无法渲染文本图层。") from exc
+
+        warnings: list[str] = []
+        box_width = self._positive_int(getattr(layer, "text_box_width", layer.width) or layer.width, "文本框宽度", warnings)
+        box_height = self._positive_int(getattr(layer, "text_box_height", layer.height) or layer.height, "文本框高度", warnings)
+        font_size = self._positive_int(getattr(layer, "font_size", 0), "字号", warnings)
+        font_path = self._valid_font_path(getattr(layer, "font_path", None), warnings)
+        text = self._source_text(layer)
+        if getattr(layer, "original_text", "") != text:
+            layer.original_text = text
+
+        glyph_warnings = self._raw_glyph_warnings(getattr(layer, "glyph_overrides", {}) or {})
+        render_text, clean_overrides, rebuild_warnings = rebuild_render_text(
+            text,
+            getattr(layer, "glyph_overrides", {}) or {},
+            font_path=font_path,
+            text_layer_id=getattr(layer, "id", ""),
+        )
+        warnings.extend(glyph_warnings)
+        warnings.extend(rebuild_warnings)
+
+        image = Image.new("RGBA", (box_width, box_height), (0, 0, 0, 0))
+        if not render_text:
+            warnings.append("空文本：已渲染透明文本图层。")
+            return TextRenderResult(image, render_text, clean_overrides, None, warnings)
+
+        font = self._load_font(ImageFont, font_path, font_size, warnings)
+        fill = self._fill_color(layer)
+        line_spacing = self._line_spacing(layer)
+        tracking = self._tracking(layer)
+        lines = render_text.splitlines() or [render_text]
+        line_images = [self._render_line(Image, ImageDraw, font, line, fill, tracking) for line in lines]
+        non_empty_lines = [line_image for line_image in line_images if line_image is not None]
+        if not non_empty_lines:
+            warnings.append("文本没有可见墨迹：已渲染透明文本图层。")
+            return TextRenderResult(image, render_text, clean_overrides, None, warnings)
+
+        text_image = self._compose_text_image(Image, non_empty_lines, layer, font_size, line_spacing)
+        if text_image is None:
+            warnings.append("文本没有可见墨迹：已渲染透明文本图层。")
+            return TextRenderResult(image, render_text, clean_overrides, None, warnings)
+        image = self._fill_text_box_with_ink(Image, text_image, box_width, box_height)
+
+        ink = image.getbbox()
+        ink_bbox = InkBounds(*ink) if ink else None
+        if ink_bbox is None:
+            warnings.append("文本没有可见墨迹：已渲染透明文本图层。")
+        return TextRenderResult(image, render_text, clean_overrides, ink_bbox, warnings)
+
+    def _valid_font_path(self, font_path: Path | str | None, warnings: list[str]) -> Path | None:
+        if not font_path:
+            return None
+        path = Path(font_path)
+        if not path.is_file():
+            warnings.append(f"字体文件不存在：{path}，已使用默认字体降级渲染。")
+            return None
+        return path
+
+    def _load_font(self, image_font_module, font_path: Path | None, font_size: int, warnings: list[str]):
+        if font_path is not None:
+            try:
+                return image_font_module.truetype(str(font_path), font_size)
+            except Exception as exc:
+                warnings.append(f"字体加载失败：{font_path}，已使用默认字体降级渲染。原因：{exc}")
+        try:
+            return image_font_module.load_default(size=font_size)
+        except TypeError:
+            return image_font_module.load_default()
+
+    def _render_line(self, image_module, image_draw_module, font, line: str, fill: str, tracking: float):
+        if line == "":
+            return None
+        if abs(tracking) < 0.001:
+            probe = image_module.new("RGBA", (1, 1), (0, 0, 0, 0))
+            draw = image_draw_module.Draw(probe)
+            bbox = draw.textbbox((0, 0), line, font=font)
+            width = max(1, int(round(bbox[2] - bbox[0])))
+            height = max(1, int(round(bbox[3] - bbox[1])))
+            image = image_module.new("RGBA", (width, height), (0, 0, 0, 0))
+            image_draw_module.Draw(image).text((-bbox[0], -bbox[1]), line, font=font, fill=fill)
+            cropped = image.getbbox()
+            return image.crop(cropped) if cropped else None
+
+        probe = image_module.new("RGBA", (1, 1), (0, 0, 0, 0))
+        draw = image_draw_module.Draw(probe)
+        positions: list[tuple[str, float, tuple[int, int, int, int]]] = []
+        cursor = 0.0
+        left = top = 10**9
+        right = bottom = -10**9
+        for char in line:
+            bbox = draw.textbbox((cursor, 0), char, font=font)
+            positions.append((char, cursor, bbox))
+            left = min(left, bbox[0])
+            top = min(top, bbox[1])
+            right = max(right, bbox[2])
+            bottom = max(bottom, bbox[3])
+            cursor += float(draw.textlength(char, font=font)) + tracking
+        if right <= left or bottom <= top:
+            return None
+        image = image_module.new("RGBA", (max(1, int(round(right - left))), max(1, int(round(bottom - top)))), (0, 0, 0, 0))
+        line_draw = image_draw_module.Draw(image)
+        for char, cursor, _bbox in positions:
+            line_draw.text((cursor - left, -top), char, font=font, fill=fill)
+        cropped = image.getbbox()
+        return image.crop(cropped) if cropped else None
+
+    def _compose_text_image(self, image_module, line_images: list[Any], layer: TextLayer, font_size: int, line_spacing: float):
+        line_gap = max(0, int(round(font_size * max(0.0, line_spacing - 1.0))))
+        width = max((line_image.width for line_image in line_images), default=0)
+        height = sum(line_image.height for line_image in line_images) + line_gap * max(0, len(line_images) - 1)
+        if width <= 0 or height <= 0:
+            return None
+        image = image_module.new("RGBA", (width, height), (0, 0, 0, 0))
+        y = 0
+        for line_image in line_images:
+            x = self._horizontal_offset(layer, width, line_image.width)
+            image.alpha_composite(line_image, (x, y))
+            y += line_image.height + line_gap
+        ink = image.getbbox()
+        return image.crop(ink) if ink else None
+
+    def _fill_text_box_with_ink(self, image_module, text_image, box_width: int, box_height: int):
+        """把真实墨迹边界映射到文本框四边；结果无字体行框空白。"""
+        if text_image.size == (box_width, box_height):
+            return text_image
+        resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS", 1)
+        return text_image.resize((box_width, box_height), resampling)
+
+    def _horizontal_offset(self, layer: TextLayer, box_width: int, line_width: int) -> int:
+        align = str(getattr(layer, "align", "center") or "center").casefold()
+        if align == "left":
+            return 0
+        if align == "right":
+            return max(0, box_width - line_width)
+        return max(0, int(round((box_width - line_width) / 2)))
+
+    def _positive_int(self, value: Any, label: str, warnings: list[str]) -> int:
+        try:
+            number = int(round(float(value)))
+        except (TypeError, ValueError):
+            warnings.append(f"{label}无效：{value}，已降级为 1。")
+            return 1
+        if number <= 0:
+            warnings.append(f"{label}必须大于 0：{value}，已降级为 1。")
+            return 1
+        return number
+
+    def _line_spacing(self, layer: TextLayer) -> float:
+        try:
+            return max(0.5, float(getattr(layer, "line_spacing", 1.2)))
+        except (TypeError, ValueError):
+            return 1.2
+
+    def _tracking(self, layer: TextLayer) -> float:
+        value = getattr(layer, "tracking", None)
+        if value in (None, 0, 0.0):
+            value = getattr(layer, "letter_spacing", 0.0)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fill_color(self, layer: TextLayer) -> str:
+        return str(getattr(layer, "fill_color", "") or getattr(layer, "color", "") or "#111111")
+
+    def _source_text(self, layer: TextLayer) -> str:
+        original = str(getattr(layer, "original_text", "") or "")
+        current = str(getattr(layer, "text", "") or "")
+        render_text = str(getattr(layer, "render_text", "") or "")
+        # 兼容旧调用方：历史代码可能只写 layer.text，没有同步 original_text。
+        if current != original and current != render_text:
+            return current
+        return original or current
+
+    def _raw_glyph_warnings(self, overrides: Any) -> list[str]:
+        warnings: list[str] = []
+        if not isinstance(overrides, dict):
+            return ["字形覆盖配置无效，已回退普通字符。"]
+        for index, override in overrides.items():
+            if not isinstance(override, dict):
+                warnings.append(f"字形覆盖位置 {index} 配置无效，已回退普通字符。")
+                continue
+            if "glyph_id" not in override:
+                continue
+            try:
+                glyph_id = int(override.get("glyph_id"))
+            except (TypeError, ValueError):
+                warnings.append(f"字形 glyph_id 无效：{override.get('glyph_id')}，已回退普通字符。")
+                continue
+            if glyph_id < 0:
+                warnings.append(f"字形 glyph_id 无效：{glyph_id}，已回退普通字符。")
+        return warnings

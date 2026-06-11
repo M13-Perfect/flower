@@ -1,38 +1,106 @@
-# Project Instructions for Codex
+# AGENTS.md
 
-## 项目目标
+## Project Goal
 
-这是一个本地桌面应用，用于根据订单备注或人工输入生成 Birth Flower 个性化图片。
+This project is an order-driven material generation editor.
 
-核心原则：
+The goal is to build a lightweight design editor for custom product assets:
+- Parse customer order notes.
+- Apply product templates.
+- Create editable layer-based designs.
+- Let the user manually confirm and adjust.
+- Export PNG, SVG, and later DXF.
 
-1. 动态识别只用于提高效率，最终生成必须人工确认。
-2. 不允许识别后自动生成最终文件。
-3. 代码要跨平台，优先支持 Windows、macOS、Linux。
-4. 不要内置商业字体，不要下载字体。
-5. 不要假设用户素材一定存在，所有文件缺失都要友好报错。
-6. SVG 如果嵌入的是 PNG/JPG 花朵素材，需要明确提示这不是纯矢量。
-7. 复杂文字排版需要提示 RAQM 支持风险。
-8. 所有关键逻辑请加中文注释。
-9. 新增功能必须配套测试。
-10. 不要无必要更换 UI 框架。
+## Architecture
 
-## 推荐模块拆分
+Use the following architecture:
 
-- birth_flower_mvp.py：程序入口
-- ui_app.py：界面逻辑
-- birth_flower_parser.py：订单备注解析
-- asset_resolver.py：素材和字体路径解析
-- renderer.py：PNG 和 SVG 渲染
-- config_store.py：配置读写
-- models.py：数据结构
-- tests/：pytest 测试
+- `apps/desktop`: Electron desktop shell.
+- `apps/desktop/src/renderer`: React + TypeScript frontend.
+- `apps/desktop/src/renderer/canvas`: Fabric.js canvas editor.
+- `services/api`: Python FastAPI backend.
+- `services/api/app/domain`: business logic.
+- `packages/design-core`: shared TypeScript schemas for templates and layer models.
+- `templates`: JSON product templates.
+- `assets`: local fonts, flowers, sample files.
+- `docs`: architecture, export pipeline, font handling, and refactor notes.
 
-## 质量要求
+## Core Rules
 
-- 使用 pathlib.Path 处理路径
-- 使用 dataclass 管理结构化数据
-- 捕获常见异常
-- README 必须同步更新
-- requirements.txt 必须同步更新
-- pytest 必须通过
+- Preserve editability. Do not rasterize text, SVG, or layers during editing.
+- Save designs as JSON layer documents.
+- Separate editor UI state from export state.
+- Selection boxes, guides, debug rectangles, and handles must never appear in exported files.
+- Keep parsing logic, template logic, font logic, and export logic separated.
+- Prefer deterministic code over AI guessing for production export.
+- Add full error handling for file I/O, font loading, SVG parsing, and export failures.
+- Add Chinese comments for non-obvious business logic.
+- Avoid global mutable state unless there is a clear reason.
+- Do not introduce new production dependencies without explaining why.
+
+## Frontend Conventions
+
+- Use React + TypeScript.
+- Use Fabric.js only inside canvas-related modules.
+- Keep React component state separate from Fabric canvas object state.
+- Use typed API clients for backend calls.
+- Store editor document data in a serializable JSON model.
+- Add boundary handling for empty canvas, missing fonts, missing assets, invalid templates, and failed API calls.
+
+## Backend Conventions
+
+- Use Python 3.11+.
+- Use FastAPI for HTTP APIs.
+- Use Pydantic models for request and response validation.
+- Keep route handlers thin.
+- Put business logic under `app/domain`.
+- All file operations must validate paths and avoid path traversal.
+- Return structured errors with clear error codes.
+- Add pytest tests for parser, template engine, font scanner, and exporters.
+
+## Export Rules
+
+- PNG export must not include editor-only UI elements.
+- SVG export should preserve vector paths whenever possible.
+- DXF export should only use path-like geometry; convert text to paths before DXF export.
+- Export outputs must include metadata: template id, order id, timestamp, app version.
+- Add golden image or snapshot tests for critical templates when possible.
+
+## Test Commands
+
+Frontend:
+- `pnpm lint`
+- `pnpm test`
+- `pnpm build`
+
+Backend:
+- `pytest`
+- `ruff check .`
+- `mypy app`
+
+Desktop:
+- `pnpm --filter desktop dev`
+- `pnpm --filter desktop build`
+
+## Definition of Done
+
+A task is done only when:
+- The feature works through the UI or API.
+- Relevant tests are added or updated.
+- Lint and type checks pass.
+- Edge cases are handled.
+- The implementation is documented if behavior changed.
+- The final response includes changed files, test results, and known limitations.
+
+## Do Not Do
+
+- Do not rewrite unrelated modules.
+- Do not mix old Tkinter UI code with the new editor.
+- Do not hardcode absolute local paths.
+- Do not silently ignore export errors.
+- Do not assume fonts contain normal Unicode characters only.
+- Do not store customer order data in logs unless explicitly needed for debugging.
+
+## ExecPlan Rule
+
+For complex features, migrations, or architectural refactors, create or update an execution plan under `docs/` before implementation.

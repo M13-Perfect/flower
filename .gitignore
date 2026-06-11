@@ -1,4 +1,5 @@
 .venv/
+.venv-win/
 .codex/
 .superpowers/
 __pycache__/
@@ -6,6 +7,12 @@ __pycache__/
 outputs/
 birth_flower_config.json
 *.pyc
+node_modules/
+dist/
+dist-electron/
+apps/desktop/dist/
+packages/design-core/dist/
+services/api/.ruff_cache/
 
 # Local business assets are intentionally kept out of GitHub.
 BirthMonth flowers/

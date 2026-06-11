@@ -34,6 +34,12 @@ RUNTIME_DEPENDENCIES = (
     ("freetype-py", "freetype"),
 )
 
+# Font 2 常用结尾字形：截图中的 a.005-z.005，按 a-z 顺序连续映射到 PUA E068-E081。
+FONT2_DEFAULT_ENDING_GLYPHS = {
+    letter: f"U+{0xE068 + index:04X}"
+    for index, letter in enumerate("abcdefghijklmnopqrstuvwxyz")
+}
+
 
 
 
@@ -312,7 +318,13 @@ def default_glyph_map_payload() -> dict[str, Any]:
             "enabled": True,
             "apply_mode": "replace_last_letter",
             "description": "Font 2 ending swash glyphs",
-            "letters": {},
+            "letters": {
+                letter: {
+                    "codepoint": codepoint,
+                    "label": f"{letter}.005 ending glyph",
+                }
+                for letter, codepoint in FONT2_DEFAULT_ENDING_GLYPHS.items()
+            },
         },
     }
 
@@ -865,7 +877,22 @@ class GlyphBindingsConfig:
 
 
 def default_glyph_bindings_payload() -> dict[str, Any]:
-    return {"fonts": {}}
+    return {
+        "fonts": {
+            "Font 2": {
+                "font_path": "",
+                "bindings": {
+                    codepoint.removeprefix("U+"): {
+                        "base_char": letter,
+                        "usage": "end",
+                        "display_name": f"{letter}.005 ending glyph",
+                        "glyph_name": f"{letter}.005",
+                    }
+                    for letter, codepoint in FONT2_DEFAULT_ENDING_GLYPHS.items()
+                },
+            }
+        }
+    }
 
 
 @dataclass
@@ -896,7 +923,19 @@ class GlyphRulesConfig:
 
 
 def default_glyph_rules_payload() -> dict[str, Any]:
-    return {"enabled": True, "fonts": {"Font 4": {"end_char_rules": {}, "start_char_rules": {}}, "Font 2": {"end_char_rules": {}, "start_char_rules": {}}}}
+    return {
+        "enabled": True,
+        "fonts": {
+            "Font 4": {"end_char_rules": {}, "start_char_rules": {}},
+            "Font 2": {
+                "end_char_rules": {
+                    letter: codepoint.removeprefix("U+")
+                    for letter, codepoint in FONT2_DEFAULT_ENDING_GLYPHS.items()
+                },
+                "start_char_rules": {},
+            },
+        },
+    }
 
 
 def build_glyph_catalog(font_path: str | Path, font_id: str = "", bindings: GlyphBindingsConfig | None = None) -> GlyphCatalog:

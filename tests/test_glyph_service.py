@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 import glyph_service
-from glyph_service import GlyphMapConfig, check_runtime_dependencies, scan_font_glyphs, resolve_glyph
+from glyph_service import GlyphMapConfig, check_runtime_dependencies, default_glyph_map_payload, scan_font_glyphs, resolve_glyph
 
 
 def _config(tmp_path: Path, letters: dict[str, str] | None = None, apply_mode: str = "replace_last_letter") -> GlyphMapConfig:
@@ -15,6 +15,22 @@ def _config(tmp_path: Path, letters: dict[str, str] | None = None, apply_mode: s
     policy["apply_mode"] = apply_mode
     config.save()
     return GlyphMapConfig.load(tmp_path / "glyph_maps.json")
+
+
+def test_font2_default_payload_binds_26_ending_glyphs():
+    payload = default_glyph_map_payload()
+    letters = payload["Font 2"]["letters"]
+
+    assert tuple(letters) == tuple("abcdefghijklmnopqrstuvwxyz")
+    assert letters["a"]["codepoint"] == "U+E068"
+    assert letters["z"]["codepoint"] == "U+E081"
+
+    config = GlyphMapConfig.load(Path("glyph_maps/glyph_maps.json"))
+    result = resolve_glyph("Jazmin", "Font 2", config)
+
+    assert result.render_text == "Jazmi" + chr(0xE075)
+    assert result.source_letter == "n"
+    assert result.glyph_codepoint == "U+E075"
 
 
 def test_font4_jazmin_replaces_last_n_when_mapping_exists(tmp_path):
