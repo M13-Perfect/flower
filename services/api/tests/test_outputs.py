@@ -70,6 +70,34 @@ def test_save_outputs_keeps_order_directory_inside_outputs(
     assert tmp_path.resolve() in output_dir.parents
 
 
+def test_save_outputs_returns_structured_error_when_output_directory_is_unwritable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(tmp_path))
+    original_mkdir = Path.mkdir
+
+    def deny_order_dir(self: Path, *args, **kwargs) -> None:
+        if self.name == "Lacey":
+            raise PermissionError("denied")
+        original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", deny_order_dir)
+
+    response = TestClient(app).post(
+        "/outputs/save",
+        json={
+            "orderName": "Lacey",
+            "document": _document(order_id="order-lacey"),
+            "svg": "<svg></svg>",
+            "pngDataUrl": TINY_PNG_DATA_URL,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "OUTPUT_WRITE_FAILED"
+
+
 def _document(*, order_id: str) -> dict:
     return {
         "schemaVersion": "1.0",

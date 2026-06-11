@@ -37,15 +37,27 @@ def save_outputs(
     dxf_content_base64: str | None = None,
 ) -> SaveOutputsResult:
     output_dir = _safe_output_dir(order_name)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    files = [
-        _write_text(output_dir, "order.json", json.dumps(document, ensure_ascii=False, indent=2), "json"),
-        _write_text(output_dir, "design.svg", svg, "svg"),
-        _write_bytes(output_dir, "preview.png", _decode_png_data_url(png_data_url), "png"),
-    ]
-    if dxf_content_base64:
-        files.append(_write_bytes(output_dir, "design.dxf", _decode_base64(dxf_content_base64, "dxf"), "dxf"))
+        files = [
+            _write_text(output_dir, "order.json", json.dumps(document, ensure_ascii=False, indent=2), "json"),
+            _write_text(output_dir, "design.svg", svg, "svg"),
+            _write_bytes(output_dir, "preview.png", _decode_png_data_url(png_data_url), "png"),
+        ]
+        if dxf_content_base64:
+            files.append(_write_bytes(output_dir, "design.dxf", _decode_base64(dxf_content_base64, "dxf"), "dxf"))
+    except OSError as exc:
+        # 文件系统错误必须转成业务错误，避免前端只收到 500 或浏览器级 Failed to fetch。
+        raise DomainError(
+            code="OUTPUT_WRITE_FAILED",
+            message="Output files could not be written.",
+            details={
+                "orderName": _sanitize_order_name(order_name),
+                "errorType": exc.__class__.__name__,
+            },
+            recoverable=True,
+        ) from exc
 
     return SaveOutputsResult(
         output_dir=_relative_project_path(output_dir),
