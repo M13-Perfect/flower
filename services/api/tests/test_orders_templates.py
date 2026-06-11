@@ -1,6 +1,81 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+
+
+REAL_ORDER_NOTES = [
+    pytest.param(
+        "Choose Your Birth Flower  ：Sep - Aster\n"
+        "Font Design  ：Font 3\n"
+        "Personalization  ：Lacey",
+        ("Lacey", 9, "Aster", "Font 3"),
+        id="sep-aster-font-3-lacey",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Jun - Rose\n"
+        "Font Design  ：Font 3\n"
+        "Personalization  ：Hend",
+        ("Hend", 6, "Rose", "Font 3"),
+        id="jun-rose-font-3-hend",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Jan - Snowdrop\n"
+        "Font Design  ：Font 2\n"
+        "Personalization  ：Veronica",
+        ("Veronica", 1, "Snowdrop", "Font 2"),
+        id="jan-snowdrop-font-2-veronica",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Oct - Cosmos\n"
+        "Font Design  ：Font 3\n"
+        "Personalization  ：Grace",
+        ("Grace", 10, "Cosmos", "Font 3"),
+        id="oct-cosmos-font-3-grace",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Feb - Violet\n"
+        "Font Design  ：Font 4\n"
+        "Personalization  ：Gemma",
+        ("Gemma", 2, "Violet", "Font 4"),
+        id="feb-violet-font-4-gemma",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Nov - Peony\n"
+        "Font Design  ：Font 3\n"
+        "Personalization  ：Katie",
+        ("Katie", 11, "Peony", "Font 3"),
+        id="nov-peony-font-3-katie",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Jun - Honeysuckle\n"
+        "Font Design  ：Font 3\n"
+        "Personalization  ：Kristin",
+        ("Kristin", 6, "Honeysuckle", "Font 3"),
+        id="jun-honeysuckle-font-3-kristin",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Mar - Daffodil\n"
+        "Font Design  ：Font 3\n"
+        "Personalization  ：Elisabeth",
+        ("Elisabeth", 3, "Daffodil", "Font 3"),
+        id="mar-daffodil-font-3-elisabeth",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Jun - Honeysuckle\n"
+        "Font Design  ：Font 3\n"
+        "Personalization  ：Jenna",
+        ("Jenna", 6, "Honeysuckle", "Font 3"),
+        id="jun-honeysuckle-font-3-jenna",
+    ),
+    pytest.param(
+        "Choose Your Birth Flower  ：Jun - Honeysuckle\n"
+        "Font Design  ：Font 3\n"
+        "Personalization  ：Zoe",
+        ("Zoe", 6, "Honeysuckle", "Font 3"),
+        id="jun-honeysuckle-font-3-zoe",
+    ),
+]
 
 
 def test_parse_order_note_returns_normalized_fields_and_manual_confirmation() -> None:
@@ -39,6 +114,30 @@ def test_parse_order_note_returns_normalized_fields_and_manual_confirmation() ->
         },
         "specialNotes": "Please keep the name centered.",
     }
+
+
+@pytest.mark.parametrize(("order_note", "expected"), REAL_ORDER_NOTES)
+def test_parse_order_note_accepts_supplied_real_birth_flower_notes(
+    order_note: str,
+    expected: tuple[str, int, str, str],
+) -> None:
+    client = TestClient(app)
+    expected_name, expected_month, expected_flower, expected_font = expected
+
+    response = client.post(
+        "/orders/parse",
+        json={"orderNote": order_note, "orderId": f"real-{expected_name.casefold()}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    parsed = payload["parsedOrder"]
+    assert payload["requiresManualConfirmation"] is True
+    assert payload["warnings"] == []
+    assert parsed["customerName"] == expected_name
+    assert parsed["month"] == expected_month
+    assert parsed["flower"]["name"] == expected_flower
+    assert parsed["fontPreference"]["label"] == expected_font
 
 
 def test_parse_order_note_returns_structured_error_when_required_fields_are_uncertain(
