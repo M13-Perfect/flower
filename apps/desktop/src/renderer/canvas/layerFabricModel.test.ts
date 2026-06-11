@@ -15,6 +15,8 @@ import {
   listLayersForDisplay,
   serializeLayerDocumentFromSnapshots,
   updateLayerProperty,
+  updateTextLayerContent,
+  updateTextLayerFont,
 } from "./layerFabricModel";
 
 describe("layer Fabric model conversion", () => {
@@ -142,6 +144,69 @@ describe("layer Fabric model conversion", () => {
           glyphName: "y.swash",
         },
       ],
+    });
+    expect(validateLayerDocument(next).ok).toBe(true);
+  });
+
+  it("updates text layer content and drops stale glyph overrides", () => {
+    const document = applyGlyphOverrideToTextLayer(createDocument(), "text_1", {
+      index: 4,
+      replacement: "\ue123",
+      codepoint: "U+E123",
+      glyphName: "y.swash",
+    });
+
+    const next = updateTextLayerContent(document, "text_1", "Averi");
+    const layer = next.layers[0];
+
+    expect(layer).toMatchObject({
+      type: "text",
+      text: "Averi",
+      glyphOverrides: [],
+    });
+    expect(validateLayerDocument(next).ok).toBe(true);
+  });
+
+  it("keeps glyph overrides that still match after text changes", () => {
+    const document = applyGlyphOverrideToTextLayer(createDocument(), "text_1", {
+      index: 4,
+      replacement: "\ue123",
+      codepoint: "U+E123",
+      glyphName: "y.swash",
+    });
+
+    const next = updateTextLayerContent(document, "text_1", "Avery Rose");
+    const layer = next.layers[0];
+
+    expect(layer).toMatchObject({
+      type: "text",
+      text: "Avery Rose",
+      glyphOverrides: [
+        {
+          index: 4,
+          originalText: "y",
+          replacement: "\ue123",
+        },
+      ],
+    });
+    expect(validateLayerDocument(next).ok).toBe(true);
+  });
+
+  it("updates text layer font reference for font selection controls", () => {
+    const next = updateTextLayerFont(createDocument(), "text_1", {
+      family: "Malovely Script",
+      assetId: "malovely-script",
+      source: "asset",
+    });
+    const layer = next.layers[0];
+
+    expect(layer).toMatchObject({
+      type: "text",
+      fontRef: {
+        family: "Malovely Script",
+        assetId: "malovely-script",
+        source: "asset",
+      },
     });
     expect(validateLayerDocument(next).ok).toBe(true);
   });

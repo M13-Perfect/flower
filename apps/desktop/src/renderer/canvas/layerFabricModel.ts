@@ -1,5 +1,6 @@
 import {
   type GlyphOverride,
+  type FontReference,
   type ImageLayer,
   type Layer,
   type LayerDocument,
@@ -62,6 +63,13 @@ export interface TextGlyphOverrideInput {
   replacement: string;
   codepoint?: string;
   glyphName?: string;
+}
+
+export interface TextLayerFontInput {
+  family: string;
+  source?: FontReference["source"];
+  assetId?: string;
+  fallbackFamilies?: string[];
 }
 
 export function isSupportedEditorLayer(layer: Layer): layer is SupportedEditorLayer {
@@ -173,6 +181,50 @@ export function applyGlyphOverrideToTextLayer(
   const validation = validateLayerDocument(nextDocument);
   if (!validation.ok) {
     throw new Error(`Glyph override update is invalid: ${validation.errors.join("; ")}`);
+  }
+
+  return nextDocument;
+}
+
+export function updateTextLayerContent(
+  document: LayerDocument,
+  layerId: string,
+  text: string,
+): LayerDocument {
+  const nextDocument: LayerDocument = {
+    ...document,
+    metadata: {
+      ...document.metadata,
+      updatedAt: new Date().toISOString(),
+    },
+    layers: document.layers.map((layer) => updateTextContentById(layer, layerId, text)),
+  };
+
+  const validation = validateLayerDocument(nextDocument);
+  if (!validation.ok) {
+    throw new Error(`Text layer update is invalid: ${validation.errors.join("; ")}`);
+  }
+
+  return nextDocument;
+}
+
+export function updateTextLayerFont(
+  document: LayerDocument,
+  layerId: string,
+  font: TextLayerFontInput,
+): LayerDocument {
+  const nextDocument: LayerDocument = {
+    ...document,
+    metadata: {
+      ...document.metadata,
+      updatedAt: new Date().toISOString(),
+    },
+    layers: document.layers.map((layer) => updateTextFontById(layer, layerId, font)),
+  };
+
+  const validation = validateLayerDocument(nextDocument);
+  if (!validation.ok) {
+    throw new Error(`Text layer font update is invalid: ${validation.errors.join("; ")}`);
   }
 
   return nextDocument;
@@ -316,6 +368,67 @@ function updateGlyphOverrideById(layer: Layer, layerId: string, input: TextGlyph
   return {
     ...layer,
     glyphOverrides: nextOverrides,
+  };
+}
+
+function updateTextContentById(layer: Layer, layerId: string, text: string): Layer {
+  if (layer.type === "group") {
+    return {
+      ...layer,
+      children: layer.children.map((child) => updateTextContentById(child, layerId, text)),
+    };
+  }
+
+  if (layer.id !== layerId) {
+    return layer;
+  }
+
+  if (layer.type !== "text") {
+    throw new Error("Text content updates can only be applied to text layers");
+  }
+
+  const chars = Array.from(text);
+  const glyphOverrides = (layer.glyphOverrides ?? []).filter(
+    (override) => chars[override.index] === override.originalText,
+  );
+
+  return {
+    ...layer,
+    text,
+    glyphOverrides,
+  };
+}
+
+function updateTextFontById(layer: Layer, layerId: string, font: TextLayerFontInput): Layer {
+  if (layer.type === "group") {
+    return {
+      ...layer,
+      children: layer.children.map((child) => updateTextFontById(child, layerId, font)),
+    };
+  }
+
+  if (layer.id !== layerId) {
+    return layer;
+  }
+
+  if (layer.type !== "text") {
+    throw new Error("Font updates can only be applied to text layers");
+  }
+
+  const family = font.family.trim();
+  if (!family) {
+    throw new Error("Font family must not be empty");
+  }
+
+  return {
+    ...layer,
+    fontRef: {
+      ...layer.fontRef,
+      family,
+      source: font.source ?? layer.fontRef.source,
+      assetId: font.assetId ?? layer.fontRef.assetId,
+      fallbackFamilies: font.fallbackFamilies ?? layer.fontRef.fallbackFamilies,
+    },
   };
 }
 
