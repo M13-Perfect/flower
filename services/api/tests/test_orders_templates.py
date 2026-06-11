@@ -280,6 +280,7 @@ def test_apply_template_resolves_birth_month_flower_asset_from_project_root(
         "assetId": "flower-september-aster",
         "path": "BirthMonth flowers/AsterSeptember .svg",
     }
+    assert flower_layer["inlineSvg"] == '<svg viewBox="0 0 10 10"><path d="M0 0 L10 0 L10 10 Z"/></svg>'
 
 
 def test_apply_template_returns_structured_error_for_missing_required_order_data() -> None:

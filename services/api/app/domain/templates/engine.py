@@ -164,7 +164,7 @@ def _build_layers(parsed_order: ParsedOrder) -> list[dict[str, Any]]:
     assert parsed_order.flower is not None
     assert parsed_order.font_preference is not None
 
-    flower_asset_id, flower_path = _resolve_flower_asset_ref(
+    flower_asset_id, flower_path, inline_svg = _resolve_flower_asset_ref(
         parsed_order.month,
         parsed_order.month_name,
         parsed_order.flower.name,
@@ -172,7 +172,7 @@ def _build_layers(parsed_order: ParsedOrder) -> list[dict[str, Any]]:
 
     return [
         _text_layer(parsed_order.customer_name, parsed_order.font_preference.label),
-        _flower_layer(parsed_order.flower.name, flower_asset_id, flower_path),
+        _flower_layer(parsed_order.flower.name, flower_asset_id, flower_path, inline_svg),
     ]
 
 
@@ -180,20 +180,33 @@ def _resolve_flower_asset_ref(
     month: int,
     month_name: str | None,
     flower_name: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None]:
     month_slug = _slug(month_name or str(month))
     flower_slug = _slug(flower_name)
     asset_id = f"flower-{month_slug}-{flower_slug}"
     default_path = Path("assets") / "flowers" / f"{month_slug}-{flower_slug}.svg"
 
-    if (_project_root() / default_path).is_file():
-        return asset_id, default_path.as_posix()
+    default_file = _project_root() / default_path
+    if default_file.is_file():
+        return asset_id, default_path.as_posix(), _read_svg_asset(default_file)
 
     legacy_asset = _find_legacy_flower_asset(month, month_name, flower_name)
     if legacy_asset is not None:
-        return asset_id, _relative_project_path(legacy_asset)
+        return asset_id, _relative_project_path(legacy_asset), _read_svg_asset(legacy_asset)
 
-    return asset_id, default_path.as_posix()
+    return asset_id, default_path.as_posix(), None
+
+
+def _read_svg_asset(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DomainError(
+            code="ASSET_LOAD_FAILED",
+            message="SVG asset could not be read.",
+            details={"path": _relative_project_path(path)},
+            recoverable=True,
+        ) from exc
 
 
 def _find_legacy_flower_asset(
@@ -260,8 +273,13 @@ def _text_layer(text: str, font_label: str) -> dict[str, Any]:
     }
 
 
-def _flower_layer(flower_name: str, asset_id: str, asset_path: str) -> dict[str, Any]:
-    return {
+def _flower_layer(
+    flower_name: str,
+    asset_id: str,
+    asset_path: str,
+    inline_svg: str | None = None,
+) -> dict[str, Any]:
+    layer = {
         **_layer_base(
             layer_id="layer_flower",
             layer_type="svg",
@@ -286,6 +304,9 @@ def _flower_layer(flower_name: str, asset_id: str, asset_path: str) -> dict[str,
         },
         "preserveVector": True,
     }
+    if inline_svg is not None:
+        layer["inlineSvg"] = inline_svg
+    return layer
 
 
 def _layer_base(
