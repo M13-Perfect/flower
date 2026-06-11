@@ -171,7 +171,7 @@ export class ApiError extends Error {
 const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
 
 export function createApiClient(options: ApiClientOptions = {}) {
-  const baseUrl = normalizeBaseUrl(options.baseUrl ?? DEFAULT_BASE_URL);
+  const baseUrl = normalizeBaseUrl(options.baseUrl ?? resolveDefaultBaseUrl());
   const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
 
   return {
@@ -274,4 +274,8 @@ async function postJson<T>(
 
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
+}
+
+function resolveDefaultBaseUrl(): string {
+  return import.meta.env.VITE_FLOWER_API_BASE_URL || DEFAULT_BASE_URL;
 }
