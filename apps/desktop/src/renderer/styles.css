@@ -243,6 +243,89 @@ h2 {
   font-size: 13px;
 }
 
+.order-panel,
+.text-panel {
+  border-bottom: 1px solid #e3e7ea;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+}
+
+.text-panel {
+  border-bottom: 0;
+  border-top: 1px solid #e3e7ea;
+  margin-bottom: 0;
+  margin-top: 18px;
+  padding-bottom: 0;
+  padding-top: 14px;
+}
+
+.text-field,
+.stack-field {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.text-field span,
+.stack-field span,
+.field-note {
+  color: #44535c;
+  font-size: 13px;
+}
+
+.text-field input,
+.stack-field textarea {
+  border: 1px solid #cbd3d8;
+  border-radius: 6px;
+  color: #182026;
+  min-width: 0;
+  padding: 8px;
+  width: 100%;
+}
+
+.text-field input {
+  min-height: 36px;
+}
+
+.stack-field textarea {
+  min-height: 112px;
+  resize: vertical;
+}
+
+.order-summary {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0 0;
+}
+
+.order-summary div {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 48px minmax(0, 1fr);
+}
+
+.order-summary dt,
+.order-summary dd {
+  font-size: 12px;
+  margin: 0;
+}
+
+.order-summary dt {
+  color: #667784;
+}
+
+.order-summary dd {
+  color: #182026;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.field-note {
+  margin-top: -2px;
+}
+
 .glyph-panel {
   border-top: 1px solid #e3e7ea;
   margin-top: 18px;
