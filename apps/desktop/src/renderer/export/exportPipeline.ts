@@ -360,6 +360,8 @@ function stripUnsafeSvgMarkup(svg: string): string {
     .replace(/<\?xml[\s\S]*?\?>/gi, "")
     .replace(/<!doctype[\s\S]*?>/gi, "")
     .replace(/<script\b[\s\S]*?<\/script>/gi, "")
+    // 真实花朵素材会带 serif/xml 等设计软件命名空间属性；抽出内层 SVG 后这些前缀可能失去声明，导致浏览器 PNG 栅格化失败。
+    .replace(/\s(?:xmlns:[a-z][\w.-]*|[a-z][\w.-]*:[\w.-]+)\s*=\s*(?:"[^"]*"|'[^']*')/gi, "")
     .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*')/gi, "");
 }
 
