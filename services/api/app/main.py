@@ -8,6 +8,7 @@ from app.domain import DomainError
 from app.domain.exports import export_dxf
 from app.domain.fonts import list_fonts, list_glyphs
 from app.domain.orders import parse_order_note
+from app.domain.output_store import save_outputs
 from app.domain.templates import apply_template
 from app.schemas.errors import ErrorBody, ErrorEnvelope
 from app.schemas.exports import DxfExportRequest, DxfExportResponse, ExportWarningBody
@@ -20,6 +21,7 @@ from app.schemas.fonts import (
 )
 from app.schemas.health import HealthResponse
 from app.schemas.orders import ParseOrderRequest, ParseOrderResponse
+from app.schemas.outputs import SaveOutputsRequest, SaveOutputsResponse, SavedOutputFileBody
 from app.schemas.templates import ApplyTemplateRequest, ApplyTemplateResponse
 
 app = FastAPI(title="Flower Local API", version="0.1.0")
@@ -105,6 +107,34 @@ def export_document_dxf(request: DxfExportRequest) -> Any:
         contentBase64=exported.content_base64,
         metadata=exported.metadata,
         warnings=[ExportWarningBody(**warning.to_dict()) for warning in exported.warnings],
+    )
+    return response.model_dump(by_alias=True)
+
+
+@app.post("/outputs/save", response_model=None)
+def save_order_outputs(request: SaveOutputsRequest) -> Any:
+    try:
+        saved = save_outputs(
+            order_name=request.order_name,
+            document=request.document,
+            svg=request.svg,
+            png_data_url=request.png_data_url,
+            dxf_content_base64=request.dxf_content_base64,
+        )
+    except DomainError as exc:
+        return _domain_error_response(exc, status_code=422)
+
+    response = SaveOutputsResponse(
+        outputDir=saved.output_dir,
+        files=[
+            SavedOutputFileBody(
+                kind=file.kind,
+                fileName=file.file_name,
+                relativePath=file.relative_path,
+                bytesWritten=file.bytes_written,
+            )
+            for file in saved.files
+        ],
     )
     return response.model_dump(by_alias=True)
 
