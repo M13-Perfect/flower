@@ -23,7 +23,7 @@ from glyph_service import (
     GlyphMapConfig,
     GlyphRulesConfig,
     apply_automatic_glyph_rules,
-    apply_glyph_variant_to_text,
+    apply_glyph_to_text_layer,
     build_glyph_catalog,
     check_runtime_dependencies,
     codepoint_to_char,
@@ -38,7 +38,7 @@ from order_importer import load_order_remark_from_file
 from parse_pipeline import parse_order_remark_auto
 from gpt_parser import DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, parse_order_remark_with_gpt
 from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_document_png, render_document_svg, render_dxf, render_png, render_svg
-from text_layout import LINE_HEIGHT_RATIO, measure_text_ink_bbox, layout_personalization_text
+from text_layout import measure_text_ink_bbox, layout_personalization_text
 
 
 DEFAULT_FLOWER_DIR = Path("BirthMonth flowers")
@@ -79,6 +79,25 @@ def import_dianxiaomi_xlsx_batch(path: Path | str) -> object:
     batch = import_orders(Path(path), adapter_name="dianxiaomi-xlsx")
     save_batch(batch)
     return generate_batch(batch.batch_id)
+
+
+# 当前产品线唯一模板;多产品后改为按当前模板选择。
+PHYSICAL_TEMPLATE_ID = "birth-flower-card"
+
+
+def load_template_physical_size() -> object:
+    """物理尺寸的唯一数据源是模板文件;UI 只读写它,禁止本地另存副本。"""
+    ensure_services_api_import_path()
+    from app.domain.templates.physical import get_physical_size
+
+    return get_physical_size(PHYSICAL_TEMPLATE_ID)
+
+
+def save_template_physical_size(width_mm: float, height_mm: float | None) -> object:
+    ensure_services_api_import_path()
+    from app.domain.templates.physical import update_physical_size
+
+    return update_physical_size(PHYSICAL_TEMPLATE_ID, width_mm, height_mm)
 
 
 def summarize_xlsx_batch_result(result: object) -> tuple[int, int, int, Path]:
@@ -1018,29 +1037,85 @@ class BirthFlowerApp:
         window.transient(self.root)
         frame = ttk.Frame(window, padding=12)
         frame.pack(fill="both", expand=True)
+        # 显示文案用"素材/文字";"字体"一词保留给 optionNo 字体编号体系,避免混淆。
         fields = (
             ("画布宽", "canvas_width"),
             ("画布高", "canvas_height"),
-            ("flower_x", "flower_x"),
-            ("flower_y", "flower_y"),
-            ("flower_width", "flower_width"),
-            ("flower_height", "flower_height"),
-            ("text_x", "text_x"),
-            ("text_y", "text_y"),
-            ("text_width", "text_width"),
-            ("text_height", "text_height"),
-            ("text_size", "text_size"),
+            ("素材_x", "flower_x"),
+            ("素材_y", "flower_y"),
+            ("素材_宽", "flower_width"),
+            ("素材_高", "flower_height"),
+            ("文字_x", "text_x"),
+            ("文字_y", "text_y"),
+            ("文字_宽", "text_width"),
+            ("文字_高", "text_height"),
+            ("文字_字号", "text_size"),
         )
         dialog_vars = {key: tk.StringVar(value=self.layout_vars[key].get()) for _label, key in fields}
         for row, (label, key) in enumerate(fields):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Entry(frame, textvariable=dialog_vars[key], width=14).grid(row=row, column=1, sticky="ew", pady=3)
+
+        # —— 输出物理尺寸:读写模板 exportSettings.physical,与批量生成同一数据源 ——
+        base_row = len(fields)
+        phys_width_var = tk.StringVar()
+        phys_height_var = tk.StringVar()
+        phys_unlock_var = tk.BooleanVar(value=False)
+        phys_ratio = 1.0
+        phys_available = True
+        try:
+            phys = load_template_physical_size()
+            phys_ratio = phys.canvas_height / phys.canvas_width
+            phys_width_var.set(f"{phys.width_mm:g}")
+            phys_height_var.set(f"{phys.height_mm:g}")
+            phys_unlock_var.set(not phys.height_derived)
+        except Exception as exc:  # 模板缺失时布局功能仍可用,只禁用尺寸区
+            phys_available = False
+            LOGGER.warning("物理尺寸读取失败: %s", exc)
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=base_row, column=0, columnspan=2, sticky="ew", pady=(10, 6)
+        )
+        ttk.Label(frame, text="输出宽度(mm)").grid(row=base_row + 1, column=0, sticky="w", pady=3)
+        phys_width_entry = ttk.Entry(frame, textvariable=phys_width_var, width=14)
+        phys_width_entry.grid(row=base_row + 1, column=1, sticky="ew", pady=3)
+        ttk.Label(frame, text="输出高度(mm)").grid(row=base_row + 2, column=0, sticky="w", pady=3)
+        phys_height_entry = ttk.Entry(frame, textvariable=phys_height_var, width=14)
+        phys_height_entry.grid(row=base_row + 2, column=1, sticky="ew", pady=3)
+
+        def sync_height_state(*_args) -> None:
+            if phys_unlock_var.get():
+                phys_height_entry.configure(state="normal")
+                return
+            phys_height_entry.configure(state="readonly")
+            try:
+                width = float(phys_width_var.get())
+                phys_height_var.set(f"{width * phys_ratio:g}")
+            except ValueError:
+                phys_height_var.set("")
+
+        unlock_check = ttk.Checkbutton(
+            frame,
+            text="解锁比例(默认高度随画布宽高比联动)",
+            variable=phys_unlock_var,
+            command=sync_height_state,
+        )
+        unlock_check.grid(row=base_row + 3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        if phys_available:
+            phys_width_var.trace_add("write", sync_height_state)
+            sync_height_state()
+        else:
+            for widget in (phys_width_entry, phys_height_entry, unlock_check):
+                widget.configure(state="disabled")
+
         ttk.Label(
             frame,
-            text="保存后的全局默认值只会初始化新建图层，不会覆盖已有图层的位置和大小。",
+            text=(
+                "保存后的全局默认值只会初始化新建图层，不会覆盖已有图层的位置和大小。\n"
+                "输出物理尺寸保存进产品模板，批量生成与按钮导入立即生效。"
+            ),
             style="Status.TLabel",
             wraplength=360,
-        ).grid(row=len(fields), column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        ).grid(row=base_row + 4, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         frame.columnconfigure(1, weight=1)
 
         def apply_values(close: bool = False) -> None:
@@ -1049,9 +1124,21 @@ class BirthFlowerApp:
             except ValueError as exc:
                 messagebox.showerror("布局设置", str(exc))
                 return
+            if phys_available:
+                try:
+                    width_mm = float(phys_width_var.get())
+                    height_mm = float(phys_height_var.get()) if phys_unlock_var.get() else None
+                except ValueError:
+                    messagebox.showerror("布局设置", "输出物理尺寸必须是正数(毫米)。")
+                    return
+                try:
+                    save_template_physical_size(width_mm, height_mm)
+                except Exception as exc:
+                    messagebox.showerror("布局设置", f"物理尺寸保存失败：{exc}")
+                    return
             self._set_layout_vars(layout)
             self._save_current_config()
-            self.status_var.set("全局布局默认值已保存；已有图层未被修改")
+            self.status_var.set("全局布局默认值已保存；输出物理尺寸已写入产品模板")
             if close:
                 window.destroy()
 
@@ -1061,7 +1148,7 @@ class BirthFlowerApp:
                 dialog_vars[key].set(str(getattr(default, key)))
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        buttons.grid(row=base_row + 5, column=0, columnspan=2, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="恢复默认值", command=reset_defaults).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="应用", command=lambda: apply_values(False)).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="保存", command=lambda: apply_values(True)).pack(side="left", padx=(0, 8))
@@ -1268,7 +1355,7 @@ class BirthFlowerApp:
         self._add_text_layer_from_fields()
 
     def parse_remark(self) -> None:
-        remark = self.remark_var.get()
+        remark = self._current_remark_text()
         ai_config = self._current_ai_config()
         self.status_var.set("解析中...")
 
@@ -1310,9 +1397,38 @@ class BirthFlowerApp:
         self._refresh_flower_choices()
         self._select_flower_by_current_fields()
         self._select_font_by_current_field()
+        self._replace_layers_from_parse_result(result)
         if result.warnings:
             messagebox.showwarning("无法解析", "\n".join(result.warnings))
         self._redraw_preview()
+
+    def _replace_layers_from_parse_result(self, result) -> None:
+        if not self._parse_result_can_create_layers(result):
+            return
+        if self.flower_label_map.get(self.flower_asset_var.get()) is None:
+            return
+        # 解析新订单时旧素材/文字属于上一单输出，必须先清空再生成本单图层。
+        self.document.layers = [
+            layer for layer in self.document.layers if not isinstance(layer, (ImageLayer, TextLayer))
+        ]
+        self.document.normalize_z_indexes()
+        self.document.selected_layer_id = None
+        self.selected_preview_item = None
+        self.current_manual_glyph_override = None
+        self.current_glyph_overrides.clear()
+        self.selected_glyph_position = None
+        self._add_selected_flower_to_canvas()
+        self._add_text_layer_from_fields()
+
+    def _parse_result_can_create_layers(self, result) -> bool:
+        warnings = getattr(result, "warnings", []) or []
+        return (
+            not warnings
+            and bool((getattr(result, "text", "") or "").strip())
+            and getattr(result, "month", None) is not None
+            and getattr(result, "font", None) is not None
+            and getattr(result, "flower", None) is not None
+        )
 
     def choose_output(self) -> None:
         current_output = normalize_output_path(self.output_var.get())
@@ -1400,12 +1516,19 @@ class BirthFlowerApp:
         clean_override["index"] = index
         clean_override["base_char"] = text[index]
         clean_override["original_char"] = text[index]
+        clean_override["selected_char"] = text[index]
         if clean_override.get("char") and not clean_override.get("replacement_char"):
             clean_override["replacement_char"] = clean_override.get("char")
         layer = self._selected_text_layer()
         if layer is not None:
-            layer.glyph_overrides[index] = clean_override
-            self._apply_text_layer_render_text(layer)
+            try:
+                _render_text, clean_overrides, warnings = apply_glyph_to_text_layer(layer, index, clean_override)
+            except ValueError as exc:
+                messagebox.showerror("字形绑定失败", str(exc))
+                return
+            if warnings:
+                self.warning_var.set("；".join(warnings))
+            layer.glyph_overrides = clean_overrides
             self.current_glyph_overrides = dict(layer.glyph_overrides)
         else:
             self.current_glyph_overrides[index] = clean_override
@@ -1467,6 +1590,7 @@ class BirthFlowerApp:
             return False
         try:
             selection_start = editor.index("sel.first")
+            selected_char = editor.get("sel.first", "sel.first +1c")
             count = editor.count("1.0", selection_start, "chars")
         except tk.TclError:
             return False
@@ -1474,6 +1598,17 @@ class BirthFlowerApp:
             return False
         index = int(count[0])
         if index < 0 or index >= len(layer.original_text):
+            return False
+        if layer.original_text[index] != selected_char:
+            LOGGER.warning(
+                "inline selection index mismatch: layer_id=%s raw_text=%r index=%s selected_char=%r actual=%r",
+                layer.id,
+                layer.original_text,
+                index,
+                selected_char,
+                layer.original_text[index],
+            )
+            messagebox.showerror("字形应用失败", "文本选择索引错位，请重新选中字母后再应用。")
             return False
         self.document.selected_layer_id = layer.id
         self.selected_preview_item = layer.id
@@ -1530,6 +1665,7 @@ class BirthFlowerApp:
         )
         layer.render_text = render_text
         layer.glyph_overrides = clean_overrides
+        layer.raw_text = layer.original_text
         layer.text = layer.original_text
         if warnings:
             LOGGER.warning("TextLayer 字形覆盖降级：layer_id=%s warnings=%s", layer.id, "; ".join(warnings))
@@ -1546,14 +1682,7 @@ class BirthFlowerApp:
             messagebox.showwarning("字形应用", "请先选择文本中的一个字符。")
             return
         try:
-            render_text, clean_overrides, warnings = apply_glyph_variant_to_text(
-                layer.original_text,
-                layer.glyph_overrides,
-                index,
-                variant,
-                font_path=layer.font_path,
-                text_layer_id=layer.id,
-            )
+            render_text, clean_overrides, warnings = apply_glyph_to_text_layer(layer, index, variant)
         except ValueError as exc:
             LOGGER.warning(
                 "字形替换失败：text_layer_id=%s original_text=%r index=%s glyph_name=%s error=%s",
@@ -2057,6 +2186,7 @@ class BirthFlowerApp:
         old_text = layer.original_text
         new_text = self.layer_text_var.get()
         layer.original_text = new_text
+        layer.raw_text = new_text
         layer.text = new_text
         if old_text != new_text and layer.glyph_overrides:
             LOGGER.info("文本内容变化，清空特殊字形绑定：layer_id=%s", layer.id)
@@ -2769,6 +2899,7 @@ class BirthFlowerApp:
                 LOGGER.info("文本内容变化，清空特殊字形绑定：layer_id=%s", layer.id)
                 layer.glyph_overrides.clear()
             layer.original_text = new_text
+            layer.raw_text = new_text
             layer.text = new_text
             if layer.glyph_overrides:
                 self._apply_text_layer_render_text(layer)
@@ -2838,6 +2969,7 @@ class BirthFlowerApp:
                 LOGGER.info("文本内容变化，清空特殊字形绑定：layer_id=%s", layer.id)
                 layer.glyph_overrides.clear()
             layer.original_text = new_text
+            layer.raw_text = new_text
             layer.text = new_text
             if layer.glyph_overrides:
                 self._apply_text_layer_render_text(layer)
@@ -2853,6 +2985,7 @@ class BirthFlowerApp:
         layer = self.document.layer_by_id(self.inline_text_layer_id)
         if isinstance(layer, TextLayer):
             layer.original_text = self.inline_text_original_text
+            layer.raw_text = self.inline_text_original_text
             layer.text = self.inline_text_original_text
             if layer.glyph_overrides:
                 self._apply_text_layer_render_text(layer)
