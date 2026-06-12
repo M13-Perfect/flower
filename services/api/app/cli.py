@@ -6,7 +6,9 @@ from pathlib import Path
 import sys
 
 from app.domain import DomainError
+from app.domain.orders.batch_generate import write_reports_for_workflow_result
 from app.domain.orders.workflow import (
+    PNG_SKIPPED_REASON,
     export_review_csv_file,
     generate_batch_outputs,
     import_orders_file,
@@ -112,15 +114,23 @@ def _handle_import_review(args: argparse.Namespace) -> dict:
 
 
 def _handle_generate(args: argparse.Namespace) -> dict:
+    batch_id = _batch_id_arg(args)
     result = generate_batch_outputs(
-        _batch_id_arg(args),
-        include_png=True,
+        batch_id,
+        include_png=args.png,
         exported_at=args.exported_at,
     )
+    _, report_path, review_csv_path = write_reports_for_workflow_result(batch_id, result)
     return {
         "batchId": result.batch_id,
         "generated": result.generated_count,
         "failed": result.failed_count,
+        "reportPath": report_path.as_posix(),
+        "reviewCsvPath": review_csv_path.as_posix(),
+        "png": {
+            "requested": bool(args.png),
+            "skippedReason": None if args.png else PNG_SKIPPED_REASON,
+        },
         "items": [
             {
                 "orderJobId": item.order_job_id,

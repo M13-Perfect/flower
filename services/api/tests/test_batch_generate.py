@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import zipfile
 import xml.etree.ElementTree as ET
+import json
 from pathlib import Path
 
 import pytest
@@ -30,11 +31,13 @@ def test_generate_batch_from_real_dianxiaomi_fixture_writes_assets_and_report(
     for order_id in ("4087956129", "4087958577", "4087970477"):
         order_dir = tmp_path / "outputs" / order_id
         assert (order_dir / "order.json").is_file()
+        document = json.loads((order_dir / "order.json").read_text(encoding="utf-8"))
+        assert document["metadata"]["pngExport"]["status"] == "skipped"
         assert "<svg" in (order_dir / f"{order_id}.svg").read_text(encoding="utf-8")
         dxf_text = (order_dir / f"{order_id}.dxf").read_text(encoding="utf-8")
         assert "SECTION" in dxf_text
         assert "EOF" in dxf_text
-        assert (order_dir / f"{order_id}.png").read_bytes().startswith(b"\x89PNG")
+        assert not (order_dir / f"{order_id}.png").exists()
 
     report_path = tmp_path / "outputs" / "reports" / "batch_real-report.xlsx"
     rows = _read_xlsx_rows(report_path)

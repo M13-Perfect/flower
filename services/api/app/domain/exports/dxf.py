@@ -111,6 +111,7 @@ def export_dxf(
     target_units = (
         units
         or _nested(document, "exportSettings", "dxf", "units")
+        or ("mm" if _physical_size_mm(document) is not None else None)
         or document["canvas"]["unit"]
     )
     if target_units not in SUPPORTED_UNITS:
@@ -428,6 +429,9 @@ def _resolve_font_path(layer: dict[str, Any], context: ExportContext) -> Path:
     font_ref: dict[str, Any] = raw_font_ref if isinstance(raw_font_ref, dict) else {}
     asset_id = str(font_ref.get("assetId") or "")
     candidates: list[Path] = []
+    option_no = _font_option_no(font_ref)
+    if option_no is not None:
+        candidates.extend(_business_font_candidates(option_no))
     if asset_id:
         safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", asset_id).strip("-")
         for suffix in (".ttf", ".otf"):
@@ -463,6 +467,43 @@ def _resolve_font_path(layer: dict[str, Any], context: ExportContext) -> Path:
         details={"layerId": layer.get("id")},
         recoverable=True,
     )
+
+
+def _font_option_no(font_ref: dict[str, Any]) -> int | None:
+    raw_values = (
+        font_ref.get("optionNo"),
+        font_ref.get("option_no"),
+        font_ref.get("assetId"),
+        font_ref.get("family"),
+    )
+    for raw in raw_values:
+        match = re.search(r"\bfont[-\s_]*([1-9][0-9]?)\b", str(raw), flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        if isinstance(raw, int):
+            return raw
+    return None
+
+
+def _business_font_candidates(option_no: int) -> list[Path]:
+    font_dir = _project_root() / "BirthMonth flowers"
+    if not font_dir.is_dir():
+        return []
+    fonts = [
+        path
+        for path in font_dir.iterdir()
+        if path.is_file() and path.suffix.casefold() in {".ttf", ".otf"}
+    ]
+    groups = (("malovelyscript", 1), ("adorabella", 3))
+    for group_key, start_index in groups:
+        group = sorted(
+            (font for font in fonts if _compact_name(font.stem) == group_key),
+            key=lambda font: (_file_size(font), font.suffix.casefold(), font.name.casefold()),
+        )
+        offset = option_no - start_index
+        if 0 <= offset < len(group[:2]):
+            return [group[offset]]
+    return []
 
 
 def _glyph_shapes(
@@ -835,12 +876,55 @@ def _text_with_glyph_overrides(layer: dict[str, Any]) -> str:
         index = override.get("index")
         if not isinstance(index, int) or index < 0 or index >= len(chars):
             continue
-        if chars[index] != override.get("originalText"):
+        original = (
+            override.get("originalText")
+            or override.get("base_char")
+            or override.get("original_char")
+        )
+        if chars[index] != original:
             continue
-        replacement = override.get("replacement")
-        if isinstance(replacement, str) and replacement:
+        replacement = (
+            override.get("replacement")
+            or override.get("replacement_char")
+            or override.get("char")
+        )
+        codepoint = override.get("codepoint")
+        parsed_codepoint = _parse_codepoint(codepoint)
+        if parsed_codepoint is not None and not _is_control_codepoint(parsed_codepoint):
+            replacement = chr(parsed_codepoint)
+        if (
+            isinstance(replacement, str)
+            and replacement
+            and not _contains_unicode_control_character(replacement)
+            and not _is_control_codepoint_string(codepoint)
+        ):
             chars[index] = replacement
     return "".join(chars)
+
+
+def _parse_codepoint(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"(?:U\+|0x)?([0-9a-fA-F]{4,6})", value.strip())
+    if not match:
+        return None
+    codepoint = int(match.group(1), 16)
+    return codepoint if 0 <= codepoint <= 0x10FFFF else None
+
+
+def _contains_unicode_control_character(value: str) -> bool:
+    return any(_is_control_codepoint(ord(char)) for char in value)
+
+
+def _is_control_codepoint_string(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    match = re.fullmatch(r"(?:U\+|0x)?([0-9a-fA-F]{4,6})", value.strip())
+    return bool(match and _is_control_codepoint(int(match.group(1), 16)))
+
+
+def _is_control_codepoint(codepoint: int) -> bool:
+    return 0x0000 <= codepoint <= 0x001F or 0x007F <= codepoint <= 0x009F
 
 
 def _aligned_text_offset(
@@ -883,6 +967,15 @@ def _unit_scale(source: str, target: str, context: ExportContext) -> float:
         return 1 / 25.4
     if source == "in" and target == "mm":
         return 25.4
+    physical_size = _physical_size_mm(context.document)
+    if source == "px" and physical_size is not None:
+        canvas = context.document["canvas"]
+        canvas_width = float(canvas["width"])
+        scale_mm = physical_size[0] / canvas_width
+        if target == "mm":
+            return scale_mm
+        if target == "in":
+            return scale_mm / 25.4
     context.warnings.append(
         DxfWarning(
             code="UNIT_SCALE_ASSUMED",
@@ -893,6 +986,29 @@ def _unit_scale(source: str, target: str, context: ExportContext) -> float:
         )
     )
     return 1.0
+
+
+def _physical_size_mm(document: dict[str, Any]) -> tuple[float, float] | None:
+    physical = _nested(document, "exportSettings", "physical")
+    if not isinstance(physical, dict) or physical.get("widthMm") is None:
+        return None
+    width = _positive_float(physical.get("widthMm"), 0)
+    canvas = document.get("canvas")
+    if not isinstance(canvas, dict):
+        return None
+    canvas_width = _positive_float(canvas.get("width"), 0)
+    canvas_height = _positive_float(canvas.get("height"), 0)
+    if width <= 0 or canvas_width <= 0 or canvas_height <= 0:
+        raise DomainError(
+            code="VALIDATION_ERROR",
+            message="Physical export width and canvas dimensions must be positive.",
+            details={"field": "exportSettings.physical.widthMm"},
+            recoverable=True,
+        )
+    height = _positive_float(physical.get("heightMm"), 0)
+    if height <= 0:
+        height = width * canvas_height / canvas_width
+    return width, height
 
 
 def _dedupe_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -967,6 +1083,17 @@ def _relative_project_path(path: Path) -> str:
 def _project_root() -> Path:
     default_root = Path(__file__).resolve().parents[5]
     return Path(os.environ.get("FLOWER_PROJECT_ROOT", default_root)).resolve()
+
+
+def _compact_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _local_name(tag: str) -> str:

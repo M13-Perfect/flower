@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Literal
+from xml.etree import ElementTree
 
 from app.domain import DomainError
 
@@ -171,35 +173,99 @@ def _render_layer(layer: dict[str, Any]) -> str:
 
 
 def _render_text_layer(layer: dict[str, Any]) -> str:
+    from app.domain.exports.dxf import (
+        ExportContext,
+        Matrix,
+        _aligned_text_offset,
+        _glyph_shapes,
+        _resolve_font_path,
+        _text_with_glyph_overrides as dxf_text_with_glyph_overrides,
+    )
+
+    try:
+        from fontTools.ttLib import TTFont
+    except ImportError as exc:
+        raise DomainError(
+            code="FONT_LOAD_FAILED",
+            message="fontTools is required to convert text to paths for SVG export.",
+            details={"layerId": layer.get("id")},
+            recoverable=False,
+        ) from exc
+
     raw_style = layer.get("style")
     style: dict[str, Any] = raw_style if isinstance(raw_style, dict) else {}
-    raw_font_ref = layer.get("fontRef")
-    font_ref: dict[str, Any] = raw_font_ref if isinstance(raw_font_ref, dict) else {}
-    text = _text_with_glyph_overrides(layer)
-    text_x = _aligned_text_x(layer, style)
-    anchor = _text_anchor(str(style.get("align") or "left"))
+    context = ExportContext(document={}, target_units="px", exported_at="")
+    font_path = _resolve_font_path(layer, context)
+    try:
+        font = TTFont(str(font_path))
+    except Exception as exc:
+        raise DomainError(
+            code="FONT_LOAD_FAILED",
+            message="Font could not be loaded for SVG text path export.",
+            details={"layerId": layer.get("id")},
+            recoverable=True,
+        ) from exc
+
+    glyph_set = font.getGlyphSet()
+    cmap = font.getBestCmap() or {}
+    hmtx: dict[str, Any] = font["hmtx"].metrics if "hmtx" in font else {}
+    units_per_em = float(font["head"].unitsPerEm if "head" in font else 1000)
     font_size = _number(style.get("fontSize") or 16)
+    font_size_value = float(font_size)
     line_height = float(style.get("lineHeight") or 1)
-    lines = re.split(r"\r\n|\n|\r", text)
-    tspans = []
-    for index, line in enumerate(lines):
-        dy = 0 if index == 0 else float(style.get("fontSize") or 16) * line_height
-        tspans.append(f'<tspan x="{_number(text_x)}" dy="{_number(dy)}">{escape(line)}</tspan>')
-    attrs = [
-        f'font-family="{_attr(str(font_ref.get("family") or "serif"))}"',
-        f'font-size="{font_size}"',
-        f'fill="{_attr(str(style.get("fill") or "#000000"))}"',
-        f'text-anchor="{anchor}"',
-        'dominant-baseline="text-before-edge"',
-        f'data-layer-id="{_attr(str(layer.get("id") or ""))}"',
-    ]
-    if float(style.get("letterSpacing") or 0):
-        attrs.append(f'letter-spacing="{_number(style.get("letterSpacing"))}"')
-    if style.get("stroke"):
-        attrs.append(f'stroke="{_attr(str(style.get("stroke")))}"')
-    if style.get("strokeWidth") is not None:
-        attrs.append(f'stroke-width="{_number(style.get("strokeWidth"))}"')
-    return f'<text x="0" y="0" {" ".join(attrs)}>{"".join(tspans)}</text>'
+    letter_spacing = float(style.get("letterSpacing") or 0)
+    fill = str(style.get("fill") or "#000000")
+    stroke = str(style.get("stroke") or "")
+    stroke_width = float(style.get("strokeWidth") or 0)
+    text = dxf_text_with_glyph_overrides(layer)
+    paths: list[str] = []
+
+    for line_index, line in enumerate(re.split(r"\r\n|\n|\r", text)):
+        cursor = _aligned_text_offset(
+            line,
+            style,
+            layer,
+            cmap,
+            hmtx,
+            units_per_em,
+            font_size_value,
+            letter_spacing,
+        )
+        baseline_y = line_index * font_size_value * line_height
+        for char in line:
+            codepoint = ord(char)
+            glyph_name = cmap.get(codepoint)
+            if glyph_name is None or glyph_name not in glyph_set:
+                raise DomainError(
+                    code="GLYPH_MISSING",
+                    message="Font does not contain a required glyph for SVG text path export.",
+                    details={"layerId": layer.get("id"), "codepoint": f"U+{codepoint:04X}"},
+                    recoverable=True,
+                )
+            for shape in _glyph_shapes(
+                glyph_set[glyph_name],
+                glyph_name,
+                cursor,
+                baseline_y,
+                font_size_value / units_per_em,
+                Matrix(),
+                str(layer.get("id", "text")),
+            ):
+                path_data = _shape_path_data(shape.points, shape.closed)
+                if not path_data:
+                    continue
+                attrs = [
+                    f'd="{_attr(path_data)}"',
+                    f'fill="{_attr(fill)}"',
+                    f'data-layer-id="{_attr(str(layer.get("id") or ""))}"',
+                ]
+                if stroke and stroke_width > 0:
+                    attrs.append(f'stroke="{_attr(stroke)}"')
+                    attrs.append(f'stroke-width="{_number(stroke_width)}"')
+                paths.append(f'<path {" ".join(attrs)}/>')
+            advance = float((hmtx.get(glyph_name) or (units_per_em, 0))[0])
+            cursor += advance * font_size_value / units_per_em + letter_spacing
+    return "\n".join(paths)
 
 
 def _render_svg_layer(layer: dict[str, Any]) -> str:
@@ -210,25 +276,30 @@ def _render_svg_layer(layer: dict[str, Any]) -> str:
         if path:
             inline_svg = _read_svg_asset(str(path), layer)
     if not inline_svg:
-        asset_ref = layer.get("assetRef")
-        path = asset_ref.get("path") if isinstance(asset_ref, dict) else ""
-        return (
-            f'<image width="{_number(layer.get("width", 0))}" '
-            f'height="{_number(layer.get("height", 0))}" '
-            f'href="{_attr(str(path))}" preserveAspectRatio="xMidYMid meet" '
-            f'data-layer-id="{_attr(str(layer.get("id") or ""))}"/>'
+        raise DomainError(
+            code="ASSET_NOT_FOUND",
+            message="SVG layer must include inlineSvg or assetRef.path for SVG export.",
+            details={"layerId": layer.get("id")},
+            recoverable=True,
         )
-    inner, view_box = _parse_inline_svg(str(inline_svg), layer)
+    children, view_box = _parse_inline_svg(str(inline_svg), layer)
+    x_min, y_min, source_width, source_height = view_box
+    x_scale = float(layer.get("width", source_width) or source_width) / source_width
+    y_scale = float(layer.get("height", source_height) or source_height) / source_height
+    view_box_text = " ".join(_number(value) for value in view_box)
+    transform = (
+        f"scale({_number(x_scale)} {_number(y_scale)}) "
+        f"translate({_number(-x_min)} {_number(-y_min)})"
+    )
     return "\n".join(
         [
             (
-                f'<svg width="{_number(layer.get("width", 0))}" '
-                f'height="{_number(layer.get("height", 0))}" '
-                f'viewBox="{_attr(view_box)}" preserveAspectRatio="xMidYMid meet" '
-                f'data-layer-id="{_attr(str(layer.get("id") or ""))}">'
+                f'<g data-layer-id="{_attr(str(layer.get("id") or ""))}" '
+                f'data-source-viewBox="{_attr(view_box_text)}" '
+                f'transform="{_attr(transform)}">'
             ),
-            *_indent(inner.splitlines(), "  "),
-            "</svg>",
+            *_indent(children, "  "),
+            "</g>",
         ]
     )
 
@@ -277,33 +348,105 @@ def _is_exportable(layer: dict[str, Any]) -> bool:
     return not any(marker.strip().casefold() in HELPER_LAYER_MARKERS for marker in markers)
 
 
-def _parse_inline_svg(svg: str, layer: dict[str, Any]) -> tuple[str, str]:
+def _parse_inline_svg(svg: str, layer: dict[str, Any]) -> tuple[list[str], tuple[float, float, float, float]]:
     sanitized = _strip_unsafe_svg_markup(svg).strip()
-    fallback = _fallback_view_box(layer)
-    match = re.search(r"<svg\b([^>]*)>([\s\S]*?)</svg>", sanitized, flags=re.IGNORECASE)
-    if not match:
-        return sanitized, fallback
-    view_box_match = re.search(r"\sviewBox=(['\"])(.*?)\1", match.group(1), flags=re.IGNORECASE)
-    return match.group(2).strip(), view_box_match.group(2) if view_box_match else fallback
+    try:
+        root = ElementTree.fromstring(sanitized)
+    except ElementTree.ParseError as exc:
+        raise DomainError(
+            code="SVG_PARSE_FAILED",
+            message="SVG asset could not be parsed for SVG export.",
+            details={"layerId": layer.get("id")},
+            recoverable=True,
+        ) from exc
+    if _local_name(root.tag) != "svg":
+        raise DomainError(
+            code="SVG_PARSE_FAILED",
+            message="SVG asset root element must be <svg>.",
+            details={"layerId": layer.get("id")},
+            recoverable=True,
+        )
+    view_box = _svg_view_box(root, layer)
+    if view_box[2] <= 0 or view_box[3] <= 0:
+        raise DomainError(
+            code="SVG_PARSE_FAILED",
+            message="SVG viewBox must have positive width and height.",
+            details={"layerId": layer.get("id")},
+            recoverable=True,
+        )
+    _sanitize_svg_tree(root)
+    children = [
+        ElementTree.tostring(deepcopy(child), encoding="unicode", short_empty_elements=True)
+        for child in list(root)
+    ]
+    return children, view_box
 
 
 def _strip_unsafe_svg_markup(svg: str) -> str:
+    without_xml = re.sub(r"^\s*<\?xml[^>]*\?>", "", svg, flags=re.IGNORECASE)
     return re.sub(
-        r"\son[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*')",
+        r"<!DOCTYPE[^>]*(?:\[[\s\S]*?\]\s*)?>",
         "",
-        re.sub(
-            r"<script\b[\s\S]*?</script>",
-            "",
-            re.sub(
-                r"<!doctype[\s\S]*?>",
-                "",
-                re.sub(r"<\?xml[\s\S]*?\?>", "", svg, flags=re.I),
-                flags=re.I,
-            ),
-            flags=re.I,
-        ),
-        flags=re.I,
+        without_xml,
+        flags=re.IGNORECASE,
     )
+
+
+def _svg_view_box(
+    root: ElementTree.Element,
+    layer: dict[str, Any],
+) -> tuple[float, float, float, float]:
+    raw = root.get("viewBox")
+    if raw:
+        try:
+            parts = [float(part) for part in re.split(r"[\s,]+", raw.strip()) if part]
+        except ValueError as exc:
+            raise DomainError(
+                code="SVG_PARSE_FAILED",
+                message="SVG viewBox contains invalid numbers.",
+                details={"layerId": layer.get("id")},
+                recoverable=True,
+            ) from exc
+        if len(parts) == 4:
+            return parts[0], parts[1], parts[2], parts[3]
+    raw_view_box = layer.get("viewBox")
+    view_box: dict[str, Any] = raw_view_box if isinstance(raw_view_box, dict) else {}
+    return (
+        float(view_box.get("x", 0)),
+        float(view_box.get("y", 0)),
+        float(view_box.get("width", layer.get("width", 1))),
+        float(view_box.get("height", layer.get("height", 1))),
+    )
+
+
+def _sanitize_svg_tree(element: ElementTree.Element) -> None:
+    element.tag = _local_name(element.tag)
+    for attr_name in list(element.attrib):
+        clean_name = _local_name(attr_name)
+        if clean_name.casefold().startswith("on"):
+            del element.attrib[attr_name]
+            continue
+        if clean_name != attr_name:
+            element.attrib[clean_name] = element.attrib.pop(attr_name)
+    for child in list(element):
+        if _local_name(child.tag) == "script":
+            element.remove(child)
+            continue
+        _sanitize_svg_tree(child)
+
+
+def _shape_path_data(points: list[tuple[float, float]], closed: bool) -> str:
+    if len(points) < 2:
+        return ""
+    commands = [f"M {_number(points[0][0])} {_number(points[0][1])}"]
+    commands.extend(f"L {_number(x)} {_number(y)}" for x, y in points[1:])
+    if closed:
+        commands.append("Z")
+    return " ".join(commands)
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
 
 def _fallback_view_box(layer: dict[str, Any]) -> str:

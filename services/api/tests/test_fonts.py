@@ -85,6 +85,36 @@ def test_get_font_glyphs_returns_structured_error_for_missing_font(tmp_path, mon
     assert payload["error"]["details"] == {"fontId": "missing"}
 
 
+def test_selected_font_directory_is_scanned_and_font_file_is_served(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(scanner, "PROJECT_ROOT", tmp_path)
+    font_root = tmp_path / "external-fonts"
+    font_root.mkdir()
+    font_path = font_root / "Specimen.ttf"
+    build_test_font(font_path, family_name="Specimen", pua_codepoint=0xE123)
+    client = TestClient(app)
+
+    settings_response = client.put(
+        "/settings/paths",
+        json={
+            "assetDirectories": [],
+            "fontDirectories": [str(font_root)],
+            "outputDirectory": None,
+        },
+    )
+    assert settings_response.status_code == 200
+
+    fonts_response = client.get("/fonts")
+    assert fonts_response.status_code == 200
+    fonts_payload = fonts_response.json()
+    assert fonts_payload["fontCount"] == 1
+    assert fonts_payload["fonts"][0]["id"] == "specimen"
+
+    file_response = client.get("/fonts/specimen/file")
+    assert file_response.status_code == 200
+    assert file_response.content == font_path.read_bytes()
+
+
 def build_test_font(path: Path, *, family_name: str, pua_codepoint: int) -> None:
     glyph_order = [".notdef", "A", "uniE123.swash", "unmapped.alt"]
     glyphs = {name: draw_box_glyph() for name in glyph_order}

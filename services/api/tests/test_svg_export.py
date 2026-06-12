@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any
+
+from fontTools.fontBuilder import FontBuilder
+from fontTools.pens.ttGlyphPen import TTGlyphPen
+
 from app.domain import DomainError
 from app.domain.exports.svg import export_svg
 
@@ -7,7 +14,9 @@ from app.domain.exports.svg import export_svg
 EXPORTED_AT = "2026-06-12T10:11:12.000Z"
 
 
-def test_svg_export_preserves_layers_metadata_and_filters_editor_helpers() -> None:
+def test_svg_export_outputs_cad_safe_parseable_svg(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(tmp_path))
+    build_test_font(tmp_path / "assets" / "fonts" / "lovely-script.ttf")
     document = base_document(
         layers=[
             {
@@ -34,8 +43,12 @@ def test_svg_export_preserves_layers_metadata_and_filters_editor_helpers() -> No
             {
                 **layer_base("flower_1", "svg", x=30, y=40, width=80, height=90, z_index=1),
                 "inlineSvg": (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" '
+                    '"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">'
                     '<svg viewBox="0 0 10 10">'
-                    '<path d="M0 0h10v10z" fill="#00aa00"/></svg>'
+                    '<path d="M0 0h10v10z" fill="#00aa00" onclick="bad()"/>'
+                    "</svg>"
                 ),
                 "viewBox": {"x": 0, "y": 0, "width": 10, "height": 10},
                 "preserveVector": True,
@@ -70,10 +83,16 @@ def test_svg_export_preserves_layers_metadata_and_filters_editor_helpers() -> No
     assert 'id="text_1"' in result.content
     assert 'id="path_1"' in result.content
     assert result.content.index('id="flower_1"') < result.content.index('id="text_1"')
-    assert "Kristianna" in result.content
-    assert 'font-family="Font 5"' in result.content
-    assert '<path d="M0 0h10v10z" fill="#00aa00"/>' in result.content
+    assert 'data-source-viewBox="0 0 10 10"' in result.content
+    assert "onclick" not in result.content
     assert "selection_1" not in result.content
+    assert result.content.startswith('<?xml version="1.0" encoding="UTF-8"?>')
+    assert result.content.count("<?xml") == 1
+    assert "<!DOCTYPE" not in result.content
+    assert "<text" not in result.content
+    assert "<image" not in result.content
+    assert 'data-layer-id="text_1"' in result.content
+    assert ET.fromstring(result.content) is not None
 
 
 def test_svg_export_rejects_missing_required_document_fields() -> None:
@@ -115,6 +134,48 @@ def base_document(*, layers: list[dict]) -> dict:
         },
         "layers": layers,
     }
+
+
+def build_test_font(path: Path) -> None:
+    glyph_order = [".notdef", *list("Kristianna")]
+    glyph_order = list(dict.fromkeys(glyph_order))
+    glyphs = {name: draw_box_glyph() for name in glyph_order}
+    advance_widths = {name: (500, 0) for name in glyph_order}
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder(glyph_order)
+    builder.setupCharacterMap({ord(name): name for name in glyph_order if name != ".notdef"})
+    builder.setupGlyf(glyphs)
+    builder.setupHorizontalMetrics(advance_widths)
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupOS2(
+        sTypoAscender=780,
+        sTypoDescender=-220,
+        usWinAscent=820,
+        usWinDescent=220,
+    )
+    builder.setupNameTable(
+        {
+            "familyName": "Lovely Script",
+            "styleName": "Regular",
+            "uniqueFontIdentifier": "Lovely Script Regular",
+            "fullName": "Lovely Script Regular",
+            "psName": "LovelyScript-Regular",
+        }
+    )
+    builder.setupPost()
+    builder.save(path)
+
+
+def draw_box_glyph() -> Any:
+    pen = TTGlyphPen(None)
+    pen.moveTo((0, 0))
+    pen.lineTo((500, 0))
+    pen.lineTo((500, 700))
+    pen.lineTo((0, 700))
+    pen.closePath()
+    return pen.glyph()
 
 
 def layer_base(

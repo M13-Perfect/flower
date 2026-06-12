@@ -33,19 +33,22 @@ def save_outputs(
     order_name: str,
     document: dict[str, Any],
     svg: str,
-    png_data_url: str,
+    png_data_url: str | None = None,
     dxf_content_base64: str | None = None,
+    output_directory: str | None = None,
 ) -> SaveOutputsResult:
     output_id = _output_order_id(order_name, document)
-    output_dir = _safe_output_dir(output_id)
+    output_dir = _safe_output_dir(output_id, output_directory)
+    selected_output_root = output_directory is not None and bool(output_directory.strip())
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         files = [
             _write_text(output_dir, "order.json", json.dumps(document, ensure_ascii=False, indent=2), "json"),
             _write_text(output_dir, f"{output_id}.svg", svg, "svg"),
-            _write_bytes(output_dir, f"{output_id}.png", _decode_png_data_url(png_data_url), "png"),
         ]
+        if png_data_url:
+            files.append(_write_bytes(output_dir, f"{output_id}.png", _decode_png_data_url(png_data_url), "png"))
         if dxf_content_base64:
             files.append(_write_bytes(output_dir, f"{output_id}.dxf", _decode_base64(dxf_content_base64, "dxf"), "dxf"))
     except OSError as exc:
@@ -61,7 +64,7 @@ def save_outputs(
         ) from exc
 
     return SaveOutputsResult(
-        output_dir=_relative_project_path(output_dir),
+        output_dir=str(output_dir) if selected_output_root else _relative_project_path(output_dir),
         files=tuple(files),
     )
 
@@ -106,8 +109,8 @@ def _decode_base64(value: str, field: str) -> bytes:
         ) from exc
 
 
-def _safe_output_dir(order_name: str) -> Path:
-    outputs_root = (_project_root() / "outputs").resolve()
+def _safe_output_dir(order_name: str, output_directory: str | None = None) -> Path:
+    outputs_root = _resolve_output_root(output_directory)
     order_dir = (outputs_root / _sanitize_order_name(order_name)).resolve()
     if outputs_root != order_dir and outputs_root not in order_dir.parents:
         raise DomainError(
@@ -117,6 +120,24 @@ def _safe_output_dir(order_name: str) -> Path:
             recoverable=True,
         )
     return order_dir
+
+
+def _resolve_output_root(output_directory: str | None) -> Path:
+    if output_directory is None or not output_directory.strip():
+        return (_project_root() / "outputs").resolve()
+
+    root = Path(output_directory).expanduser()
+    if not root.is_absolute():
+        root = _project_root() / root
+    root = root.resolve()
+    if root.exists() and not root.is_dir():
+        raise DomainError(
+            code="PATH_NOT_DIRECTORY",
+            message="Output path is not a directory.",
+            details={"path": str(root)},
+            recoverable=True,
+        )
+    return root
 
 
 def _safe_child_path(output_dir: Path, file_name: str) -> Path:
@@ -149,13 +170,8 @@ def _relative_project_path(path: Path) -> str:
     root = _project_root()
     try:
         return resolved.relative_to(root).as_posix()
-    except ValueError as exc:
-        raise DomainError(
-            code="PATH_TRAVERSAL_BLOCKED",
-            message="Output path is outside the project root.",
-            details={"path": str(path)},
-            recoverable=True,
-        ) from exc
+    except ValueError:
+        return str(resolved)
 
 
 def _project_root() -> Path:

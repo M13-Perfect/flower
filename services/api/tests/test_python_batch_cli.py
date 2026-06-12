@@ -5,10 +5,12 @@ import csv
 import json
 from io import StringIO
 from pathlib import Path
+import shutil
 import struct
 import sys
 from types import SimpleNamespace
 import types
+import xml.etree.ElementTree as ET
 import zlib
 
 from app.cli import main as cli_main
@@ -72,9 +74,13 @@ def test_python_batch_workflow_generates_golden_svg_dxf_and_optional_png(
     assert result.failed_count == 0
     output_a = project_root / "outputs" / "A1001"
     output_b = project_root / "outputs" / "B1001"
-    assert (output_a / "A1001.svg").read_text(encoding="utf-8") == golden("real_note_a.svg")
+    svg_a = (output_a / "A1001.svg").read_text(encoding="utf-8")
+    svg_b = (output_b / "B1001.svg").read_text(encoding="utf-8")
+    assert_production_svg(svg_a)
+    assert_production_svg(svg_b)
+    assert svg_a == golden("real_note_a.svg")
     assert (output_a / "A1001.dxf").read_text(encoding="utf-8") == golden("real_note_a.dxf")
-    assert (output_b / "B1001.svg").read_text(encoding="utf-8") == golden("real_note_b.svg")
+    assert svg_b == golden("real_note_b.svg")
     assert (output_b / "B1001.dxf").read_text(encoding="utf-8") == golden("real_note_b.dxf")
     assert read_png_size((output_a / "A1001.png").read_bytes()) == (3000, 3000)
     assert read_png_size((output_b / "B1001.png").read_bytes()) == (3000, 3000)
@@ -104,9 +110,12 @@ def test_python_batch_workflow_imports_xlsx_without_review_rows(
     assert result.generated_count == 3
     for order_id in ("4087956129", "4087958577", "4087970477"):
         output_dir = tmp_path / "outputs" / order_id
-        assert (output_dir / f"{order_id}.svg").is_file()
+        document = json.loads((output_dir / "order.json").read_text(encoding="utf-8"))
+        assert document["metadata"]["pngExport"]["status"] == "skipped"
+        assert "Cairo" in document["metadata"]["pngExport"]["reason"]
+        assert_production_svg((output_dir / f"{order_id}.svg").read_text(encoding="utf-8"))
         assert (output_dir / f"{order_id}.dxf").is_file()
-        assert read_png_size((output_dir / f"{order_id}.png").read_bytes()) == (3000, 3000)
+        assert not (output_dir / f"{order_id}.png").exists()
 
 
 def test_python_batch_cli_runs_review_loop_commands(
@@ -143,6 +152,7 @@ def test_python_batch_cli_runs_review_loop_commands(
     assert cli_main(["generate", "--batch-id", "cli_batch", "--exported-at", EXPORTED_AT]) == 0
     generated = json.loads(capsys.readouterr().out)
     assert generated["generated"] == 2
+    assert "Cairo" in generated["png"]["skippedReason"]
     assert {item["status"] for item in generated["items"]} == {"EXPORTED"}
 
 
@@ -165,6 +175,10 @@ def prepare_project_root(project_root: Path) -> None:
             "unit": "px",
             "background": { "type": "solid", "color": "#ffffff" }
           },
+          "exportSettings": {
+            "physical": { "widthMm": 80 },
+            "dxf": { "textMode": "paths", "units": "mm" }
+          },
           "slots": [
             { "slotId": "customer_name", "kind": "text", "required": true },
             { "slotId": "flower", "kind": "svg", "required": true }
@@ -181,6 +195,7 @@ def prepare_project_root(project_root: Path) -> None:
         '<svg viewBox="0 0 10 10"><path d="M1 1 L9 1 L5 9 Z"/></svg>',
         encoding="utf-8",
     )
+    copy_test_font(project_root)
 
 
 def prepare_xlsx_project_root(project_root: Path) -> None:
@@ -199,6 +214,13 @@ def prepare_xlsx_project_root(project_root: Path) -> None:
             '<svg viewBox="0 0 10 10"><path d="M0 0 L10 0 L10 10 L0 0"/></svg>',
             encoding="utf-8",
         )
+    copy_test_font(project_root)
+
+
+def copy_test_font(project_root: Path) -> None:
+    font_source = REPO_ROOT / "Birthmonth_font.ttf"
+    if font_source.is_file():
+        shutil.copy2(font_source, project_root / "Birthmonth_font.ttf")
 
 
 def orders_csv_text() -> str:
@@ -293,6 +315,10 @@ def fake_svg2png(
     output_height: int,
 ) -> None:
     assert b"<svg" in bytestring
+    assert b"<text" not in bytestring
+    assert b"<image" not in bytestring
+    assert b'data-layer-id="layer_flower"' in bytestring
+    assert b'data-layer-id="layer_customer_name"' in bytestring
     Path(write_to).write_bytes(tiny_png(output_width, output_height))
 
 
@@ -315,3 +341,11 @@ def chunk(kind: bytes, data: bytes) -> bytes:
 
 def golden(name: str) -> str:
     return (Path(__file__).parent / "golden" / name).read_text(encoding="utf-8")
+
+
+def assert_production_svg(svg: str) -> None:
+    assert svg.startswith('<?xml version="1.0" encoding="UTF-8"?>')
+    assert svg.count("<?xml") == 1
+    assert "<text" not in svg
+    assert "<image" not in svg
+    assert ET.fromstring(svg) is not None
