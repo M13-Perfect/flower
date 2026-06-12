@@ -20,7 +20,7 @@ def test_save_outputs_writes_order_files_under_sanitized_order_directory(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(tmp_path))
-    document = _document(order_id="order-lacey")
+    document = _document(order_id="4087956129")
     dxf_text = "0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n"
 
     response = TestClient(app).post(
@@ -36,14 +36,14 @@ def test_save_outputs_writes_order_files_under_sanitized_order_directory(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["outputDir"] == "outputs/Lacey"
+    assert payload["outputDir"] == "outputs/4087956129"
     assert {item["kind"] for item in payload["files"]} == {"json", "png", "svg", "dxf"}
 
-    output_dir = tmp_path / "outputs" / "Lacey"
+    output_dir = tmp_path / "outputs" / "4087956129"
     assert json.loads((output_dir / "order.json").read_text(encoding="utf-8")) == document
-    assert (output_dir / "design.svg").read_text(encoding="utf-8").startswith("<svg")
-    assert (output_dir / "preview.png").read_bytes().startswith(b"\x89PNG")
-    assert (output_dir / "design.dxf").read_text(encoding="utf-8") == dxf_text
+    assert (output_dir / "4087956129.svg").read_text(encoding="utf-8").startswith("<svg")
+    assert (output_dir / "4087956129.png").read_bytes().startswith(b"\x89PNG")
+    assert (output_dir / "4087956129.dxf").read_text(encoding="utf-8") == dxf_text
 
 
 def test_save_outputs_keeps_order_directory_inside_outputs(
@@ -64,7 +64,7 @@ def test_save_outputs_keeps_order_directory_inside_outputs(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["outputDir"] == "outputs/bad-customer"
+    assert payload["outputDir"] == "outputs/order-bad"
     output_dir = (tmp_path / payload["outputDir"]).resolve()
     assert output_dir.is_dir()
     assert tmp_path.resolve() in output_dir.parents
@@ -78,7 +78,7 @@ def test_save_outputs_returns_structured_error_when_output_directory_is_unwritab
     original_mkdir = Path.mkdir
 
     def deny_order_dir(self: Path, *args, **kwargs) -> None:
-        if self.name == "Lacey":
+        if self.name == "order-lacey":
             raise PermissionError("denied")
         original_mkdir(self, *args, **kwargs)
 
