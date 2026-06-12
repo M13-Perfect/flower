@@ -2,6 +2,7 @@
 .venv-win/
 .codex/
 .superpowers/
+.worktrees/
 __pycache__/
 .pytest_cache/
 outputs/
