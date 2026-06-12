@@ -11,6 +11,7 @@ from typing import Any
 
 from app.domain import DomainError
 from app.domain.exports import export_dxf
+from app.domain.exports.png import png_rasterizer_available
 from app.domain.orders.batch_import import BatchOrderItem
 from app.domain.orders.batch_store import load_batch
 from app.domain.orders.workflow import generate_batch_outputs, parse_order_batch
@@ -39,7 +40,10 @@ class BatchGenerateResult:
 
 def generate_batch(batch_id: str) -> BatchGenerateResult:
     batch = parse_order_batch(batch_id)
-    workflow_result = generate_batch_outputs(batch.batch_id)
+    # 桌面按钮路径与 CLI 同规则:栅格化可用即产 PNG,不可用降级跳过。
+    workflow_result = generate_batch_outputs(
+        batch.batch_id, include_png=png_rasterizer_available()
+    )
     generated_items, report_path, review_csv_path = write_reports_for_workflow_result(
         batch.batch_id, workflow_result
     )

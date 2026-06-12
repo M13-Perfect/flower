@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 from app.domain import DomainError
+from app.domain.exports.png import png_rasterizer_available
 from app.domain.orders.batch_generate import write_reports_for_workflow_result
 from app.domain.orders.workflow import (
     PNG_SKIPPED_REASON,
@@ -115,9 +116,11 @@ def _handle_import_review(args: argparse.Namespace) -> dict:
 
 def _handle_generate(args: argparse.Namespace) -> dict:
     batch_id = _batch_id_arg(args)
+    # --png 强制开启;未指定时按栅格化能力自动决定,缺 cairo 时只降级不失败。
+    include_png = bool(args.png) or png_rasterizer_available()
     result = generate_batch_outputs(
         batch_id,
-        include_png=args.png,
+        include_png=include_png,
         exported_at=args.exported_at,
     )
     _, report_path, review_csv_path = write_reports_for_workflow_result(batch_id, result)
@@ -129,7 +132,8 @@ def _handle_generate(args: argparse.Namespace) -> dict:
         "reviewCsvPath": review_csv_path.as_posix(),
         "png": {
             "requested": bool(args.png),
-            "skippedReason": None if args.png else PNG_SKIPPED_REASON,
+            "enabled": include_png,
+            "skippedReason": None if include_png else PNG_SKIPPED_REASON,
         },
         "items": [
             {
