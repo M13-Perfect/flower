@@ -65,6 +65,8 @@ def apply_template(
     document_id = f"doc_{uuid4().hex}"
     resolved_project_id = project_id or "project_local"
     resolved_job_id = job_id or f"job_{uuid4().hex}"
+    # 订单号是导出元数据必填项；用户未填订单号时用 job id 兜底，保证前端编辑保存仍是合法文档。
+    resolved_order_id = parsed_order.order_id or resolved_job_id
 
     return {
         "schemaVersion": "1.0",
@@ -72,7 +74,7 @@ def apply_template(
         "projectId": resolved_project_id,
         "jobId": resolved_job_id,
         "metadata": {
-            "orderId": parsed_order.order_id,
+            "orderId": resolved_order_id,
             "templateId": template["templateId"],
             "templateVersion": template["version"],
             "appVersion": APP_VERSION,

@@ -36,17 +36,18 @@ def save_outputs(
     png_data_url: str,
     dxf_content_base64: str | None = None,
 ) -> SaveOutputsResult:
-    output_dir = _safe_output_dir(order_name)
+    output_id = _output_order_id(order_name, document)
+    output_dir = _safe_output_dir(output_id)
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         files = [
             _write_text(output_dir, "order.json", json.dumps(document, ensure_ascii=False, indent=2), "json"),
-            _write_text(output_dir, "design.svg", svg, "svg"),
-            _write_bytes(output_dir, "preview.png", _decode_png_data_url(png_data_url), "png"),
+            _write_text(output_dir, f"{output_id}.svg", svg, "svg"),
+            _write_bytes(output_dir, f"{output_id}.png", _decode_png_data_url(png_data_url), "png"),
         ]
         if dxf_content_base64:
-            files.append(_write_bytes(output_dir, "design.dxf", _decode_base64(dxf_content_base64, "dxf"), "dxf"))
+            files.append(_write_bytes(output_dir, f"{output_id}.dxf", _decode_base64(dxf_content_base64, "dxf"), "dxf"))
     except OSError as exc:
         # 文件系统错误必须转成业务错误，避免前端只收到 500 或浏览器级 Failed to fetch。
         raise DomainError(
@@ -135,6 +136,12 @@ def _sanitize_order_name(value: str) -> str:
     cleaned = "".join(char if char.isalnum() or char in {" ", "-", "_"} else "-" for char in leaf)
     collapsed = re.sub(r"[\s_-]+", "-", cleaned).strip("-._ ")
     return (collapsed or "order")[:80]
+
+
+def _output_order_id(order_name: str, document: dict[str, Any]) -> str:
+    metadata = document.get("metadata")
+    raw_order_id = metadata.get("orderId") if isinstance(metadata, dict) else None
+    return _sanitize_order_name(str(raw_order_id or order_name))
 
 
 def _relative_project_path(path: Path) -> str:

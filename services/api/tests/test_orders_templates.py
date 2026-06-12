@@ -219,6 +219,36 @@ def test_apply_template_returns_editable_layer_document() -> None:
     assert flower_layer["preserveVector"] is True
 
 
+def test_apply_template_uses_job_id_when_order_id_is_missing() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/templates/apply",
+        json={
+            "templateId": "birth-flower-card",
+            "jobId": "job-no-order-id",
+            "parsedOrder": {
+                "customerName": "Ava Chen",
+                "month": 6,
+                "monthName": "June",
+                "flower": {
+                    "choice": 1,
+                    "name": "Rose",
+                },
+                "fontPreference": {
+                    "choice": 2,
+                    "label": "Font 2",
+                },
+                "specialNotes": "",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    document = response.json()["document"]
+    assert document["metadata"]["orderId"] == "job-no-order-id"
+
+
 def test_apply_template_resolves_birth_month_flower_asset_from_project_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
