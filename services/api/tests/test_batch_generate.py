@@ -26,11 +26,11 @@ def test_generate_batch_from_real_dianxiaomi_fixture_writes_assets_and_report(
 
     result = generate_batch("batch_real")
 
-    assert [item.status for item in result.items] == ["READY", "READY", "READY"]
+    assert [item.status for item in result.items] == ["EXPORTED", "EXPORTED", "EXPORTED"]
     for order_id in ("4087956129", "4087958577", "4087970477"):
         order_dir = tmp_path / "outputs" / order_id
         assert (order_dir / "order.json").is_file()
-        assert (order_dir / f"{order_id}.svg").read_text(encoding="utf-8").startswith("<svg")
+        assert "<svg" in (order_dir / f"{order_id}.svg").read_text(encoding="utf-8")
         dxf_text = (order_dir / f"{order_id}.dxf").read_text(encoding="utf-8")
         assert "SECTION" in dxf_text
         assert "EOF" in dxf_text
@@ -39,9 +39,9 @@ def test_generate_batch_from_real_dianxiaomi_fixture_writes_assets_and_report(
     report_path = tmp_path / "outputs" / "reports" / "batch_real-report.xlsx"
     rows = _read_xlsx_rows(report_path)
     assert rows[0] == ["订单号", "状态", "是否需人工核验", "原因汇总", "素材文件路径"]
-    assert rows[1][0:3] == ["4087956129", "READY", "否"]
-    assert rows[2][0:3] == ["4087958577", "READY", "否"]
-    assert rows[3][0:3] == ["4087970477", "READY", "否"]
+    assert rows[1][0:3] == ["4087956129", "EXPORTED", "否"]
+    assert rows[2][0:3] == ["4087958577", "EXPORTED", "否"]
+    assert rows[3][0:3] == ["4087970477", "EXPORTED", "否"]
     assert "4087956129.svg" in rows[1][4]
 
 

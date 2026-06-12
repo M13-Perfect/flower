@@ -13,6 +13,7 @@ from app.domain import DomainError
 from app.domain.exports import export_dxf
 from app.domain.orders.batch_import import BatchOrderItem
 from app.domain.orders.batch_store import load_batch
+from app.domain.orders.workflow import generate_batch_outputs, parse_order_batch
 from app.domain.orders.parser import parse_order_note
 from app.domain.orders.report import write_batch_report, write_review_csv
 from app.domain.output_store import save_outputs
@@ -37,16 +38,40 @@ class BatchGenerateResult:
 
 
 def generate_batch(batch_id: str) -> BatchGenerateResult:
-    batch = load_batch(batch_id)
-    generated_items = [_generate_item(item) for item in batch.items]
+    batch = parse_order_batch(batch_id)
+    workflow_result = generate_batch_outputs(batch.batch_id, include_png=True)
+    generated_by_job = {item.order_job_id: item for item in workflow_result.items}
+    final_batch = load_batch(batch.batch_id)
+    generated_items = [
+        _generated_item_from_batch_item(item, generated_by_job.get(item.order_job_id))
+        for item in final_batch.items
+    ]
     report_rows = [_report_row(item) for item in generated_items]
-    report_path = write_batch_report(batch.batch_id, report_rows)
-    review_csv_path = write_review_csv(batch.batch_id, report_rows)
+    report_path = write_batch_report(final_batch.batch_id, report_rows)
+    review_csv_path = write_review_csv(final_batch.batch_id, report_rows)
     return BatchGenerateResult(
-        batch_id=batch.batch_id,
+        batch_id=final_batch.batch_id,
         items=generated_items,
         report_path=report_path,
         review_csv_path=review_csv_path,
+    )
+
+
+def _generated_item_from_batch_item(item: BatchOrderItem, generated: object | None) -> GeneratedBatchItem:
+    if generated is not None:
+        return GeneratedBatchItem(
+            order_id=item.order_id,
+            status=getattr(generated, "status"),
+            needs_manual_review=False,
+            reason_summary="",
+            output_paths=list(getattr(generated, "files")),
+        )
+    return GeneratedBatchItem(
+        order_id=item.order_id,
+        status=item.status,
+        needs_manual_review=item.status in {"BLOCKED", "NEEDS_REVIEW", "FAILED"},
+        reason_summary="; ".join(issue.message for issue in item.issues),
+        output_paths=[],
     )
 
 

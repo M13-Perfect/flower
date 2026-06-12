@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="3000" height="3000" viewBox="0 0 3000 3000">
+  <metadata id="flower-export-metadata">{"templateId": "birth-flower-card", "orderId": "A1001", "exportedAt": "2026-06-12T12:00:00.000Z", "appVersion": "0.1.0"}</metadata>
+  <rect width="3000" height="3000" fill="#ffffff" data-export-background="canvas"/>
+  <g id="layer_flower" data-layer-name="Birth flower - hydrangea" transform="translate(900 420)">
+    <svg width="1200" height="1400" viewBox="0 0 10 10" preserveAspectRatio="xMidYMid meet" data-layer-id="layer_flower">
+      <path d="M0 0 L10 0 L10 10 Z"/>
+    </svg>
+  </g>
+  <g id="layer_customer_name" data-layer-name="Customer name" transform="translate(600 2200)">
+    <text x="0" y="0" font-family="Font 5" font-size="180" fill="#1f2933" text-anchor="middle" dominant-baseline="text-before-edge" data-layer-id="layer_customer_name" stroke="#ffffff" stroke-width="0"><tspan x="900" dy="0">Kristianna</tspan></text>
+  </g>
+</svg>

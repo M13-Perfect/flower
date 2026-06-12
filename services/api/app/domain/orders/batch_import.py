@@ -4,11 +4,12 @@ import csv
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 import warnings
 from uuid import uuid4
 
 from app.domain import DomainError
+from app.domain.orders.issues import ReviewIssue
 
 
 DEFAULT_LISTING_ID = "birth-flower-card"
@@ -19,17 +20,6 @@ ORDER_STATUSES = {
     "BLOCKED",
     "FAILED",
 }
-
-
-@dataclass
-class ReviewIssue:
-    code: str
-    severity: str
-    field: str | None
-    message: str
-    raw_value: str | None = None
-    suggested_value: str | None = None
-    requires_manual_action: bool = True
 
 
 @dataclass
@@ -45,7 +35,15 @@ class BatchOrderItem:
     personalization: str = ""
     variation: str = ""
     listing_version: str | None = None
+    raw_row: dict[str, str] = field(default_factory=dict)
     issues: list[ReviewIssue] = field(default_factory=list)
+    customer_name: str | None = None
+    month: int | None = None
+    flower: str | None = None
+    color: str | None = None
+    font_option_no: int | None = None
+    font_id: str | None = None
+    parsed_order: Any | None = None
 
 
 @dataclass
@@ -87,6 +85,22 @@ def import_orders(
     adapter = _adapter_for_source(source_path, adapter_name)
     resolved_batch_id = batch_id or f"batch_{uuid4().hex}"
     return adapter.load(source_path, batch_id=resolved_batch_id, default_listing_id=default_listing_id)
+
+
+def import_batch_csv(
+    csv_content: str,
+    *,
+    source_name: str = "orders.csv",
+    batch_id: str | None = None,
+    default_listing_id: str = DEFAULT_LISTING_ID,
+) -> BatchImport:
+    resolved_batch_id = batch_id or f"batch_{uuid4().hex}"
+    return _load_generic_csv_content(
+        csv_content,
+        source_name=source_name,
+        batch_id=resolved_batch_id,
+        default_listing_id=default_listing_id,
+    )
 
 
 def _adapter_for_source(source: Path, adapter_name: str | None) -> OrderSourceAdapter:
@@ -160,6 +174,10 @@ class DianxiaomiXlsxAdapter:
                     order_note=order_note,
                     personalization="",
                     variation="",
+                    raw_row={
+                        "orderId": order_id,
+                        "orderNote": order_note,
+                    },
                 )
             )
         workbook.close()
@@ -181,39 +199,11 @@ class GenericCsvAdapter:
         batch_id: str,
         default_listing_id: str,
     ) -> BatchImport:
-        content = source.read_text(encoding="utf-8-sig")
-        reader = csv.DictReader(StringIO(content))
-        fieldnames = list(reader.fieldnames or [])
-        missing_columns = [column for column in ("orderId", "orderNote") if column not in fieldnames]
-        if missing_columns:
-            raise DomainError(
-                code="CSV_INVALID",
-                message="CSV is missing required columns.",
-                details={"missingColumns": missing_columns},
-                recoverable=True,
-            )
-
-        items: list[BatchOrderItem] = []
-        for row_number, row in enumerate(reader, start=2):
-            normalized = {key: _clean_cell(value) for key, value in row.items() if key is not None}
-            items.append(
-                _build_item(
-                    batch_id=batch_id,
-                    row_number=row_number,
-                    source_adapter=self.name,
-                    order_id=normalized.get("orderId", ""),
-                    listing_id=normalized.get("listingId", "") or default_listing_id,
-                    order_note=normalized.get("orderNote", ""),
-                    personalization=normalized.get("personalization", ""),
-                    variation=normalized.get("variation", ""),
-                    listing_version=normalized.get("listingVersion") or None,
-                )
-            )
-        return BatchImport(
-            batch_id=batch_id,
+        return _load_generic_csv_content(
+            source.read_text(encoding="utf-8-sig"),
             source_name=source.name,
-            source_adapter=self.name,
-            items=items,
+            batch_id=batch_id,
+            default_listing_id=default_listing_id,
         )
 
 
@@ -228,6 +218,7 @@ def _build_item(
     personalization: str,
     variation: str,
     listing_version: str | None = None,
+    raw_row: dict[str, str] | None = None,
 ) -> BatchOrderItem:
     issues = _required_value_issues(order_id, order_note)
     return BatchOrderItem(
@@ -242,7 +233,63 @@ def _build_item(
         source_adapter=source_adapter,
         personalization=personalization,
         variation=variation,
+        raw_row=raw_row or {},
         issues=issues,
+    )
+
+
+def _load_generic_csv_content(
+    content: str,
+    *,
+    source_name: str,
+    batch_id: str,
+    default_listing_id: str,
+) -> BatchImport:
+    reader = csv.DictReader(StringIO(content.lstrip("\ufeff")))
+    fieldnames = list(reader.fieldnames or [])
+    missing_columns = [column for column in ("orderId", "orderNote") if column not in fieldnames]
+    if missing_columns:
+        raise DomainError(
+            code="CSV_INVALID",
+            message="CSV is missing required columns.",
+            details={"missingColumns": missing_columns},
+            recoverable=True,
+        )
+
+    items: list[BatchOrderItem] = []
+    for row_number, row in enumerate(reader, start=2):
+        normalized = {key: _clean_cell(value) for key, value in row.items() if key is not None}
+        extra_values = row.get(None)
+        item = _build_item(
+            batch_id=batch_id,
+            row_number=row_number,
+            source_adapter=GenericCsvAdapter.name,
+            order_id=normalized.get("orderId", ""),
+            listing_id=normalized.get("listingId", "") or default_listing_id,
+            order_note=normalized.get("orderNote", ""),
+            personalization=normalized.get("personalization", ""),
+            variation=normalized.get("variation", ""),
+            listing_version=normalized.get("listingVersion") or None,
+            raw_row=normalized,
+        )
+        if extra_values is not None:
+            item.issues.append(
+                ReviewIssue(
+                    code="CSV_ROW_INVALID",
+                    severity="blocking",
+                    field=None,
+                    message="CSV row has unexpected extra columns.",
+                    raw_value=", ".join(_clean_cell(value) for value in extra_values),
+                    requires_manual_action=True,
+                )
+            )
+            item.status = "BLOCKED"
+        items.append(item)
+    return BatchImport(
+        batch_id=batch_id,
+        source_name=source_name,
+        source_adapter=GenericCsvAdapter.name,
+        items=items,
     )
 
 
