@@ -47,6 +47,8 @@ IMPORTABLE_FONT_SUFFIXES = {".ttf", ".otf"}
 IMPORTABLE_VECTOR_SUFFIXES = {".svg"}
 IMPORTABLE_BITMAP_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 IMPORTABLE_ASSET_SUFFIXES = IMPORTABLE_VECTOR_SUFFIXES | IMPORTABLE_BITMAP_SUFFIXES
+SINGLE_REMARK_SUFFIXES = {".txt", ".json", ".csv"}
+SERVICES_API_DIR = Path(__file__).resolve().parent / "services" / "api"
 APP_COLORS = {
     "background": "#f6f7f8",
     "panel": "#ffffff",
@@ -57,6 +59,81 @@ APP_COLORS = {
 }
 T = TypeVar("T")
 LOGGER = logging.getLogger(__name__)
+
+
+def ensure_services_api_import_path() -> Path:
+    if not SERVICES_API_DIR.is_dir():
+        raise RuntimeError(f"services/api not found: {SERVICES_API_DIR}")
+    api_path = str(SERVICES_API_DIR)
+    if api_path not in sys.path:
+        sys.path.insert(0, api_path)
+    return SERVICES_API_DIR
+
+
+def import_dianxiaomi_xlsx_batch(path: Path | str) -> object:
+    ensure_services_api_import_path()
+    from app.domain.orders.batch_generate import generate_batch
+    from app.domain.orders.batch_import import import_orders
+    from app.domain.orders.batch_store import save_batch
+
+    batch = import_orders(Path(path), adapter_name="dianxiaomi-xlsx")
+    save_batch(batch)
+    return generate_batch(batch.batch_id)
+
+
+def summarize_xlsx_batch_result(result: object) -> tuple[int, int, int, Path]:
+    items = list(getattr(result, "items", []))
+    total = len(items)
+    manual = sum(
+        1
+        for item in items
+        if bool(getattr(item, "needs_manual_review", False))
+        or str(getattr(item, "status", "")) in {"BLOCKED", "NEEDS_REVIEW", "FAILED"}
+    )
+    success = sum(
+        1
+        for item in items
+        if str(getattr(item, "status", "")) == "EXPORTED"
+        and not bool(getattr(item, "needs_manual_review", False))
+    )
+    return total, success, manual, Path(getattr(result, "report_path"))
+
+
+def show_xlsx_batch_import_summary(root: tk.Misc, result: object) -> None:
+    total, success, manual, report_path = summarize_xlsx_batch_result(result)
+    dialog = tk.Toplevel(root)
+    dialog.title("批量导入完成")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+
+    frame = ttk.Frame(dialog, padding=16)
+    frame.grid(row=0, column=0, sticky="nsew")
+    ttk.Label(frame, text=f"总数：{total}").grid(row=0, column=0, sticky="w")
+    ttk.Label(frame, text=f"成功：{success}").grid(row=1, column=0, sticky="w", pady=(6, 0))
+    ttk.Label(frame, text=f"需人工核验：{manual}").grid(row=2, column=0, sticky="w", pady=(6, 0))
+    ttk.Label(frame, text=f"报告：{report_path}").grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+    button_row = ttk.Frame(frame)
+    button_row.grid(row=4, column=0, sticky="e", pady=(14, 0))
+    ttk.Button(button_row, text="打开报告", command=lambda: open_report_file(report_path)).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(button_row, text="关闭", command=dialog.destroy).grid(row=0, column=1)
+
+
+def open_report_file(path: Path | str) -> None:
+    report_path = Path(path)
+    if sys.platform.startswith("win"):
+        os.startfile(str(report_path))  # type: ignore[attr-defined]
+        return
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    subprocess.Popen([opener, str(report_path)])
+
+
+def batch_import_error_message(exc: Exception) -> str:
+    message = str(getattr(exc, "message", "") or exc)
+    code = getattr(exc, "code", "")
+    if code:
+        return f"{code}: {message}"
+    return message
 
 
 def run_background(
@@ -1049,17 +1126,37 @@ class BirthFlowerApp:
     def import_remark_file(self) -> None:
         path = filedialog.askopenfilename(
             title="导入订单备注",
-            filetypes=[("Order Remark", "*.txt *.json *.csv"), ("All files", "*.*")],
+            filetypes=[("Order Remark", "*.txt *.json *.csv *.xlsx"), ("All files", "*.*")],
         )
         if not path:
             return
+        import_path = Path(path)
+        suffix = import_path.suffix.casefold()
+        if suffix == ".xlsx":
+            self._import_xlsx_batch_file(import_path)
+            return
+        if suffix not in SINGLE_REMARK_SUFFIXES:
+            messagebox.showerror("导入失败", f"不支持的文件类型：{import_path.suffix or '无后缀'}")
+            return
         try:
-            remark = load_order_remark_from_file(Path(path))
+            remark = load_order_remark_from_file(import_path)
         except (OSError, ValueError) as exc:
             messagebox.showerror("导入失败", str(exc))
             return
-        self.remark_var.set(" ".join(remark.split()))
+        self._set_remark_text(" ".join(remark.split()))
         self._set_warnings([])
+
+    def _import_xlsx_batch_file(self, path: Path) -> None:
+        def work() -> object:
+            return import_dianxiaomi_xlsx_batch(path)
+
+        def on_success(result: object) -> None:
+            show_xlsx_batch_import_summary(self.root, result)
+
+        def on_error(exc: Exception) -> None:
+            messagebox.showerror("批量导入失败", batch_import_error_message(exc))
+
+        run_background(self.root, work, on_success, on_error)
 
     def import_asset_file(self) -> None:
         path = filedialog.askopenfilename(
