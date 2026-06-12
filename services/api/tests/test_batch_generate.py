@@ -23,6 +23,10 @@ def test_generate_batch_from_real_dianxiaomi_fixture_writes_assets_and_report(
 ) -> None:
     _prepare_project_root(tmp_path)
     monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(tmp_path))
+    # 确定性测试降级路径:栅格化不可用时 PNG 跳过、主链路不受影响。
+    monkeypatch.setattr(
+        "app.domain.orders.batch_generate.png_rasterizer_available", lambda: False
+    )
     save_batch(import_orders(FIXTURE_DIR / "test.xlsx", batch_id="batch_real"))
 
     result = generate_batch("batch_real")

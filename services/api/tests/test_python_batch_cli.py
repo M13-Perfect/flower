@@ -152,8 +152,13 @@ def test_python_batch_cli_runs_review_loop_commands(
     assert cli_main(["generate", "--batch-id", "cli_batch", "--exported-at", EXPORTED_AT]) == 0
     generated = json.loads(capsys.readouterr().out)
     assert generated["generated"] == 2
-    assert "Cairo" in generated["png"]["skippedReason"]
+    # 测试环境注入了假 cairosvg,自动探测应判定可用并默认产出 PNG
+    assert generated["png"]["enabled"] is True
+    assert generated["png"]["skippedReason"] is None
     assert {item["status"] for item in generated["items"]} == {"EXPORTED"}
+    assert all(
+        any(file.endswith(".png") for file in item["files"]) for item in generated["items"]
+    )
 
 
 def prepare_project_root(project_root: Path) -> None:
