@@ -27,6 +27,12 @@ from app.domain.output_store import SaveOutputsResult, save_outputs
 from app.domain.templates import apply_template
 
 
+PNG_SKIPPED_REASON = (
+    "PNG skipped by default: cairosvg needs the native Cairo runtime on Windows. "
+    "This run delivers production SVG/DXF only."
+)
+
+
 @dataclass(frozen=True)
 class GeneratedBatchItem:
     order_job_id: str
@@ -184,6 +190,7 @@ def generate_order_job_outputs(
         item.parsed_order,
         job_id=item.order_job_id,
     )
+    _apply_review_font_ref(document, item)
     saved = _save_document_outputs(item, document, include_png=include_png, exported_at=exported_at)
     exported = replace(item, status="EXPORTED")
     replace_item(exported)
@@ -204,6 +211,7 @@ def generate_order_job_draft(
             recoverable=True,
         )
     document = template_applicator("birth-flower-card", item.parsed_order, job_id=item.order_job_id)
+    _apply_review_font_ref(document, item)
     generated = replace(item, status="GENERATED_DRAFT")
     replace_item(generated)
     return generated, document
@@ -212,7 +220,7 @@ def generate_order_job_draft(
 def generate_batch_outputs(
     batch_id: str,
     *,
-    include_png: bool = True,
+    include_png: bool = False,
     exported_at: str | None = None,
 ) -> BatchGenerateResult:
     batch = load_batch(batch_id)
@@ -227,6 +235,7 @@ def generate_batch_outputs(
                 item.parsed_order,
                 job_id=item.order_job_id,
             )
+            _apply_review_font_ref(document, item)
             saved = _save_document_outputs(
                 item,
                 document,
@@ -285,8 +294,12 @@ def _save_document_outputs(
         units=_nested(document, "exportSettings", "dxf", "units"),
         exported_at=exported_at,
     )
-    # 本套 xlsx 批量流程要求每单同时落 SVG/DXF/PNG；include_png 参数保留给 CLI 兼容。
-    png_data_url = _png_data_url(svg_export.content, document)
+    if include_png:
+        png_data_url = _png_data_url(svg_export.content, document)
+        _mark_png_export(document, status="generated", reason=None)
+    else:
+        png_data_url = None
+        _mark_png_export(document, status="skipped", reason=PNG_SKIPPED_REASON)
     return save_outputs(
         order_name=item.order_id or item.customer_name or item.order_job_id,
         document=document,
@@ -296,6 +309,32 @@ def _save_document_outputs(
     )
 
 
+def _mark_png_export(document: dict[str, Any], *, status: str, reason: str | None) -> None:
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        document["metadata"] = metadata
+    payload: dict[str, Any] = {"status": status}
+    if reason:
+        payload["reason"] = reason
+    metadata["pngExport"] = payload
+
+
+def _apply_review_font_ref(document: dict[str, Any], item: BatchOrderItem) -> None:
+    if item.font_option_no is None and not item.font_id:
+        return
+    for layer in document.get("layers", []):
+        if not isinstance(layer, dict) or layer.get("type") != "text":
+            continue
+        raw_font_ref = layer.get("fontRef")
+        font_ref: dict[str, Any] = raw_font_ref if isinstance(raw_font_ref, dict) else {}
+        if item.font_option_no is not None:
+            font_ref["optionNo"] = item.font_option_no
+        if item.font_id:
+            font_ref["assetId"] = item.font_id
+        layer["fontRef"] = font_ref
+
+
 def _png_data_url(svg: str, document: dict[str, Any]) -> str:
     canvas = document["canvas"]
     scale = float(_nested(document, "exportSettings", "png", "scale") or 1)
@@ -303,12 +342,7 @@ def _png_data_url(svg: str, document: dict[str, Any]) -> str:
     height = round(float(canvas["height"]) * scale)
     with tempfile.TemporaryDirectory() as temp_dir:
         png_path = Path(temp_dir) / "preview.png"
-        try:
-            rasterize_svg_to_png(svg, width=width, height=height, output_path=png_path)
-        except DomainError as exc:
-            if exc.code != "PNG_RASTERIZER_UNAVAILABLE":
-                raise
-            return _render_document_png_data_url(document)
+        rasterize_svg_to_png(svg, width=width, height=height, output_path=png_path)
         return "data:image/png;base64," + base64.b64encode(png_path.read_bytes()).decode("ascii")
 
 

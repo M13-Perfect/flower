@@ -6,10 +6,12 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 
+from app.domain.exports.dxf import _text_with_glyph_overrides
 from app.main import app
 
 
@@ -41,6 +43,21 @@ def test_dxf_export_converts_simple_text_to_path_geometry(tmp_path, monkeypatch)
     assert "LAYER=text_1" in dxf_text
     assert "POINT 12.0000,20.0000" in dxf_text
     assert "TEXT" not in dxf_text
+
+
+def test_dxf_text_helper_ignores_control_character_glyph_override() -> None:
+    layer = text_layer("text_1", "A")
+    layer["glyphOverrides"] = [
+        {
+            "index": 0,
+            "originalText": "A",
+            "replacement": "\n",
+            "codepoint": "U+000A",
+            "glyphName": "linefeed.alt",
+        }
+    ]
+
+    assert _text_with_glyph_overrides(layer) == "A"
 
 
 def test_dxf_export_converts_simple_inline_svg_to_path_geometry(tmp_path, monkeypatch) -> None:
@@ -104,6 +121,38 @@ def test_dxf_export_normalizes_group_transforms_and_units(tmp_path, monkeypatch)
     assert "LAYER=path_1" in dxf_text
     assert "POINT 20.0000,20.0000" in dxf_text
     assert "POINT 40.0000,20.0000" in dxf_text
+
+
+def test_dxf_export_scales_px_canvas_to_template_physical_width_mm(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    install_fake_ezdxf(monkeypatch)
+    install_project_root(tmp_path, monkeypatch)
+    document = base_document(
+        dxf_units="mm",
+        physical_width_mm=80,
+        layers=[
+            {
+                **layer_base("path_1", "path", width=300, height=20),
+                "pathData": "M0 0 L300 0 L300 100 L0 100 Z",
+                "fill": "none",
+                "stroke": "#111111",
+            }
+        ],
+    )
+
+    response = TestClient(app).post(
+        "/exports/dxf",
+        json={"document": document, "exportedAt": EXPORTED_AT},
+    )
+
+    assert response.status_code == 200
+    dxf_text = decode_dxf(response.json())
+    points = dxf_points(dxf_text)
+    xs = [point[0] for point in points]
+    assert "INSUNITS=4" in dxf_text
+    assert max(xs) - min(xs) == pytest.approx(80, abs=0.01)
 
 
 def test_dxf_export_returns_warnings_for_unsupported_svg_features(tmp_path, monkeypatch) -> None:
@@ -208,12 +257,32 @@ def decode_dxf(payload: dict[str, Any]) -> str:
     return base64.b64decode(payload["contentBase64"]).decode("utf-8")
 
 
+def dxf_points(dxf_text: str) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for line in dxf_text.splitlines():
+        if not line.startswith("POINT "):
+            continue
+        x_text, y_text = line.removeprefix("POINT ").split(",", maxsplit=1)
+        points.append((float(x_text), float(y_text)))
+    return points
+
+
 def base_document(
     *,
     layers: list[dict[str, Any]],
     canvas_unit: str = "px",
     dxf_units: str = "px",
+    physical_width_mm: float | None = None,
 ) -> dict[str, Any]:
+    export_settings: dict[str, Any] = {
+        "schemaVersion": "1.0",
+        "defaultFormats": ["dxf"],
+        "svg": {"preserveText": True, "preserveVector": True, "includeMetadata": True},
+        "png": {"scale": 1, "background": "transparent"},
+        "dxf": {"textMode": "paths", "units": dxf_units},
+    }
+    if physical_width_mm is not None:
+        export_settings["physical"] = {"widthMm": physical_width_mm}
     return {
         "schemaVersion": "1.0",
         "documentId": "doc-1",
@@ -233,13 +302,7 @@ def base_document(
             "unit": canvas_unit,
             "background": {"type": "transparent"},
         },
-        "exportSettings": {
-            "schemaVersion": "1.0",
-            "defaultFormats": ["dxf"],
-            "svg": {"preserveText": True, "preserveVector": True, "includeMetadata": True},
-            "png": {"scale": 1, "background": "transparent"},
-            "dxf": {"textMode": "paths", "units": dxf_units},
-        },
+        "exportSettings": export_settings,
         "layers": layers,
     }
 

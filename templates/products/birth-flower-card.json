@@ -13,6 +13,15 @@
       "color": "#ffffff"
     }
   },
+  "exportSettings": {
+    "physical": {
+      "widthMm": 80
+    },
+    "dxf": {
+      "textMode": "paths",
+      "units": "mm"
+    }
+  },
   "slots": [
     {
       "slotId": "customer_name",

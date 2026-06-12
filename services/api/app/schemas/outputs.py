@@ -13,6 +13,7 @@ class SaveOutputsRequest(ApiModel):
     svg: str = Field(min_length=1)
     png_data_url: str = Field(alias="pngDataUrl", min_length=1)
     dxf_content_base64: str | None = Field(default=None, alias="dxfContentBase64")
+    output_directory: str | None = Field(default=None, alias="outputDirectory")
 
 
 class SavedOutputFileBody(ApiModel):

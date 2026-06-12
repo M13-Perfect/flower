@@ -70,6 +70,30 @@ def test_save_outputs_keeps_order_directory_inside_outputs(
     assert tmp_path.resolve() in output_dir.parents
 
 
+def test_save_outputs_can_write_to_selected_output_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(tmp_path))
+    selected_root = tmp_path / "selected-exports"
+
+    response = TestClient(app).post(
+        "/outputs/save",
+        json={
+            "orderName": "Lacey",
+            "document": _document(order_id="4087956129"),
+            "svg": "<svg></svg>",
+            "pngDataUrl": TINY_PNG_DATA_URL,
+            "outputDirectory": str(selected_root),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["outputDir"] == str((selected_root / "4087956129").resolve())
+    assert (selected_root / "4087956129" / "order.json").is_file()
+
+
 def test_save_outputs_returns_structured_error_when_output_directory_is_unwritable(
     tmp_path: Path,
     monkeypatch,

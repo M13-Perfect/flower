@@ -1,65 +1,48 @@
-# Flower React/FastAPI 版操作教程
+# Flower 操作教程
 
-这份教程按现在能打开的 React/FastAPI 版来写。界面目前还是英文按钮，但下面会用中文把每一步讲清楚。
+这份文档按当前已经跑通的 React/FastAPI 版来写。
 
-当前入口：
+软件入口：
 
 ```text
 http://127.0.0.1:5173/
 ```
 
-后端健康检查：
+后端检查地址：
 
 ```text
 http://127.0.0.1:8765/health
 ```
 
-## 1. 先说现在这个版本能做什么
+当前版本不是旧的 Tkinter 窗口，而是浏览器里的图层编辑器。主流程是：填订单备注，解析订单，套出生花模板，手动调图层，最后导出或保存 PNG/SVG/DXF。
 
-现在这个版本是新的网页编辑器原型，不是旧的 Tkinter 桌面窗口。
+## 1. 先确认软件能不能打开
 
-它现在能做这些事：
+### 1.1 我已经启动好时
 
-1. 打开 React 图层编辑器。
-2. 自动连接本地 FastAPI 后端。
-3. 在画布里编辑示例图层的位置、缩放、旋转、透明度。
-4. 选择文字图层后，从字体字形面板里替换某个字符。
-5. 把当前画布导出成 SVG。
-6. 把当前画布导出成 PNG。
-7. 查看当前设计的 JSON 数据。
-
-它现在还没有完整接上这些生产流程：
-
-1. 还没有订单备注输入框。
-2. 还没有前端里的订单解析按钮。
-3. 还没有前端里的模板选择流程。
-4. 前端目前没有 DXF 导出按钮；DXF 后端接口已经有，但当前页面没做入口。
-5. `Save JSON` 只是把当前 JSON 刷新到页面文本框，不是保存到磁盘文件。
-
-所以，现在的正确使用目标是：先验证 React/FastAPI 版能跑、能编辑图层、能导出 PNG/SVG。
-
-## 2. 怎么打开软件
-
-### 2.1 最简单的打开方式
-
-如果我已经帮你启动好了，直接打开浏览器，访问：
+直接打开浏览器，访问：
 
 ```text
 http://127.0.0.1:5173/
 ```
 
-看到页面标题是 `Flower`，大标题是 `Layer editor`，就说明前端打开了。
+页面顶部会看到：
 
-页面右上角会显示后端状态：
+```text
+Flower
+Layer editor
+```
+
+右上角正常状态是：
 
 ```text
 flower-api
 ok
 ```
 
-看到 `ok`，说明 React 已经连上 FastAPI 后端。
+看到 `ok` 就说明前端已经连上本地后端。
 
-### 2.2 自己从命令行启动
+### 1.2 自己从 PowerShell 启动
 
 打开 PowerShell，进入项目目录：
 
@@ -67,7 +50,7 @@ ok
 cd C:\Users\Administrator\Documents\flower
 ```
 
-启动前后端：
+启动软件：
 
 ```powershell
 npm run dev
@@ -76,11 +59,11 @@ npm run dev
 这个命令会同时启动两个服务：
 
 ```text
-React 前端: http://127.0.0.1:5173/
-FastAPI 后端: http://127.0.0.1:8765/
+前端页面: http://127.0.0.1:5173/
+后端 API: http://127.0.0.1:8765/
 ```
 
-命令行里看到类似下面内容，就说明正常：
+命令行里看到类似这些内容，就是启动成功：
 
 ```text
 VITE ready
@@ -88,37 +71,29 @@ Local: http://127.0.0.1:5173/
 Uvicorn running on http://127.0.0.1:8765
 ```
 
-然后打开浏览器访问：
+然后用浏览器打开：
 
 ```text
 http://127.0.0.1:5173/
 ```
 
-### 2.3 如果提示 Python 或依赖有问题
+### 1.3 检查后端
 
-这个项目现在推荐用 Windows 标准 Python 虚拟环境：
+浏览器打开：
 
-```powershell
-.\.venv-win\Scripts\python.exe --version
+```text
+http://127.0.0.1:8765/health
 ```
 
-正常应该能看到 Python 3.12。
+正常会返回：
 
-如果依赖没装，执行：
-
-```powershell
-.\.venv-win\Scripts\python.exe -m pip install -r requirements.txt
+```json
+{"status":"ok","service":"flower-api","version":"0.1.0"}
 ```
 
-不要优先用旧的：
+如果这个地址打不开，页面右上角通常也不会显示 `ok`。
 
-```powershell
-.\.venv\bin\python.exe
-```
-
-旧 `.venv` 是 MSYS Python，装 `pydantic-core`、`ruff`、`numpy` 这类依赖容易失败。
-
-### 2.4 怎么停止软件
+### 1.4 停止软件
 
 如果你是在 PowerShell 里运行的：
 
@@ -126,100 +101,196 @@ http://127.0.0.1:5173/
 npm run dev
 ```
 
-要停止，就在那个 PowerShell 窗口按：
+要停止就在那个 PowerShell 窗口按：
 
 ```text
 Ctrl + C
 ```
 
-如果是后台运行，先查端口对应进程：
+如果端口被占用，先查：
 
 ```powershell
 netstat -ano | findstr ":5173"
 netstat -ano | findstr ":8765"
 ```
 
-然后用查到的 PID 停掉：
+再按查到的 PID 停掉：
 
 ```powershell
 taskkill /PID 进程号 /T /F
 ```
 
-## 3. 打开后先看哪里
+## 2. 页面每一块是干什么的
 
-页面大概分四块：
+页面大概分三列：
 
-1. 顶部：项目标题和后端状态。
-2. 左边 `Layers`：图层列表。
-3. 中间：画布。
-4. 右边：属性、字形、导出、JSON。
-
-第一次打开时，页面已经放了一个示例设计：
-
-1. `Reference photo`：左边的参考图层。
-2. `Birth flower`：右边的花朵 SVG 图层。
-3. `Customer name`：底部的文字图层，默认文字是 `Avery`。
-
-这个示例不是客户真实订单，只是用来验证编辑器功能。
-
-## 4. 怎么确认后端正常
-
-看页面右上角状态。
-
-正常状态：
+左边是订单和图层：
 
 ```text
-flower-api
-ok
+Order
+Layers
 ```
 
-如果显示 `backend checking`，等几秒。
+中间是画布：
 
-如果显示 `Failed to fetch` 或其他错误，说明后端没连上。按这个顺序查：
-
-1. PowerShell 里 `npm run dev` 是否还在运行。
-2. 浏览器能不能打开 `http://127.0.0.1:8765/health`。
-3. 端口 `8765` 有没有被别的软件占用。
-4. 如果后端没启动，重新执行 `npm run dev`。
-
-后端健康检查正常时，打开这个地址会看到：
-
-```json
-{"status":"ok","service":"flower-api","version":"0.1.0"}
+```text
+Canvas
 ```
 
-## 5. 图层怎么选
+右边是属性、文字、字形、导出和 JSON：
 
-左边 `Layers` 面板里会列出当前图层。
+```text
+Properties
+Text
+Glyphs
+Export
+JSON
+```
 
-点某一行，就选中那个图层。
+第一次打开时会显示一个示例设计，默认有 3 个图层：
 
-推荐操作习惯：
+```text
+Customer name
+Birth flower
+Reference photo
+```
 
-1. 要调文字，就点 `Customer name`。
-2. 要调花朵，就点 `Birth flower`。
-3. 要调参考图，就点 `Reference photo`。
+示例只是用来测试编辑器，不是真实订单。
 
-选中后，中间画布会出现对应对象，右边 `Properties` 会显示它的参数。
+## 3. 填订单并套模板
 
-## 6. 怎么在画布上拖动和缩放
+左上角 `Order` 面板里有两个输入框：
 
-当前画布基于 Fabric.js。
+```text
+id
+note
+```
 
-常用操作：
+`id` 是订单号，可以不填，但建议填，方便后面查文件。
 
-1. 鼠标点中图层。
-2. 拖动图层，可以改变位置。
-3. 拖动控制点，可以缩放。
-4. 旋转控制点，可以旋转。
+`note` 是订单备注。当前解析器需要备注里把关键字段写清楚，不要让软件猜。
 
-画布操作适合粗调。
+推荐格式：
 
-如果要精确调数值，用右边 `Properties`。
+```text
+Customer name: Lily
+Birth month: March
+Flower: Cherry Blossom
+Font: Font 2
+Notes: demo only
+```
 
-## 7. 右边 Properties 怎么用
+也可以写成一行，只要字段名和冒号清楚：
 
-选中一个图层后，右边 `Properties` 会出现这些字段：
+```text
+Customer name: Lily Birth month: March Flower: Cherry Blossom Font: Font 2 Notes: demo only
+```
+
+填好后点击：
+
+```text
+Parse + apply
+```
+
+正常情况下，软件会做三件事：
+
+1. 解析客户名字、月份、花、字体。
+2. 自动套用 `birth-flower-card` 模板。
+3. 生成新的图层文档。
+
+解析成功后，`Order` 面板下面会显示：
+
+```text
+name
+flower
+font
+```
+
+例如：
+
+```text
+name   Lily
+flower Cherry Blossom
+font   Font 2
+```
+
+同时左边 `Layers` 会变成类似：
+
+```text
+Customer name
+Birth flower - Cherry Blossom
+```
+
+## 4. 订单备注怎么写更稳
+
+当前解析器是确定性规则，不是随便猜。它认这些字段：
+
+```text
+Customer name
+Name
+Personalization
+Text
+客户名字
+客户姓名
+姓名
+刻字
+```
+
+月份可以写：
+
+```text
+Birth month: March
+Month: 3
+月份: 3
+```
+
+花可以写：
+
+```text
+Flower: Cherry Blossom
+Flower: 2
+花朵: Cherry Blossom
+```
+
+字体可以写：
+
+```text
+Font: Font 2
+Font: 2
+字体: 2
+```
+
+最稳的做法：每个字段单独一行。
+
+如果缺字段，页面会报类似订单解析失败。这不是 bug，是防止把客户订单猜错。
+
+## 5. 选择和调整图层
+
+左边 `Layers` 里点图层名称，就会选中这个图层。
+
+常用选择：
+
+```text
+Customer name                 调文字
+Birth flower - Cherry Blossom 调花
+Reference photo               调参考图
+```
+
+选中后，中间画布会出现控制框。
+
+画布里可以直接操作：
+
+1. 鼠标拖动：移动图层。
+2. 拖四角控制点：缩放图层。
+3. 拖旋转控制点：旋转图层。
+
+画布适合粗调。
+
+精确调整用右边 `Properties`。
+
+## 6. Properties 属性怎么用
+
+选中一个图层后，右边 `Properties` 会显示：
 
 ```text
 x
@@ -231,127 +302,156 @@ visible
 locked
 ```
 
-每个字段的意思：
-
-1. `x`：图层左上角横向位置。数值越大，越往右。
-2. `y`：图层左上角纵向位置。数值越大，越往下。
-3. `scale`：缩放比例。`1` 是原始大小，`0.5` 是一半，`2` 是两倍。
-4. `rotation`：旋转角度。正数顺时针，负数逆时针。
-5. `opacity`：透明度。`1` 是完全不透明，`0` 是完全透明。
-6. `visible`：是否显示。取消勾选后，这个图层隐藏。
-7. `locked`：是否锁定。勾选后，图层不能正常被编辑移动。
-
-推荐调法：
-
-1. 大概位置用鼠标拖。
-2. 精确位置用 `x/y`。
-3. 大小用 `scale`。
-4. 想让图层半透明，就调 `opacity`。
-5. 不想误碰某个图层，就勾 `locked`。
-
-## 8. 怎么改文字效果
-
-当前页面没有直接的文字输入框。
-
-示例文字是写在当前 JSON 文档里的 `Customer name` 图层中，默认是：
+含义：
 
 ```text
-Avery
+x        横向位置，数值越大越往右
+y        纵向位置，数值越大越往下
+scale    缩放比例，1 是原大小，0.5 是一半，2 是两倍
+rotation 旋转角度，正数顺时针，负数逆时针
+opacity  透明度，1 是不透明，0 是全透明
+visible  是否显示
+locked   是否锁定
 ```
 
-当前界面能调文字图层的位置、大小、旋转、透明度，也能通过字形面板替换字符。
+推荐用法：
 
-如果要改成别的客户名字，现在需要后续补一个文字编辑控件，或者临时改 JSON/源码。也就是说，当前 UI 还不是完整订单生产界面。
+1. 先用鼠标拖到大概位置。
+2. 再用 `x/y` 精确对齐。
+3. 大小用 `scale` 微调。
+4. 不想误碰某个图层，就勾 `locked`。
+5. 只是临时隐藏，不要删图层，取消 `visible` 就行。
 
-## 9. Glyphs 字形面板怎么用
+## 7. 修改文字
 
-只有选中文字图层时，`Glyphs` 面板才有用。
-
-操作步骤：
-
-1. 左边 `Layers` 点 `Customer name`。
-2. 右边找到 `Glyphs`。
-3. `font` 下拉里选择一个字体。
-4. `char` 下拉里选择要替换的字符位置。
-5. 用筛选按钮缩小范围：
-   - `all`：全部字形。
-   - `pua`：私用区字形，通常是花体尾巴、装饰字。
-   - `mapped`：有 Unicode 映射的正常字形。
-   - `unmapped`：没有 Unicode 映射的字形。
-6. 在下面字形格子里点一个字形。
-7. 点完后，画布里的文字会更新。
-
-举例：
-
-`Avery` 有 5 个字符：
+先在左边 `Layers` 里选：
 
 ```text
-0: A
-1: v
-2: e
-3: r
-4: y
+Customer name
 ```
 
-如果你想替换最后的 `y`，就在 `char` 里选：
+右边会出现 `Text` 面板。
+
+`content` 输入框就是当前文字内容。
+
+例如把：
 
 ```text
-4: y
+Lily
 ```
 
-然后在字形格子里点想要的 `y` 变体。
+改成：
 
-注意：
+```text
+Sophia
+```
 
-1. 如果某个字形格子显示 `gid`，说明它可能没有可直接替换的字符，按钮会不可用。
-2. 字形替换会写入当前文档的 `glyphOverrides`。
-3. 替换后要点 `Save JSON`，右下角 JSON 才会刷新显示最新数据。
+画布会跟着更新。
 
-## 10. Export 导出怎么用
+`font` 下拉框可以选后端扫描到的字体。字体列表加载完成后，面板旁边会显示字体数量。
 
-右边 `Export` 面板有这些选项：
+注意：如果没有选中文字图层，`Text` 面板会显示：
+
+```text
+No text layer selected.
+```
+
+这时先去左边点 `Customer name`。
+
+## 8. 使用 Glyphs 字形面板
+
+`Glyphs` 是给花体字、特殊尾巴、PUA 字形用的。
+
+先选中文字图层：
+
+```text
+Customer name
+```
+
+再看右边 `Glyphs` 面板。
+
+里面常见控件：
+
+```text
+font
+char
+all
+pua
+mapped
+unmapped
+```
+
+`char` 是选择要替换哪个字符。
+
+例如 `Lily` 有 4 个字符：
+
+```text
+0: L
+1: i
+2: l
+3: y
+```
+
+如果要换最后的 `y`，就在 `char` 里选：
+
+```text
+3: y
+```
+
+再在下面字形格子里点想用的字形。
+
+筛选按钮含义：
+
+```text
+all      全部字形
+pua      私用区字形，常见于花体尾巴和装饰字符
+mapped   有 Unicode 映射的正常字形
+unmapped 没有 Unicode 映射的字形
+```
+
+字形替换后会写进当前 JSON 文档里的 `glyphOverrides`。
+
+## 9. 保存 JSON
+
+右下角 `JSON` 面板有：
+
+```text
+Save JSON
+```
+
+点击后会做两件事：
+
+1. 校验当前图层文档结构。
+2. 把最新 JSON 刷新到下面文本框。
+
+状态是：
+
+```text
+valid
+```
+
+说明当前文档结构正常。
+
+注意：`Save JSON` 只是刷新页面里的 JSON，不是保存到磁盘文件。
+
+真正保存到项目 `outputs` 文件夹，要用 `Save all`。
+
+## 10. 导出 SVG、PNG、DXF
+
+右边 `Export` 面板有：
 
 ```text
 scale
 transparent
 SVG
+DXF
 PNG
+Save all
 ```
 
-### 10.1 导出 SVG
+### 10.1 scale
 
-点：
-
-```text
-SVG
-```
-
-浏览器会下载一个 `.svg` 文件。
-
-SVG 会尽量保留：
-
-1. 图层顺序。
-2. SVG 花朵矢量内容。
-3. 文本节点。
-4. 元数据。
-
-默认下载位置一般是浏览器的 `Downloads` 下载目录，不一定是项目里的 `outputs` 文件夹。
-
-### 10.2 导出 PNG
-
-点：
-
-```text
-PNG
-```
-
-浏览器会下载一个 `.png` 文件。
-
-PNG 是位图，适合发给客户预览。
-
-### 10.3 scale 怎么设置
-
-`scale` 控制 PNG 导出倍率。
+`scale` 主要影响 PNG 导出倍率。
 
 常用值：
 
@@ -361,185 +461,252 @@ PNG 是位图，适合发给客户预览。
 0.5  一半尺寸
 ```
 
-如果只是自己测试，用 `1`。
+客户预览建议用 `1` 或 `2`。
 
-如果要给客户看，建议用 `2`。
-
-### 10.4 transparent 怎么设置
+### 10.2 transparent
 
 `transparent` 控制导出背景。
 
-勾上：
+勾上：导出尽量透明背景。
+
+不勾：导出带画布背景色。
+
+客户确认图一般不勾。后续要叠到别的图上时，可以考虑勾。
+
+### 10.3 SVG
+
+点击：
 
 ```text
-transparent
+SVG
 ```
 
-导出会尽量使用透明背景。
+浏览器会下载一个 `.svg` 文件。
 
-不勾：
+SVG 适合保留矢量结构，后续继续处理也方便。
 
-导出会带画布背景色。
+### 10.4 PNG
 
-客户确认图一般不勾，生产叠加图可以考虑勾。
-
-## 11. JSON 面板怎么用
-
-右下角是 `JSON` 面板。
-
-点：
+点击：
 
 ```text
-Save JSON
+PNG
 ```
 
-它会做两件事：
+浏览器会下载一个 `.png` 文件。
 
-1. 校验当前图层文档是否合法。
-2. 把最新文档 JSON 显示在下面的文本框里。
+PNG 是位图，适合发客户预览。
 
-注意：
+### 10.5 DXF
 
-`Save JSON` 现在不等于保存到磁盘。它只是刷新页面里的 JSON 文本。
-
-如果状态显示：
+点击：
 
 ```text
-valid
+DXF
 ```
 
-说明当前文档结构没问题。
+浏览器会下载一个 `.dxf` 文件。
 
-如果显示一串错误，说明当前图层数据不合法，需要先修。
+DXF 主要给后续切割、雕刻、矢量生产流程用。
 
-## 12. 当前版本推荐操作 SOP
+注意：DXF 对文字和复杂图形要求更严格。当前版本会调用后端 DXF 导出接口，如果图层里有不适合 DXF 的内容，页面会显示导出警告。
 
-按这个顺序做，最不容易乱：
+## 11. Save all 一键保存
 
-1. 打开 PowerShell。
-2. 进入项目目录：
+如果你想把当前订单的所有结果都保存到项目目录，点：
+
+```text
+Save all
+```
+
+它会一次生成：
+
+```text
+order.json
+design.svg
+preview.png
+design.dxf
+```
+
+保存位置在：
+
+```text
+C:\Users\Administrator\Documents\flower\outputs\订单名\
+```
+
+订单名优先用客户名字。
+
+例如订单客户名是 `Lily`，保存后目录是：
+
+```text
+C:\Users\Administrator\Documents\flower\outputs\Lily\
+```
+
+里面会有：
+
+```text
+order.json
+design.svg
+preview.png
+design.dxf
+```
+
+页面 `Export` 标题旁边显示：
+
+```text
+saved outputs/Lily
+```
+
+就说明保存完成。
+
+## 12. 推荐完整操作流程
+
+按这个顺序做，最不容易错：
+
+1. PowerShell 进入项目：
 
 ```powershell
 cd C:\Users\Administrator\Documents\flower
 ```
 
-3. 启动软件：
+2. 启动软件：
 
 ```powershell
 npm run dev
 ```
 
-4. 打开浏览器：
+3. 浏览器打开：
 
 ```text
 http://127.0.0.1:5173/
 ```
 
-5. 看右上角是不是 `flower-api ok`。
-6. 左边 `Layers` 选择要编辑的图层。
-7. 中间画布拖动图层，做粗调。
-8. 右边 `Properties` 用数值做精调。
-9. 如果要替换字形，先选 `Customer name`，再用 `Glyphs`。
-10. 点 `Save JSON`，确认 JSON 状态是 `valid`。
-11. 在 `Export` 里设置 `scale` 和 `transparent`。
-12. 点 `SVG` 或 `PNG` 下载文件。
-13. 到浏览器下载目录检查成品。
+4. 看右上角是不是：
+
+```text
+flower-api
+ok
+```
+
+5. 在 `Order -> id` 填订单号。
+
+6. 在 `Order -> note` 填订单备注，例如：
+
+```text
+Customer name: Lily
+Birth month: March
+Flower: Cherry Blossom
+Font: Font 2
+Notes: demo only
+```
+
+7. 点击：
+
+```text
+Parse + apply
+```
+
+8. 看 `Order` 面板下面解析结果是否正确。
+
+9. 左边 `Layers` 选择要改的图层。
+
+10. 中间画布拖动粗调位置。
+
+11. 右边 `Properties` 精调位置、大小、旋转、透明度。
+
+12. 如果要改名字，选 `Customer name`，到 `Text -> content` 修改。
+
+13. 如果要换花体尾巴或特殊字形，到 `Glyphs` 里选字符和字形。
+
+14. 点 `Save JSON`，确认 JSON 状态是 `valid`。
+
+15. 要单独下载文件，就点 `SVG`、`PNG` 或 `DXF`。
+
+16. 要一次保存完整生产文件，就点 `Save all`。
+
+17. 到 `outputs\客户名\` 检查结果文件。
 
 ## 13. 常见问题
 
 ### 13.1 页面打不开
 
-先确认服务有没有启动：
+先查前端端口：
 
 ```powershell
 netstat -ano | findstr ":5173"
 ```
 
-如果没有任何输出，说明前端没跑起来。重新执行：
+没有输出，说明前端没跑。重新执行：
 
 ```powershell
 npm run dev
 ```
 
-### 13.2 后端状态不是 ok
+### 13.2 右上角不是 ok
 
-先打开：
+打开：
 
 ```text
 http://127.0.0.1:8765/health
 ```
 
-如果打不开，说明后端没跑起来。
+如果打不开，说明后端没跑。
 
-检查 PowerShell 里有没有 `Uvicorn running on http://127.0.0.1:8765`。
-
-没有的话，重新执行：
+重新启动：
 
 ```powershell
 npm run dev
 ```
 
-### 13.3 端口被占用
+### 13.3 Parse + apply 报错
 
-查占用端口的进程：
+优先检查订单备注是不是缺字段。
 
-```powershell
-netstat -ano | findstr ":5173"
-netstat -ano | findstr ":8765"
+必须至少有：
+
+```text
+Customer name
+Birth month
+Flower
+Font
 ```
 
-停掉对应 PID：
+不要只写：
 
-```powershell
-taskkill /PID 进程号 /T /F
+```text
+Lily March Cherry Blossom Font 2
 ```
 
-再重新启动：
+这种太模糊。
 
-```powershell
-npm run dev
+要写成：
+
+```text
+Customer name: Lily
+Birth month: March
+Flower: Cherry Blossom
+Font: Font 2
 ```
 
 ### 13.4 字体列表为空
 
-先确认后端能访问字体接口：
+打开：
 
 ```text
 http://127.0.0.1:8765/fonts
 ```
 
-如果返回空，说明项目字体目录里没扫到字体。
+如果 `fontCount` 是 0，说明后端没扫到字体。
 
-当前后端会扫描这些位置：
+当前项目里已有字体文件时，刷新页面一般会重新加载。如果你新放了字体，建议重启：
 
-```text
-assets/fonts
-BirthMonth flowers
-Birthmonth_font.ttf
+```powershell
+npm run dev
 ```
 
-把 `.ttf` 或 `.otf` 字体放到这些位置后，刷新页面。
+### 13.5 点 PNG/SVG/DXF 后找不到文件
 
-### 13.5 点 PNG 没反应
-
-先看右边 `Export` 标题旁边的状态。
-
-常见原因：
-
-1. 浏览器拦截下载。
-2. 当前文档 JSON 不合法。
-3. 画布里有外部资源无法被浏览器加载。
-
-处理顺序：
-
-1. 点 `Save JSON`，看是否 `valid`。
-2. 先试导出 `SVG`。
-3. 再试 `PNG`。
-4. 看浏览器地址栏或下载图标有没有拦截提示。
-
-### 13.6 下载文件在哪里
-
-当前 React 页面用浏览器下载。
+单独点 `PNG`、`SVG`、`DXF` 是浏览器下载。
 
 一般在：
 
@@ -547,31 +714,80 @@ Birthmonth_font.ttf
 C:\Users\Administrator\Downloads
 ```
 
-不是项目的：
+不是项目里的 `outputs`。
+
+如果想保存到项目目录，用：
 
 ```text
-C:\Users\Administrator\Documents\flower\outputs
+Save all
 ```
 
-除非后续改成后端保存文件，否则前端按钮下载默认走浏览器下载目录。
+### 13.6 Save all 后文件在哪里
 
-## 14. 给当前版本的真实判断
+在：
 
-现在 React/FastAPI 版已经能跑起来，也能证明核心编辑链路可用。
+```text
+C:\Users\Administrator\Documents\flower\outputs\客户名\
+```
 
-但它还不是完整生产软件。最缺的是：
+例如：
 
-1. 订单备注输入和解析入口。
-2. 模板选择和应用入口。
-3. 文本内容编辑入口。
-4. DXF 前端导出入口。
-5. JSON 保存到磁盘的入口。
+```text
+C:\Users\Administrator\Documents\flower\outputs\Lily\
+```
 
-所以当前最适合做：
+### 13.7 图层拖不动
 
-1. 前后端联调。
-2. Fabric 图层编辑验证。
-3. 字体和字形接口验证。
-4. PNG/SVG 导出验证。
+先检查右边 `Properties`：
 
-如果要进入真实接单生产，下一步应该优先补订单解析、模板套用、文本编辑和 DXF 按钮。
+```text
+locked
+```
+
+如果勾上了，取消勾选。
+
+再检查：
+
+```text
+visible
+```
+
+如果取消了，图层会隐藏。
+
+### 13.8 画布里看不到花
+
+可能原因：
+
+1. 图层被隐藏。
+2. 图层被拖到画布外。
+3. 花朵素材没找到。
+
+处理顺序：
+
+1. 选中花朵图层。
+2. 确认 `visible` 勾上。
+3. 把 `x/y/scale` 调回合理范围。
+4. 重新点一次 `Parse + apply` 套模板。
+
+## 14. 当前版本的真实边界
+
+当前 React/FastAPI 版已经跑通这些能力：
+
+1. 打开浏览器编辑器。
+2. 连接本地 FastAPI 后端。
+3. 解析订单备注。
+4. 套出生花模板。
+5. 编辑图层位置、缩放、旋转、透明度、显隐、锁定。
+6. 修改文字内容。
+7. 选择字体和字形。
+8. 导出 SVG、PNG、DXF。
+9. `Save all` 保存完整输出到 `outputs`。
+
+当前还不是最终生产级完整软件，主要限制：
+
+1. 模板选择现在固定使用 `birth-flower-card`。
+2. 订单解析要求字段清楚，不能靠模糊备注猜。
+3. DXF 对复杂图形和文字仍要人工检查。
+4. 浏览器下载文件和 `Save all` 保存文件是两套路径，别混用。
+
+最低成本 SOP：平时生产优先用 `Parse + apply` 生成草稿，再人工检查图层，最后用 `Save all` 保存全套文件。

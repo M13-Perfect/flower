@@ -3,9 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib
 from pathlib import Path
-import shutil
-import subprocess
-import tempfile
 
 from app.domain import DomainError
 
@@ -38,7 +35,7 @@ def rasterize_svg_to_png(
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if _try_cairosvg(svg, width, height, path) or _try_resvg(svg, width, height, path):
+    if _try_cairosvg(svg, width, height, path):
         data = path.read_bytes()
         actual_width, actual_height = read_png_size(data)
         return PngRasterizeResult(
@@ -49,8 +46,8 @@ def rasterize_svg_to_png(
         )
     raise DomainError(
         code="PNG_RASTERIZER_UNAVAILABLE",
-        message="PNG output requires optional cairosvg or resvg.",
-        details={"install": "Install cairosvg or put resvg on PATH, or omit --png."},
+        message="PNG output requires cairosvg.",
+        details={"install": "Install cairosvg, or omit --png."},
         recoverable=True,
     )
 
@@ -94,41 +91,4 @@ def _try_cairosvg(svg: str, width: int, height: int, output_path: Path) -> bool:
             details={"errorType": exc.__class__.__name__},
             recoverable=True,
         ) from exc
-    return True
-
-
-def _try_resvg(svg: str, width: int, height: int, output_path: Path) -> bool:
-    executable = shutil.which("resvg")
-    if not executable:
-        return False
-    with tempfile.NamedTemporaryFile("w", suffix=".svg", encoding="utf-8", delete=False) as handle:
-        handle.write(svg)
-        svg_path = Path(handle.name)
-    try:
-        completed = subprocess.run(
-            [
-                executable,
-                "--width",
-                str(width),
-                "--height",
-                str(height),
-                str(svg_path),
-                str(output_path),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    finally:
-        try:
-            svg_path.unlink()
-        except OSError:
-            pass
-    if completed.returncode != 0:
-        raise DomainError(
-            code="PNG_EXPORT_FAILED",
-            message="resvg could not rasterize SVG.",
-            details={"stderr": completed.stderr.strip()[:500]},
-            recoverable=True,
-        )
     return True

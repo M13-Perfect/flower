@@ -204,6 +204,8 @@ def test_apply_template_returns_editable_layer_document() -> None:
     assert document["metadata"]["templateVersion"] == "1.0.0"
     assert document["canvas"]["width"] == 3000
     assert document["canvas"]["height"] == 3000
+    assert document["exportSettings"]["physical"] == {"widthMm": 80, "heightMm": 80}
+    assert document["exportSettings"]["dxf"]["units"] == "mm"
 
     text_layer = next(layer for layer in document["layers"] if layer["slotId"] == "customer_name")
     flower_layer = next(layer for layer in document["layers"] if layer["slotId"] == "flower")
@@ -339,3 +341,35 @@ def test_apply_template_returns_structured_error_for_missing_required_order_data
     assert payload["error"]["code"] == "TEMPLATE_APPLY_FAILED"
     assert payload["error"]["recoverable"] is True
     assert payload["error"]["details"]["missingFields"] == ["fontPreference"]
+
+
+def test_asset_view_box_uses_real_svg_dimensions() -> None:
+    from app.domain.templates.engine import _asset_view_box
+
+    # 真实素材形态:无 viewBox,只有 width/height 像素属性 + DOCTYPE 头
+    real_asset_style = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>'
+        '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"'
+        ' "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">'
+        '<svg width="3000px" height="3000px" version="1.1"'
+        ' xmlns="http://www.w3.org/2000/svg"><path d="M0 0h10"/></svg>'
+    )
+    assert _asset_view_box(real_asset_style) == {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 3000.0,
+        "height": 3000.0,
+    }
+
+    # 显式 viewBox 优先
+    with_view_box = '<svg viewBox="0 0 240 360" xmlns="http://www.w3.org/2000/svg"/>'
+    assert _asset_view_box(with_view_box) == {
+        "x": 0.0,
+        "y": 0.0,
+        "width": 240.0,
+        "height": 360.0,
+    }
+
+    # 解析不了时退回默认占位,不抛异常
+    assert _asset_view_box("not-svg")["width"] == 512.0
+    assert _asset_view_box(None)["width"] == 512.0

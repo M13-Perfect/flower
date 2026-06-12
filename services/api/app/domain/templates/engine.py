@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import re
@@ -7,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from xml.etree import ElementTree
 
 from app.domain import DomainError
 from app.schemas.orders import ParsedOrder
@@ -82,7 +84,7 @@ def apply_template(
             "updatedAt": timestamp,
         },
         "canvas": template["canvas"],
-        "exportSettings": _default_export_settings(template["canvas"]["unit"]),
+        "exportSettings": _export_settings(template),
         "layers": _build_layers(parsed_order),
     }
 
@@ -173,7 +175,7 @@ def _build_layers(parsed_order: ParsedOrder) -> list[dict[str, Any]]:
     )
 
     return [
-        _text_layer(parsed_order.customer_name, parsed_order.font_preference.label),
+        _text_layer(parsed_order.customer_name, parsed_order.font_preference),
         _flower_layer(parsed_order.flower.name, flower_asset_id, flower_path, inline_svg),
     ]
 
@@ -238,7 +240,8 @@ def _flower_match_keys(flower_name: str) -> set[str]:
     return {compact_name, *(word for word in words if word)}
 
 
-def _text_layer(text: str, font_label: str) -> dict[str, Any]:
+def _text_layer(text: str, font_preference: Any) -> dict[str, Any]:
+    font_label = str(font_preference.label)
     return {
         **_layer_base(
             layer_id="layer_customer_name",
@@ -256,7 +259,8 @@ def _text_layer(text: str, font_label: str) -> dict[str, Any]:
         "fontRef": {
             "family": font_label,
             "source": "asset",
-            "assetId": _slug(font_label),
+            "assetId": f"font-{int(font_preference.choice)}",
+            "optionNo": int(font_preference.choice),
             "fallbackFamilies": ["serif"],
         },
         "style": {
@@ -298,17 +302,51 @@ def _flower_layer(
             "assetId": asset_id,
             "path": asset_path,
         },
-        "viewBox": {
-            "x": 0,
-            "y": 0,
-            "width": 512,
-            "height": 512,
-        },
+        # viewBox 必须来自素材真实坐标系;占位值会让导出缩放彻底失真。
+        "viewBox": _asset_view_box(inline_svg),
         "preserveVector": True,
     }
     if inline_svg is not None:
         layer["inlineSvg"] = inline_svg
     return layer
+
+
+_SVG_DIMENSION_PATTERN = re.compile(r"^\s*([0-9.]+)\s*(?:px)?\s*$")
+_DEFAULT_ASSET_VIEW_BOX = {"x": 0.0, "y": 0.0, "width": 512.0, "height": 512.0}
+
+
+def _asset_view_box(inline_svg: str | None) -> dict[str, float]:
+    if not inline_svg:
+        return dict(_DEFAULT_ASSET_VIEW_BOX)
+    try:
+        root = ElementTree.fromstring(inline_svg)
+    except ElementTree.ParseError:
+        return dict(_DEFAULT_ASSET_VIEW_BOX)
+    view_box = root.get("viewBox")
+    if view_box:
+        parts = view_box.replace(",", " ").split()
+        if len(parts) == 4:
+            try:
+                x, y, width, height = (float(part) for part in parts)
+            except ValueError:
+                return dict(_DEFAULT_ASSET_VIEW_BOX)
+            if width > 0 and height > 0:
+                return {"x": x, "y": y, "width": width, "height": height}
+    width = _parse_svg_dimension(root.get("width"))
+    height = _parse_svg_dimension(root.get("height"))
+    if width and height:
+        return {"x": 0.0, "y": 0.0, "width": width, "height": height}
+    return dict(_DEFAULT_ASSET_VIEW_BOX)
+
+
+def _parse_svg_dimension(value: str | None) -> float | None:
+    if not value:
+        return None
+    match = _SVG_DIMENSION_PATTERN.match(value)
+    if not match:
+        return None
+    number = float(match.group(1))
+    return number if number > 0 else None
 
 
 def _layer_base(
@@ -345,12 +383,47 @@ def _layer_base(
     }
 
 
+def _export_settings(template: dict[str, Any]) -> dict[str, Any]:
+    canvas = template["canvas"]
+    settings = _deep_merge(
+        _default_export_settings(str(canvas["unit"])),
+        template.get("exportSettings") if isinstance(template.get("exportSettings"), dict) else {},
+    )
+    physical = settings.get("physical")
+    if isinstance(physical, dict) and physical.get("widthMm") is not None:
+        width_mm = _positive_float(physical.get("widthMm"))
+        if width_mm is None:
+            raise DomainError(
+                code="TEMPLATE_INVALID",
+                message="Template physical export width must be a positive number.",
+                details={"field": "exportSettings.physical.widthMm"},
+                recoverable=True,
+            )
+        canvas_width = float(canvas["width"])
+        canvas_height = float(canvas["height"])
+        physical["widthMm"] = width_mm
+        if physical.get("heightMm") is None:
+            # 物理高度以模板画布比例派生，避免导出端写死产品尺寸。
+            physical["heightMm"] = width_mm * canvas_height / canvas_width
+        else:
+            height_mm = _positive_float(physical.get("heightMm"))
+            if height_mm is None:
+                raise DomainError(
+                    code="TEMPLATE_INVALID",
+                    message="Template physical export height must be a positive number.",
+                    details={"field": "exportSettings.physical.heightMm"},
+                    recoverable=True,
+                )
+            physical["heightMm"] = height_mm
+    return settings
+
+
 def _default_export_settings(unit: str) -> dict[str, Any]:
     return {
         "schemaVersion": "1.0",
-        "defaultFormats": ["svg", "png"],
+        "defaultFormats": ["svg", "png", "dxf"],
         "svg": {
-            "preserveText": True,
+            "preserveText": False,
             "preserveVector": True,
             "includeMetadata": True,
         },
@@ -363,6 +436,24 @@ def _default_export_settings(unit: str) -> dict[str, Any]:
             "units": unit,
         },
     }
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = deepcopy(value)
+    return result
+
+
+def _positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _missing_order_fields(parsed_order: ParsedOrder) -> list[str]:

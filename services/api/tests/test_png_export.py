@@ -32,7 +32,6 @@ def test_rasterize_svg_to_png_uses_cairosvg_when_available(tmp_path, monkeypatch
 
 def test_rasterize_svg_to_png_reports_optional_dependency_gap(tmp_path, monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "cairosvg", None)
-    monkeypatch.setattr("app.domain.exports.png.shutil.which", lambda _name: None)
     output_path = tmp_path / "preview.png"
 
     with pytest.raises(DomainError) as exc_info:

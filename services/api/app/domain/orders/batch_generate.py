@@ -39,22 +39,35 @@ class BatchGenerateResult:
 
 def generate_batch(batch_id: str) -> BatchGenerateResult:
     batch = parse_order_batch(batch_id)
-    workflow_result = generate_batch_outputs(batch.batch_id, include_png=True)
-    generated_by_job = {item.order_job_id: item for item in workflow_result.items}
-    final_batch = load_batch(batch.batch_id)
+    workflow_result = generate_batch_outputs(batch.batch_id)
+    generated_items, report_path, review_csv_path = write_reports_for_workflow_result(
+        batch.batch_id, workflow_result
+    )
+    return BatchGenerateResult(
+        batch_id=batch.batch_id,
+        items=generated_items,
+        report_path=report_path,
+        review_csv_path=review_csv_path,
+    )
+
+
+def write_reports_for_workflow_result(
+    batch_id: str,
+    workflow_result: object,
+) -> tuple[list[GeneratedBatchItem], Path, Path]:
+    """由 workflow 生成结果写出批次报告;CLI 直调 workflow 时也必须出报告。"""
+    generated_by_job = {
+        item.order_job_id: item for item in getattr(workflow_result, "items", ())
+    }
+    final_batch = load_batch(batch_id)
     generated_items = [
         _generated_item_from_batch_item(item, generated_by_job.get(item.order_job_id))
         for item in final_batch.items
     ]
     report_rows = [_report_row(item) for item in generated_items]
-    report_path = write_batch_report(final_batch.batch_id, report_rows)
-    review_csv_path = write_review_csv(final_batch.batch_id, report_rows)
-    return BatchGenerateResult(
-        batch_id=final_batch.batch_id,
-        items=generated_items,
-        report_path=report_path,
-        review_csv_path=review_csv_path,
-    )
+    report_path = write_batch_report(batch_id, report_rows)
+    review_csv_path = write_review_csv(batch_id, report_rows)
+    return generated_items, report_path, review_csv_path
 
 
 def _generated_item_from_batch_item(item: BatchOrderItem, generated: object | None) -> GeneratedBatchItem:

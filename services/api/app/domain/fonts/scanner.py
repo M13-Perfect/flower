@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from app.domain import DomainError
+from app.domain.settings import get_path_settings, has_saved_path_settings
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
@@ -138,7 +139,24 @@ def list_glyphs(font_id: str) -> tuple[FontRecord, tuple[GlyphRecord, ...], tupl
     catalog = list_fonts()
     for font in catalog.fonts:
         if font.id == font_id:
-            return font, _scan_font_glyphs(_project_path(font.source_path)), catalog.issues
+            return font, _scan_font_glyphs(_source_path(font.source_path)), catalog.issues
+
+    raise DomainError(
+        code="FONT_NOT_FOUND",
+        message="Font was not found.",
+        details={"fontId": font_id},
+        recoverable=True,
+    )
+
+
+def get_font_file_path(font_id: str) -> Path:
+    catalog = list_fonts()
+    for font in catalog.fonts:
+        if font.id == font_id:
+            path = _source_path(font.source_path)
+            if not path.is_file():
+                break
+            return path
 
     raise DomainError(
         code="FONT_NOT_FOUND",
@@ -150,14 +168,14 @@ def list_glyphs(font_id: str) -> tuple[FontRecord, tuple[GlyphRecord, ...], tupl
 
 def _discover_font_candidates(issues: list[FontScanIssue]) -> list[Path]:
     candidates: list[Path] = []
-    for relative_dir in FONT_DIRECTORIES:
-        directory = PROJECT_ROOT / relative_dir
+    for directory in _font_directories():
+        display_path = _relative_path(directory)
         if not directory.exists():
             issues.append(
                 FontScanIssue(
                     code="FONT_DIRECTORY_MISSING",
-                    message=f"Font directory not found: {relative_dir}",
-                    path=relative_dir,
+                    message=f"Font directory not found: {display_path}",
+                    path=display_path,
                 )
             )
             continue
@@ -165,8 +183,8 @@ def _discover_font_candidates(issues: list[FontScanIssue]) -> list[Path]:
             issues.append(
                 FontScanIssue(
                     code="FONT_SOURCE_NOT_DIRECTORY",
-                    message=f"Font source is not a directory: {relative_dir}",
-                    path=relative_dir,
+                    message=f"Font source is not a directory: {display_path}",
+                    path=display_path,
                 )
             )
             continue
@@ -224,6 +242,8 @@ def _scan_font_glyphs(path: Path) -> tuple[GlyphRecord, ...]:
     for codepoint, glyph_name in sorted(cmap.items()):
         if glyph_name not in glyph_set:
             continue
+        if _is_control_codepoint(codepoint):
+            continue
         mapped_names.add(glyph_name)
         glyphs.append(
             GlyphRecord(
@@ -255,6 +275,10 @@ def _scan_font_glyphs(path: Path) -> tuple[GlyphRecord, ...]:
         )
 
     return tuple(glyphs)
+
+
+def _is_control_codepoint(codepoint: int) -> bool:
+    return 0x0000 <= codepoint <= 0x001F or 0x007F <= codepoint <= 0x009F
 
 
 def _best_unicode_cmap(font: Any) -> dict[int, str]:
@@ -378,16 +402,25 @@ def _relative_path(path: Path) -> str:
     try:
         return path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
     except ValueError:
-        return path.name
+        return str(path.resolve())
 
 
-def _project_path(relative_path: str) -> Path:
-    path = (PROJECT_ROOT / relative_path).resolve()
+def _font_directories() -> list[Path]:
+    if has_saved_path_settings(PROJECT_ROOT):
+        return [Path(path).resolve() for path in get_path_settings(PROJECT_ROOT).font_directories]
+    return [(PROJECT_ROOT / relative_dir).resolve() for relative_dir in FONT_DIRECTORIES]
+
+
+def _source_path(source_path: str) -> Path:
+    raw_path = Path(source_path)
+    path = raw_path.resolve() if raw_path.is_absolute() else (PROJECT_ROOT / source_path).resolve()
+    if raw_path.is_absolute():
+        return path
     if PROJECT_ROOT.resolve() not in path.parents and path != PROJECT_ROOT.resolve():
         raise DomainError(
             code="PATH_TRAVERSAL_BLOCKED",
             message="Font path is outside the project root.",
-            details={"path": relative_path},
+            details={"path": source_path},
             recoverable=True,
         )
     return path
