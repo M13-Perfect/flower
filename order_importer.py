@@ -7,6 +7,7 @@ from typing import Any
 
 
 REMARK_KEYS = ("remark", "remarks", "note", "notes", "order_remark", "buyer_message", "message", "备注", "订单备注")
+BINARY_FILE_ERROR = "该文件是二进制格式,请确认文件类型"
 
 
 def load_order_remark_from_file(path: Path | str) -> str:
@@ -20,11 +21,11 @@ def load_order_remark_from_file(path: Path | str) -> str:
         return _load_from_json(source)
     if suffix == ".csv":
         return _load_from_csv(source)
-    return source.read_text(encoding="utf-8").strip()
+    return _read_text(source, encoding="utf-8").strip()
 
 
 def _load_from_json(path: Path) -> str:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(_read_text(path, encoding="utf-8"))
     remark = _find_remark(payload)
     if remark:
         return remark
@@ -32,13 +33,23 @@ def _load_from_json(path: Path) -> str:
 
 
 def _load_from_csv(path: Path) -> str:
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            remark = _find_remark(row)
-            if remark:
-                return remark
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                remark = _find_remark(row)
+                if remark:
+                    return remark
+    except UnicodeDecodeError as exc:
+        raise ValueError(BINARY_FILE_ERROR) from exc
     raise ValueError("CSV 中未找到备注字段")
+
+
+def _read_text(path: Path, *, encoding: str) -> str:
+    try:
+        return path.read_text(encoding=encoding)
+    except UnicodeDecodeError as exc:
+        raise ValueError(BINARY_FILE_ERROR) from exc
 
 
 def _find_remark(value: Any) -> str:

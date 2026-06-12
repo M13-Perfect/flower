@@ -807,6 +807,69 @@ def test_programmatic_flower_refresh_and_parse_do_not_add_layers(monkeypatch, tm
     finally:
         root.destroy()
 
+
+def test_import_remark_file_xlsx_runs_batch_flow(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        source = tmp_path / "orders.xlsx"
+        source.write_bytes(b"xlsx")
+        report_path = tmp_path / "batch-report.xlsx"
+        result = SimpleNamespace(
+            items=[
+                SimpleNamespace(status="EXPORTED", needs_manual_review=False),
+                SimpleNamespace(status="BLOCKED", needs_manual_review=True),
+            ],
+            report_path=report_path,
+        )
+        captured_dialog: list[object] = []
+        captured_dialog_kwargs: dict[str, object] = {}
+        imported_paths: list[Path] = []
+
+        def fake_askopenfilename(**kwargs):
+            captured_dialog_kwargs.update(kwargs)
+            return str(source)
+
+        def run_immediately(_root, work, on_success, on_error):
+            try:
+                value = work()
+            except Exception as exc:
+                on_error(exc)
+            else:
+                on_success(value)
+            return SimpleNamespace()
+
+        monkeypatch.setattr(ui_app_module.filedialog, "askopenfilename", fake_askopenfilename)
+        monkeypatch.setattr(
+            ui_app_module,
+            "load_order_remark_from_file",
+            lambda _path: (_ for _ in ()).throw(AssertionError("legacy importer called")),
+        )
+        monkeypatch.setattr(ui_app_module, "run_background", run_immediately)
+        monkeypatch.setattr(
+            ui_app_module,
+            "import_dianxiaomi_xlsx_batch",
+            lambda path: imported_paths.append(Path(path)) or result,
+        )
+        monkeypatch.setattr(
+            ui_app_module,
+            "show_xlsx_batch_import_summary",
+            lambda _root, value: captured_dialog.append(value),
+        )
+
+        app.import_remark_file()
+
+        assert "*.xlsx" in captured_dialog_kwargs["filetypes"][0][1]
+        assert imported_paths == [source]
+        assert captured_dialog == [result]
+        assert ui_app_module.summarize_xlsx_batch_result(result) == (2, 1, 1, report_path)
+    finally:
+        root.destroy()
+
 def test_font_settings_uses_one_choose_font_button():
     try:
         root = tk.Tk()
