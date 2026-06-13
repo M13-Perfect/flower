@@ -113,11 +113,20 @@ def _build_svg(
     canvas = document["canvas"]
     width = _number(canvas["width"])
     height = _number(canvas["height"])
+    # 绑定物理尺寸:width/height 用 mm、viewBox 保留像素坐标系,二者一起规定真实大小。
+    # 缺物理配置时退回无单位像素(旧行为),避免破坏非生产用途。
+    physical = _physical_size_mm(document)
+    if physical is not None:
+        width_attr = f"{_number(physical[0])}mm"
+        height_attr = f"{_number(physical[1])}mm"
+    else:
+        width_attr = str(width)
+        height_attr = str(height)
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
-            f'height="{height}" viewBox="0 0 {width} {height}">'
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width_attr}" '
+            f'height="{height_attr}" viewBox="0 0 {width} {height}">'
         ),
         (
             '  <metadata id="flower-export-metadata">'
@@ -597,6 +606,30 @@ def _positive_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def _physical_size_mm(document: dict[str, Any]) -> tuple[float, float] | None:
+    """宽松读取 exportSettings.physical;缺失或非法时返回 None(SVG 退回像素)。"""
+    export_settings = document.get("exportSettings")
+    if not isinstance(export_settings, dict):
+        return None
+    physical = export_settings.get("physical")
+    if not isinstance(physical, dict):
+        return None
+    width = _positive_float(physical.get("widthMm"))
+    if width is None:
+        return None
+    canvas = document.get("canvas")
+    if not isinstance(canvas, dict):
+        return None
+    canvas_width = _positive_float(canvas.get("width"))
+    canvas_height = _positive_float(canvas.get("height"))
+    if canvas_width is None or canvas_height is None:
+        return None
+    height = _positive_float(physical.get("heightMm"))
+    if height is None:
+        height = width * canvas_height / canvas_width
+    return width, height
 
 
 def _number(value: Any) -> str:

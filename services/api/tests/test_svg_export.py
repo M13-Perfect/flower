@@ -95,6 +95,50 @@ def test_svg_export_outputs_cad_safe_parseable_svg(tmp_path, monkeypatch) -> Non
     assert ET.fromstring(result.content) is not None
 
 
+def test_svg_binds_physical_mm_size_to_viewbox(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(tmp_path))
+    document = base_document(
+        layers=[
+            {
+                **layer_base("path_1", "path", x=0, y=0),
+                "pathData": "M0 0 L10 0 L10 10 Z",
+                "fill": "none",
+                "stroke": "#111111",
+            }
+        ]
+    )
+    # 画布 300x200 px,物理宽 90mm -> 高按比例 60mm。
+    document["exportSettings"]["physical"] = {"widthMm": 90}
+
+    result = export_svg(document, exported_at=EXPORTED_AT)
+
+    # 物理尺寸(mm)与坐标系(viewBox px)同时存在且绑定。
+    assert 'width="90mm"' in result.content
+    assert 'height="60mm"' in result.content
+    assert 'viewBox="0 0 300 200"' in result.content
+    assert ET.fromstring(result.content) is not None
+
+
+def test_svg_falls_back_to_pixels_without_physical_config(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(tmp_path))
+    document = base_document(
+        layers=[
+            {
+                **layer_base("path_1", "path"),
+                "pathData": "M0 0 L10 0 L10 10 Z",
+                "fill": "none",
+                "stroke": "#111111",
+            }
+        ]
+    )
+    document["exportSettings"].pop("physical", None)
+
+    result = export_svg(document, exported_at=EXPORTED_AT)
+
+    assert 'width="300"' in result.content
+    assert "mm" not in result.content.splitlines()[1]
+
+
 def test_svg_export_rejects_missing_required_document_fields() -> None:
     try:
         export_svg({"schemaVersion": "1.0", "layers": []})

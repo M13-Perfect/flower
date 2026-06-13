@@ -523,6 +523,8 @@ def _glyph_shapes(
     points: list[tuple[float, float]] = []
     current = (0.0, 0.0)
     start = (0.0, 0.0)
+    # 字形在字体单位空间扁平化,经 scale_factor 再经 matrix 变换到 mm。
+    tol = _local_tolerance(matrix, scale_factor)
 
     def convert(point: tuple[float, float]) -> tuple[float, float]:
         x = cursor_x + point[0] * scale_factor
@@ -544,12 +546,12 @@ def _glyph_shapes(
             if raw_points:
                 control = raw_points[0]
                 end = raw_points[-1]
-                for point in _flatten_quadratic(current, control, end):
+                for point in _flatten_quadratic(current, control, end, tol):
                     points.append(convert(point))
                 current = end
         elif command == "curveTo":
             control_1, control_2, end = args
-            for point in _flatten_cubic(current, control_1, control_2, end):
+            for point in _flatten_cubic(current, control_1, control_2, end, tol):
                 points.append(convert(point))
             current = end
         elif command == "closePath":
@@ -599,6 +601,8 @@ def _parse_path_shapes(path_data: str, matrix: Matrix, layer_id: str) -> list[Pa
         index += 1
         return value
 
+    tol = _local_tolerance(matrix)
+
     def add_point(point: tuple[float, float]) -> None:
         points.append(apply_matrix(matrix, point))
 
@@ -645,7 +649,7 @@ def _parse_path_shapes(path_data: str, matrix: Matrix, layer_id: str) -> list[Pa
             while has_number():
                 c = _point(number(), number(), cursor, absolute)
                 end = _point(number(), number(), cursor, absolute)
-                for point in _flatten_quadratic(cursor, c, end):
+                for point in _flatten_quadratic(cursor, c, end, tol):
                     add_point(point)
                 cursor = end
         elif cmd == "C":
@@ -653,7 +657,7 @@ def _parse_path_shapes(path_data: str, matrix: Matrix, layer_id: str) -> list[Pa
                 c1 = _point(number(), number(), cursor, absolute)
                 c2 = _point(number(), number(), cursor, absolute)
                 end = _point(number(), number(), cursor, absolute)
-                for point in _flatten_cubic(cursor, c1, c2, end):
+                for point in _flatten_cubic(cursor, c1, c2, end, tol):
                     add_point(point)
                 cursor = end
         elif cmd == "Z":
@@ -680,11 +684,119 @@ def _point(x: float, y: float, cursor: tuple[float, float], absolute: bool) -> t
     return (x, y) if absolute else (cursor[0] + x, cursor[1] + y)
 
 
+# 自适应扁平化:近直的曲线只产少量点,弯曲处自动加密;容差以最终 mm 计,
+# 0.05mm 远低于激光精度,既保形又避免旧固定步数导致的过密(单条线 5000+ 点)。
+_FLATTEN_TOLERANCE_MM = 0.05
+_FLATTEN_MAX_DEPTH = 20
+
+
+def _matrix_scale(matrix: Matrix) -> float:
+    sx = math.hypot(matrix.a, matrix.b)
+    sy = math.hypot(matrix.c, matrix.d)
+    average = (sx + sy) / 2
+    return average if average > 1e-9 else 1.0
+
+
+def _local_tolerance(matrix: Matrix, extra_scale: float = 1.0) -> float:
+    """把 mm 容差换算到曲线自身坐标系:effective = matrix 缩放 × 额外缩放。"""
+    effective = _matrix_scale(matrix) * (extra_scale or 1.0)
+    if effective <= 1e-9:
+        return _FLATTEN_TOLERANCE_MM
+    return _FLATTEN_TOLERANCE_MM / effective
+
+
+def _midpoint(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float]:
+    return ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+
+
+def _distance_to_line(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    segment_sq = dx * dx + dy * dy
+    if segment_sq <= 1e-12:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    return abs((point[0] - start[0]) * dy - (point[1] - start[1]) * dx) / math.sqrt(segment_sq)
+
+
 def _flatten_quadratic(
     p0: tuple[float, float],
     p1: tuple[float, float],
     p2: tuple[float, float],
+    tol: float | None = None,
     steps: int = 12,
+) -> list[tuple[float, float]]:
+    if tol is None:  # 兼容无容差调用,退回固定步数
+        return _flatten_quadratic_fixed(p0, p1, p2, steps)
+    result: list[tuple[float, float]] = []
+    _subdivide_quadratic(p0, p1, p2, tol, 0, result)
+    return result
+
+
+def _flatten_cubic(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    tol: float | None = None,
+    steps: int = 16,
+) -> list[tuple[float, float]]:
+    if tol is None:
+        return _flatten_cubic_fixed(p0, p1, p2, p3, steps)
+    result: list[tuple[float, float]] = []
+    _subdivide_cubic(p0, p1, p2, p3, tol, 0, result)
+    return result
+
+
+def _subdivide_quadratic(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    tol: float,
+    depth: int,
+    out: list[tuple[float, float]],
+) -> None:
+    if depth >= _FLATTEN_MAX_DEPTH or _distance_to_line(p1, p0, p2) <= tol:
+        out.append(p2)
+        return
+    p01 = _midpoint(p0, p1)
+    p12 = _midpoint(p1, p2)
+    mid = _midpoint(p01, p12)
+    _subdivide_quadratic(p0, p01, mid, tol, depth + 1, out)
+    _subdivide_quadratic(mid, p12, p2, tol, depth + 1, out)
+
+
+def _subdivide_cubic(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    tol: float,
+    depth: int,
+    out: list[tuple[float, float]],
+) -> None:
+    flat = _distance_to_line(p1, p0, p3) <= tol and _distance_to_line(p2, p0, p3) <= tol
+    if depth >= _FLATTEN_MAX_DEPTH or flat:
+        out.append(p3)
+        return
+    p01 = _midpoint(p0, p1)
+    p12 = _midpoint(p1, p2)
+    p23 = _midpoint(p2, p3)
+    p012 = _midpoint(p01, p12)
+    p123 = _midpoint(p12, p23)
+    mid = _midpoint(p012, p123)
+    _subdivide_cubic(p0, p01, p012, mid, tol, depth + 1, out)
+    _subdivide_cubic(mid, p123, p23, p3, tol, depth + 1, out)
+
+
+def _flatten_quadratic_fixed(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    steps: int,
 ) -> list[tuple[float, float]]:
     result = []
     for index in range(1, steps + 1):
@@ -699,12 +811,12 @@ def _flatten_quadratic(
     return result
 
 
-def _flatten_cubic(
+def _flatten_cubic_fixed(
     p0: tuple[float, float],
     p1: tuple[float, float],
     p2: tuple[float, float],
     p3: tuple[float, float],
-    steps: int = 16,
+    steps: int,
 ) -> list[tuple[float, float]]:
     result = []
     for index in range(1, steps + 1):
@@ -719,6 +831,11 @@ def _flatten_cubic(
     return result
 
 
+# 雕花与刻字是同一道激光工序,所有几何用统一颜色/线宽,激光软件视为一次操作。
+_ENGRAVE_COLOR = 7  # ACI 7 = 黑/白中性色
+_ENGRAVE_LINEWEIGHT = 13  # 0.13mm 细线;激光以路径本身为准,线宽仅作显示
+
+
 def _write_dxf(shapes: list[PathShape], context: ExportContext, metadata: dict[str, str]) -> str:
     ezdxf = _load_ezdxf()
     doc = ezdxf.new(dxfversion="R2010")
@@ -726,6 +843,14 @@ def _write_dxf(shapes: list[PathShape], context: ExportContext, metadata: dict[s
     doc.units = INSUNITS[context.target_units]
     _write_dxf_metadata(doc, metadata)
     modelspace = doc.modelspace()
+
+    # 先把用到的图层登记进图层表(原先实体引用未声明的图层,依赖 CAD 自动建层)。
+    declared: set[str] = set()
+    for shape in shapes:
+        layer_name = _dxf_layer_name(shape.layer_id)
+        if layer_name not in declared:
+            _ensure_layer(doc, layer_name)
+            declared.add(layer_name)
 
     for shape in shapes:
         cleaned = _dedupe_points(shape.points)
@@ -740,6 +865,19 @@ def _write_dxf(shapes: list[PathShape], context: ExportContext, metadata: dict[s
     stream = StringIO()
     doc.write(stream)
     return stream.getvalue()
+
+
+def _ensure_layer(doc: Any, name: str) -> None:
+    layers = getattr(doc, "layers", None)
+    if layers is None or not hasattr(layers, "add"):
+        return  # 测试替身可能不实现图层表;实体仍带 layer 属性
+    try:
+        if hasattr(layers, "has_entry") and layers.has_entry(name):
+            return
+        # ezdxf 的 lineweight 是直接关键字参数,不走 dxfattribs。
+        layers.add(name=name, color=_ENGRAVE_COLOR, lineweight=_ENGRAVE_LINEWEIGHT)
+    except Exception:
+        return  # 重名或 API 差异不应阻断导出
 
 
 def _write_dxf_metadata(doc: Any, metadata: dict[str, str]) -> None:
