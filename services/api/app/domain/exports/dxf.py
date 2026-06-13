@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib
 import json
+import logging
 import math
 import os
 import re
@@ -129,7 +130,13 @@ def export_dxf(
     )
     canvas_unit = str(document["canvas"]["unit"])
     unit_scale = _unit_scale(canvas_unit, target_units, context)
-    root_matrix = scale(unit_scale, unit_scale)
+    # 画布是 Y 向下(SVG 约定),DXF 是 Y 向上;翻转 Y 让导入 CAD 后与 SVG 视觉一致
+    # (否则整图上下镜像、花朵头朝下)。绕画布高度翻转:y' = (H - y) * scale。
+    canvas_height = float(document["canvas"]["height"])
+    root_matrix = compose(
+        translate(0.0, canvas_height * unit_scale),
+        scale(unit_scale, -unit_scale),
+    )
     shapes = _collect_layer_shapes(document.get("layers", []), root_matrix, context)
     if not any(shape.points for shape in shapes):
         raise DomainError(
@@ -831,40 +838,50 @@ def _flatten_cubic_fixed(
     return result
 
 
-# 雕花与刻字是同一道激光工序,所有几何用统一颜色/线宽,激光软件视为一次操作。
+# 雕花与刻字是同一道激光工序,所有几何用统一颜色,激光软件视为一次操作。
 _ENGRAVE_COLOR = 7  # ACI 7 = 黑/白中性色
-_ENGRAVE_LINEWEIGHT = 13  # 0.13mm 细线;激光以路径本身为准,线宽仅作显示
+# 输出 DXF R12(AC1009)+ POLYLINE:EzCad2 等激光软件对 R2000+ 的 LWPOLYLINE
+# 支持不全,会导入成"可选中但改不动"的状态;R12+POLYLINE 才是原生可编辑曲线。
+# R12 不支持 $INSUNITS/线宽,EzCad 本就按 mm 解析坐标,不影响尺寸。
+_DXF_VERSION = "R12"
 
 
 def _write_dxf(shapes: list[PathShape], context: ExportContext, metadata: dict[str, str]) -> str:
     ezdxf = _load_ezdxf()
-    doc = ezdxf.new(dxfversion="R2010")
-    doc.header["$INSUNITS"] = INSUNITS[context.target_units]
-    doc.units = INSUNITS[context.target_units]
-    _write_dxf_metadata(doc, metadata)
-    modelspace = doc.modelspace()
+    # 抑制 ezdxf 对 R12 不导出 $INSUNITS 的告警(EzCad 按 mm 解析坐标,无影响)。
+    ezdxf_logger = logging.getLogger("ezdxf")
+    previous_level = ezdxf_logger.level
+    ezdxf_logger.setLevel(logging.ERROR)
+    try:
+        doc = ezdxf.new(dxfversion=_DXF_VERSION)
+        doc.header["$INSUNITS"] = INSUNITS[context.target_units]
+        _write_dxf_metadata(doc, metadata)
+        modelspace = doc.modelspace()
 
-    # 先把用到的图层登记进图层表(原先实体引用未声明的图层,依赖 CAD 自动建层)。
-    declared: set[str] = set()
-    for shape in shapes:
-        layer_name = _dxf_layer_name(shape.layer_id)
-        if layer_name not in declared:
-            _ensure_layer(doc, layer_name)
-            declared.add(layer_name)
+        # 先把用到的图层登记进图层表(原先实体引用未声明的图层,依赖 CAD 自动建层)。
+        declared: set[str] = set()
+        for shape in shapes:
+            layer_name = _dxf_layer_name(shape.layer_id)
+            if layer_name not in declared:
+                _ensure_layer(doc, layer_name)
+                declared.add(layer_name)
 
-    for shape in shapes:
-        cleaned = _dedupe_points(shape.points)
-        if len(cleaned) < 2:
-            continue
-        modelspace.add_lwpolyline(
-            cleaned,
-            close=shape.closed,
-            dxfattribs={"layer": _dxf_layer_name(shape.layer_id)},
-        )
+        for shape in shapes:
+            cleaned = _dedupe_points(shape.points)
+            if len(cleaned) < 2:
+                continue
+            polyline = modelspace.add_polyline2d(
+                cleaned,
+                dxfattribs={"layer": _dxf_layer_name(shape.layer_id)},
+            )
+            if shape.closed and hasattr(polyline, "close"):
+                polyline.close(True)
 
-    stream = StringIO()
-    doc.write(stream)
-    return stream.getvalue()
+        stream = StringIO()
+        doc.write(stream)
+        return stream.getvalue()
+    finally:
+        ezdxf_logger.setLevel(previous_level)
 
 
 def _ensure_layer(doc: Any, name: str) -> None:
@@ -874,8 +891,8 @@ def _ensure_layer(doc: Any, name: str) -> None:
     try:
         if hasattr(layers, "has_entry") and layers.has_entry(name):
             return
-        # ezdxf 的 lineweight 是直接关键字参数,不走 dxfattribs。
-        layers.add(name=name, color=_ENGRAVE_COLOR, lineweight=_ENGRAVE_LINEWEIGHT)
+        # R12 图层只支持颜色;统一色 7 即可表达"同一道工序"。
+        layers.add(name=name, color=_ENGRAVE_COLOR)
     except Exception:
         return  # 重名或 API 差异不应阻断导出
 
