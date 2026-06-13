@@ -41,7 +41,8 @@ def test_dxf_export_converts_simple_text_to_path_geometry(tmp_path, monkeypatch)
     assert payload["warnings"] == []
     assert "INSUNITS=0" in dxf_text
     assert "LAYER=text_1" in dxf_text
-    assert "POINT 12.0000,20.0000" in dxf_text
+    # Y 翻转(画布高 200):旧 (12,20) -> (12,180),让 DXF 与 SVG 视觉一致。
+    assert "POINT 12.0000,180.0000" in dxf_text
     assert "TEXT" not in dxf_text
 
 
@@ -84,9 +85,10 @@ def test_dxf_export_converts_simple_inline_svg_to_path_geometry(tmp_path, monkey
     assert response.status_code == 200
     dxf_text = decode_dxf(response.json())
     assert "LAYER=svg_1" in dxf_text
-    assert "POINT 5.0000,7.0000" in dxf_text
-    assert "POINT 25.0000,7.0000" in dxf_text
-    assert "POINT 25.0000,27.0000" in dxf_text
+    # Y 翻转(画布高 200):y -> 200-y。
+    assert "POINT 5.0000,193.0000" in dxf_text
+    assert "POINT 25.0000,193.0000" in dxf_text
+    assert "POINT 25.0000,173.0000" in dxf_text
 
 
 def test_dxf_export_normalizes_group_transforms_and_units(tmp_path, monkeypatch) -> None:
@@ -119,8 +121,9 @@ def test_dxf_export_normalizes_group_transforms_and_units(tmp_path, monkeypatch)
     dxf_text = decode_dxf(response.json())
     assert "INSUNITS=4" in dxf_text
     assert "LAYER=path_1" in dxf_text
-    assert "POINT 20.0000,20.0000" in dxf_text
-    assert "POINT 40.0000,20.0000" in dxf_text
+    # Y 翻转(画布高 200):y -> 200-y。
+    assert "POINT 20.0000,180.0000" in dxf_text
+    assert "POINT 40.0000,180.0000" in dxf_text
 
 
 def test_dxf_export_scales_px_canvas_to_template_physical_width_mm(
@@ -237,9 +240,9 @@ def test_dxf_declares_layers_with_uniform_engrave_style(tmp_path, monkeypatch) -
 
     assert response.status_code == 200
     dxf_text = decode_dxf(response.json())
-    # 两个引用图层都必须登记进图层表(不再依赖 CAD 自动建层)。
-    assert "LAYERDEF=layer_flower,color=7,lineweight=13" in dxf_text
-    assert "LAYERDEF=layer_text,color=7,lineweight=13" in dxf_text
+    # 两个引用图层都必须登记进图层表(R12 只支持颜色;统一色 7 表示同一道工序)。
+    assert "LAYERDEF=layer_flower,color=7" in dxf_text
+    assert "LAYERDEF=layer_text,color=7" in dxf_text
 
 
 def test_dxf_adaptive_flattening_keeps_endpoints_and_limits_points(tmp_path, monkeypatch) -> None:
@@ -267,9 +270,10 @@ def test_dxf_adaptive_flattening_keeps_endpoints_and_limits_points(tmp_path, mon
     assert response.status_code == 200
     points = dxf_points(decode_dxf(response.json()))
     # 近直曲线点数应远小于旧固定 16 段(含起点),且端点精确保留。
+    # Y 翻转(画布高 200):端点 y=0 -> 200。
     assert len(points) <= 6
-    assert points[0] == (0.0, 0.0)
-    assert points[-1] == (3.0, 0.0)
+    assert points[0] == (0.0, 200.0)
+    assert points[-1] == (3.0, 200.0)
 
 
 def install_project_root(path: Path, monkeypatch) -> None:
@@ -290,8 +294,8 @@ class FakeLayerTable:
     def has_entry(self, name: str) -> bool:
         return name in self.entries
 
-    def add(self, name: str, color: int | None = None, lineweight: int | None = None) -> None:
-        self.entries[name] = {"color": color, "lineweight": lineweight}
+    def add(self, name: str, color: int | None = None) -> None:
+        self.entries[name] = {"color": color}
 
 
 class FakeDxfDocument:
@@ -309,9 +313,7 @@ class FakeDxfDocument:
         stream.write(f"VERSION={self.dxfversion}\n")
         stream.write(f"INSUNITS={self.header.get('$INSUNITS')}\n")
         for name, entry in self.layers.entries.items():
-            stream.write(
-                f"LAYERDEF={name},color={entry['color']},lineweight={entry['lineweight']}\n"
-            )
+            stream.write(f"LAYERDEF={name},color={entry['color']}\n")
         for item in self._modelspace.polylines:
             stream.write(f"LAYER={item['layer']}\n")
             stream.write(f"CLOSED={item['closed']}\n")
@@ -319,18 +321,26 @@ class FakeDxfDocument:
                 stream.write(f"POINT {x:.4f},{y:.4f}\n")
 
 
+class FakePolyline:
+    def __init__(self, record: dict[str, Any]) -> None:
+        self._record = record
+
+    def close(self, state: bool = True) -> None:
+        self._record["closed"] = bool(state)
+
+
 class FakeModelspace:
     def __init__(self) -> None:
         self.polylines: list[dict[str, Any]] = []
 
-    def add_lwpolyline(self, points, close=False, dxfattribs=None) -> None:
-        self.polylines.append(
-            {
-                "points": [(float(x), float(y)) for x, y in points],
-                "closed": bool(close),
-                "layer": (dxfattribs or {}).get("layer", "0"),
-            }
-        )
+    def add_polyline2d(self, points, dxfattribs=None) -> FakePolyline:
+        record = {
+            "points": [(float(x), float(y)) for x, y in points],
+            "closed": False,
+            "layer": (dxfattribs or {}).get("layer", "0"),
+        }
+        self.polylines.append(record)
+        return FakePolyline(record)
 
 
 def decode_dxf(payload: dict[str, Any]) -> str:
