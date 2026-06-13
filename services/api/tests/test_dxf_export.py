@@ -208,6 +208,70 @@ def test_dxf_export_rejects_unsupported_layers_without_file(tmp_path, monkeypatc
     assert "contentBase64" not in payload
 
 
+def test_dxf_declares_layers_with_uniform_engrave_style(tmp_path, monkeypatch) -> None:
+    install_fake_ezdxf(monkeypatch)
+    install_project_root(tmp_path, monkeypatch)
+    document = base_document(
+        layers=[
+            svg_layer(
+                "layer_flower",
+                '<svg viewBox="0 0 10 10"><path d="M0 0 L10 0 L10 10 Z"/></svg>',
+                x=5,
+                y=7,
+                width=20,
+                height=20,
+            ),
+            {
+                **layer_base("layer_text", "path", x=1, y=2),
+                "pathData": "M0 0 L5 0 L5 5 Z",
+                "fill": "none",
+                "stroke": "#111111",
+            },
+        ]
+    )
+
+    response = TestClient(app).post(
+        "/exports/dxf",
+        json={"document": document, "exportedAt": EXPORTED_AT},
+    )
+
+    assert response.status_code == 200
+    dxf_text = decode_dxf(response.json())
+    # 两个引用图层都必须登记进图层表(不再依赖 CAD 自动建层)。
+    assert "LAYERDEF=layer_flower,color=7,lineweight=13" in dxf_text
+    assert "LAYERDEF=layer_text,color=7,lineweight=13" in dxf_text
+
+
+def test_dxf_adaptive_flattening_keeps_endpoints_and_limits_points(tmp_path, monkeypatch) -> None:
+    install_fake_ezdxf(monkeypatch)
+    install_project_root(tmp_path, monkeypatch)
+    # 一条平缓的三次贝塞尔:自适应扁平化应只产少量点,而非固定 16 段。
+    document = base_document(
+        canvas_unit="mm",
+        dxf_units="mm",
+        layers=[
+            {
+                **layer_base("curve_1", "path", x=0, y=0, width=10, height=10),
+                "pathData": "M0 0 C1 0.05 2 0.05 3 0",
+                "fill": "none",
+                "stroke": "#111111",
+            }
+        ],
+    )
+
+    response = TestClient(app).post(
+        "/exports/dxf",
+        json={"document": document, "units": "mm", "exportedAt": EXPORTED_AT},
+    )
+
+    assert response.status_code == 200
+    points = dxf_points(decode_dxf(response.json()))
+    # 近直曲线点数应远小于旧固定 16 段(含起点),且端点精确保留。
+    assert len(points) <= 6
+    assert points[0] == (0.0, 0.0)
+    assert points[-1] == (3.0, 0.0)
+
+
 def install_project_root(path: Path, monkeypatch) -> None:
     monkeypatch.setenv("FLOWER_PROJECT_ROOT", str(path))
     (path / "assets" / "fonts").mkdir(parents=True, exist_ok=True)
@@ -219,12 +283,24 @@ def install_fake_ezdxf(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "ezdxf", fake)
 
 
+class FakeLayerTable:
+    def __init__(self) -> None:
+        self.entries: dict[str, dict[str, Any]] = {}
+
+    def has_entry(self, name: str) -> bool:
+        return name in self.entries
+
+    def add(self, name: str, color: int | None = None, lineweight: int | None = None) -> None:
+        self.entries[name] = {"color": color, "lineweight": lineweight}
+
+
 class FakeDxfDocument:
     def __init__(self, dxfversion: str) -> None:
         self.dxfversion = dxfversion
         self.header: dict[str, Any] = {}
         self.units: int | None = None
         self._modelspace = FakeModelspace()
+        self.layers = FakeLayerTable()
 
     def modelspace(self) -> "FakeModelspace":
         return self._modelspace
@@ -232,6 +308,10 @@ class FakeDxfDocument:
     def write(self, stream) -> None:
         stream.write(f"VERSION={self.dxfversion}\n")
         stream.write(f"INSUNITS={self.header.get('$INSUNITS')}\n")
+        for name, entry in self.layers.entries.items():
+            stream.write(
+                f"LAYERDEF={name},color={entry['color']},lineweight={entry['lineweight']}\n"
+            )
         for item in self._modelspace.polylines:
             stream.write(f"LAYER={item['layer']}\n")
             stream.write(f"CLOSED={item['closed']}\n")

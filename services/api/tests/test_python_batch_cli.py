@@ -4,6 +4,7 @@ import base64
 import csv
 import json
 from io import StringIO
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -76,12 +77,14 @@ def test_python_batch_workflow_generates_golden_svg_dxf_and_optional_png(
     output_b = project_root / "outputs" / "B1001"
     svg_a = (output_a / "A1001.svg").read_text(encoding="utf-8")
     svg_b = (output_b / "B1001.svg").read_text(encoding="utf-8")
+    dxf_a = (output_a / "A1001.dxf").read_text(encoding="utf-8")
+    dxf_b = (output_b / "B1001.dxf").read_text(encoding="utf-8")
     assert_production_svg(svg_a)
     assert_production_svg(svg_b)
-    assert svg_a == golden("real_note_a.svg")
-    assert (output_a / "A1001.dxf").read_text(encoding="utf-8") == golden("real_note_a.dxf")
-    assert svg_b == golden("real_note_b.svg")
-    assert (output_b / "B1001.dxf").read_text(encoding="utf-8") == golden("real_note_b.dxf")
+    assert svg_a == golden("real_note_a.svg", svg_a)
+    assert dxf_a == golden("real_note_a.dxf", dxf_a)
+    assert svg_b == golden("real_note_b.svg", svg_b)
+    assert dxf_b == golden("real_note_b.dxf", dxf_b)
     assert read_png_size((output_a / "A1001.png").read_bytes()) == (3000, 3000)
     assert read_png_size((output_b / "B1001.png").read_bytes()) == (3000, 3000)
 
@@ -344,8 +347,13 @@ def chunk(kind: bytes, data: bytes) -> bytes:
     )
 
 
-def golden(name: str) -> str:
-    return (Path(__file__).parent / "golden" / name).read_text(encoding="utf-8")
+def golden(name: str, actual: str | None = None) -> str:
+    # 快照更新模式:FLOWER_UPDATE_GOLDEN=1 时写入新基准(仅在产物经断言确认后使用)。
+    path = Path(__file__).parent / "golden" / name
+    if actual is not None and os.environ.get("FLOWER_UPDATE_GOLDEN"):
+        path.write_text(actual, encoding="utf-8")
+        return actual
+    return path.read_text(encoding="utf-8")
 
 
 def assert_production_svg(svg: str) -> None:
