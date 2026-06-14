@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
-from glyph_service import GlyphCandidate, rebuild_render_text, render_glyph_thumbnail
+from glyph_service import GlyphCandidate, render_glyph_thumbnail
 from models import BirthFlowerDesign, Document, EngravingLayout, ImageLayer, TextLayer
 from text_renderer import TextRenderer
 from text_layout import LINE_HEIGHT_RATIO, TextLayoutResult, layout_personalization_text
@@ -203,7 +203,9 @@ def render_document_png(document: Document, output_path: Path | str) -> Path:
         raise ValueError("当前文档没有任何图层，无法导出。")
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    canvas = Image.new("RGBA", (document.canvas_width, document.canvas_height), (255, 248, 240, 255))
+    # 背景透明:激光雕刻按位图明暗下刀,实心背景(原来的米色)会把整块底也刻出来;
+    # 透明底只保留花/字墨迹,导入 EzCad 雕刻时背景不出刀。
+    canvas = Image.new("RGBA", (document.canvas_width, document.canvas_height), (0, 0, 0, 0))
     # 渲染流程：先清空画布，再按 z_index 从底到顶合成所有 visible 图层。
     for layer in document.sorted_layers():
         if not layer.visible:
@@ -254,6 +256,7 @@ def render_document_svg(document: Document, output_path: Path | str) -> Path:
             result = TextRenderer().render_layer(layer)
             layer.render_text = result.render_text
             layer.glyph_overrides = result.glyph_overrides
+            layer.raw_text = layer.original_text
             layer.text = layer.original_text
             if result.warnings:
                 notes.extend(result.warnings)
@@ -317,6 +320,7 @@ def _composite_text_layer(canvas, image_module, draw_module, font_module, layer:
     result = TextRenderer().render_layer(layer)
     layer.render_text = result.render_text
     layer.glyph_overrides = result.glyph_overrides
+    layer.raw_text = layer.original_text
     layer.text = layer.original_text
     if result.warnings:
         import logging
@@ -465,7 +469,6 @@ def _draw_png_text_line(image, draw, line: str, line_start: int, origin_x: float
         return
 
     # 无 Unicode 映射的 glyph 无法放进字符串，只能按字符拆开并用 glyph_id 单独贴图。
-    line_width = draw.textlength(line, font=font)
     cursor_x = origin_x
     for offset, char in enumerate(line):
         absolute_index = line_start + offset

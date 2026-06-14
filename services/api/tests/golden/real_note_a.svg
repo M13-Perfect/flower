@@ -2,8 +2,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="80mm" height="80mm" viewBox="0 0 3000 3000">
   <metadata id="flower-export-metadata">{"templateId": "birth-flower-card", "orderId": "A1001", "exportedAt": "2026-06-12T12:00:00.000Z", "appVersion": "0.1.0"}</metadata>
   <rect width="3000" height="3000" fill="#ffffff" data-export-background="canvas"/>
-  <g id="layer_flower" data-layer-name="Birth flower - hydrangea" transform="translate(900 420)">
-    <g data-layer-id="layer_flower" data-source-viewBox="0 0 10 10" transform="scale(120 140) translate(0 0)">
+  <g id="layer_flower" data-layer-name="Birth flower - hydrangea" transform="translate(900 520)">
+    <g data-layer-id="layer_flower" data-source-viewBox="0 0 10 10" transform="scale(120 120) translate(0 0)">
       <path d="M0 0 L10 0 L10 10 Z" />
     </g>
   </g>

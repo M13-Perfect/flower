@@ -372,10 +372,12 @@ def test_render_dxf_does_not_non_uniformly_stretch_text_width(tmp_path):
     render_dxf(design, output_path)
 
     dxf = output_path.read_text(encoding="utf-8")
-    assert "\n41\n" in dxf
+    # 等比改造：名字按真实比例放置，DXF TEXT 不再带非等比 width factor（组码 41）。
+    assert "\n41\n" not in dxf
+    assert "\nHi\n" in dxf
 
 
-def test_render_svg_scales_single_line_text_to_fill_layout_box(tmp_path):
+def test_render_svg_does_not_stretch_single_line_text(tmp_path):
     output_path = tmp_path / "wide-text.svg"
     design = BirthFlowerDesign(
         text="Hi",
@@ -388,7 +390,8 @@ def test_render_svg_scales_single_line_text_to_fill_layout_box(tmp_path):
     render_svg(design, output_path)
 
     svg = output_path.read_text(encoding="utf-8")
-    assert 'transform="translate(1000 900) scale(' in svg
+    # 等比改造：单行名字按 1:1 比例放置，不再非等比 scale 填满框。
+    assert "scale(1 1)" in svg
     assert 'id="text-art"' in svg
 
 

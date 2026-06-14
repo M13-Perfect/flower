@@ -17,6 +17,7 @@ class CanvasTextItem:
         result = self.renderer.render_layer(self.layer)
         self.layer.render_text = result.render_text
         self.layer.glyph_overrides = result.glyph_overrides
+        self.layer.raw_text = self.layer.original_text
         self.layer.text = self.layer.original_text
         return result
 
@@ -50,4 +51,3 @@ class FloatingTextEditor:
     layer_id: str
     original_text: str
     window_id: int | None = None
-

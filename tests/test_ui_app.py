@@ -9,8 +9,7 @@ import pytest
 from config_store import AIProfile
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult, GlyphVariant
-from models import FlowerAsset, FontAsset, ImageLayer, TextLayer
-from models import FlowerAsset, FontAsset, TextLayer, add_text_layer
+from models import FlowerAsset, FontAsset, ImageLayer, TextLayer, add_image_layer, add_text_layer
 import ui_app as ui_app_module
 from ui_app import (
     APP_COLORS,
@@ -214,12 +213,12 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         assert app.preview_canvas.bind("<Button-2>")
         visible_texts = _widget_texts(root)
         assert "内容" in visible_texts
-        assert "区分大小写" in visible_texts
+        assert "大小写" in visible_texts
         assert "添加" not in visible_texts
         assert "画布宽" not in visible_texts
         assert "画布高" not in visible_texts
         assert "生产输出" in visible_texts
-        assert "人工确认并生成" in visible_texts
+        assert "生成" in visible_texts
         assert "姓名/文字" not in visible_texts
         assert "重新扫描" not in visible_texts
         assert "显示辅助框" not in visible_texts
@@ -576,7 +575,7 @@ def test_inline_text_editor_exit_removes_canvas_window_and_border():
         root.destroy()
 
 
-def test_case_sensitive_checkbox_controls_render_content_case():
+def test_text_case_toggle_controls_render_content_case():
     try:
         root = tk.Tk()
     except tk.TclError:
@@ -586,11 +585,20 @@ def test_case_sensitive_checkbox_controls_render_content_case():
         app = BirthFlowerApp(root)
         app.name_var.set("AbCd")
 
-        app.case_sensitive_var.set(True)
-        assert app._content_text_for_render() == "AbCd"
+        app.text_case_var.set("default")
+        assert app._content_text_for_render() == "AbCd"  # 默认不改大小写
 
-        app.case_sensitive_var.set(False)
-        assert app._content_text_for_render() == "abcd"
+        app.text_case_var.set("upper")
+        assert app._content_text_for_render() == "ABCD"  # 大写
+
+        app.text_case_var.set("lower")
+        assert app._content_text_for_render() == "abcd"  # 小写
+
+        # 切换按钮循环 默认→大写→小写,按钮文字同步
+        app.text_case_var.set("default")
+        app._cycle_text_case()
+        assert app.text_case_var.get() == "upper"
+        assert app.case_button.cget("text") == "大写"
     finally:
         root.destroy()
 
@@ -782,7 +790,7 @@ def test_flower_combo_change_while_image_layer_selected_replaces_only_current_im
         root.destroy()
 
 
-def test_programmatic_flower_refresh_and_parse_do_not_add_layers(monkeypatch, tmp_path):
+def test_parse_result_replaces_existing_material_and_text_layers(monkeypatch, tmp_path):
     try:
         root = tk.Tk()
     except tk.TclError:
@@ -790,20 +798,111 @@ def test_programmatic_flower_refresh_and_parse_do_not_add_layers(monkeypatch, tm
 
     try:
         app = BirthFlowerApp(root)
+        old_flower_path = tmp_path / "Old.svg"
         flower_path = tmp_path / "IrisMay.svg"
+        font_path = tmp_path / "Font2.ttf"
+        old_flower_path.write_text("<svg/>", encoding="utf-8")
         flower_path.write_text("<svg/>", encoding="utf-8")
+        font_path.write_bytes(b"font")
+        add_image_layer(app.document, old_flower_path, name="Old flower")
+        add_text_layer(app.document, "Old name", font_path=font_path)
         asset = FlowerAsset(name="Iris", month=5, flower=1, path=flower_path, display_name="Iris")
+        font = FontAsset(name="Font 2", index=2, path=font_path, font_design="Font 2")
         app.flower_dir_var.set(str(tmp_path))
         app.flower_assets = [asset]
+        app.font_assets = [font]
         warnings = []
         monkeypatch.setattr(ui_app_module.messagebox, "showwarning", lambda title, message: warnings.append((title, message)))
 
         app._refresh_flower_choices()
-        app._apply_parse_result(SimpleNamespace(text="Ivy", month=5, font=1, flower=1, warnings=[]))
+        app._refresh_font_choices()
+        app._apply_parse_result(SimpleNamespace(text="Ivy", month=5, font=2, flower=1, warnings=[]))
 
-        assert app.document.layers == []
+        assert len(app.document.layers) == 2
+        image_layer, text_layer = app.document.layers
+        assert isinstance(image_layer, ImageLayer)
+        assert isinstance(text_layer, TextLayer)
+        assert image_layer.path == flower_path
+        assert image_layer.name == "Iris"
+        assert text_layer.text == "Ivy"
+        assert text_layer.original_text == "Ivy"
+        assert text_layer.font_path == font_path
         assert app.pending_flower_asset_label == app._flower_label(asset)
         assert warnings == []
+    finally:
+        root.destroy()
+
+
+def test_parse_remark_reads_current_text_widget_content(monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        assert app.remark_text is not None
+        note = (
+            "Choose Your Birth Flower  : Sep - Aster\n"
+            "Font Design  : Font 3\n"
+            "Personalization  : Lacey"
+        )
+        app.remark_var.set("")
+        app.remark_text.delete("1.0", "end")
+        app.remark_text.insert("1.0", note)
+        calls = []
+
+        def fake_parser(remark, ai_config=None):
+            calls.append(remark)
+            return SimpleNamespace(text="Lacey", month=9, font=3, flower=1, warnings=[])
+
+        def run_immediately(_root, work, on_success, on_error):
+            try:
+                result = work()
+            except Exception as exc:
+                on_error(exc)
+            else:
+                on_success(result)
+            return SimpleNamespace()
+
+        monkeypatch.setattr(ui_app_module, "parse_order_remark_auto", fake_parser)
+        monkeypatch.setattr(ui_app_module, "run_background", run_immediately)
+        monkeypatch.setattr(ui_app_module.messagebox, "showwarning", lambda *_args, **_kwargs: None)
+
+        app.parse_remark()
+
+        assert calls == [note]
+        assert app.remark_var.get() == note
+        assert app.name_var.get() == "Lacey"
+        assert app.month_var.get() == "9"
+        assert app.font_var.get() == "3"
+        assert app.flower_var.get() == "1"
+    finally:
+        root.destroy()
+
+
+def test_import_remark_file_updates_visible_text_widget(monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        assert app.remark_text is not None
+        note = (
+            "Choose Your Birth Flower  : Sep - Aster\n"
+            "Font Design  : Font 3\n"
+            "Personalization  : Lacey"
+        )
+        expected = " ".join(note.split())
+        monkeypatch.setattr(ui_app_module.filedialog, "askopenfilename", lambda **_kwargs: "order.txt")
+        monkeypatch.setattr(ui_app_module, "load_order_remark_from_file", lambda _path: note)
+
+        app.import_remark_file()
+
+        assert app.remark_var.get() == expected
+        assert app.remark_text.get("1.0", "end-1c") == expected
     finally:
         root.destroy()
 
@@ -844,22 +943,10 @@ def test_import_remark_file_xlsx_runs_batch_flow(monkeypatch, tmp_path):
             return SimpleNamespace()
 
         monkeypatch.setattr(ui_app_module.filedialog, "askopenfilename", fake_askopenfilename)
-        monkeypatch.setattr(
-            ui_app_module,
-            "load_order_remark_from_file",
-            lambda _path: (_ for _ in ()).throw(AssertionError("legacy importer called")),
-        )
+        monkeypatch.setattr(ui_app_module, "load_order_remark_from_file", lambda _path: (_ for _ in ()).throw(AssertionError("legacy importer called")))
         monkeypatch.setattr(ui_app_module, "run_background", run_immediately)
-        monkeypatch.setattr(
-            ui_app_module,
-            "import_dianxiaomi_xlsx_batch",
-            lambda path: imported_paths.append(Path(path)) or result,
-        )
-        monkeypatch.setattr(
-            ui_app_module,
-            "show_xlsx_batch_import_summary",
-            lambda _root, value: captured_dialog.append(value),
-        )
+        monkeypatch.setattr(ui_app_module, "import_dianxiaomi_xlsx_batch", lambda path, layout=None: imported_paths.append(Path(path)) or result)
+        monkeypatch.setattr(ui_app_module, "show_xlsx_batch_import_summary", lambda _root, value: captured_dialog.append(value))
 
         app.import_remark_file()
 
@@ -869,6 +956,7 @@ def test_import_remark_file_xlsx_runs_batch_flow(monkeypatch, tmp_path):
         assert ui_app_module.summarize_xlsx_batch_result(result) == (2, 1, 1, report_path)
     finally:
         root.destroy()
+
 
 def test_font_settings_uses_one_choose_font_button():
     try:

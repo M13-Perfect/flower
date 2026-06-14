@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import importlib
 import json
-import logging
 import math
 import os
 import re
@@ -137,8 +136,10 @@ def export_dxf(
         translate(0.0, canvas_height * unit_scale),
         scale(unit_scale, -unit_scale),
     )
-    shapes = _collect_layer_shapes(document.get("layers", []), root_matrix, context)
-    if not any(shape.points for shape in shapes):
+    # 几何收集阶段已构建 ezdxf.path.Path,提前确认 ezdxf 可用,缺失时报友好错误。
+    _load_ezdxf()
+    paths = _collect_layer_paths(document.get("layers", []), root_matrix, context)
+    if not any(_path_has_geometry(item.path) for item in paths):
         raise DomainError(
             code="DXF_NO_GEOMETRY",
             message="DXF export did not produce any path geometry.",
@@ -147,7 +148,7 @@ def export_dxf(
         )
 
     metadata = _metadata(document, context.exported_at)
-    dxf_text = _write_dxf(shapes, context, metadata)
+    dxf_text = _write_dxf(paths, context, metadata)
     return DxfExportResult(
         file_name=(
             f"{_file_part(metadata['templateId'])}_"
@@ -200,12 +201,22 @@ def _validate_document(document: dict[str, Any]) -> None:
         )
 
 
-def _collect_layer_shapes(
+@dataclass
+class _LayerPath:
+    """一条导出几何;fill 标记文字闭合字形(信息性)。所有路径都按可编辑 SPLINE/POLYLINE 输出,
+    DXF 内不做填充——实心由 EzCad 导入后原生「填充」完成。"""
+
+    path: Any
+    fill: bool = False
+
+
+def _collect_layer_paths(
     layers: list[dict[str, Any]],
     parent_matrix: Matrix,
     context: ExportContext,
-) -> list[PathShape]:
-    result: list[PathShape] = []
+) -> list[_LayerPath]:
+    """收集所有可导出图层的几何为带"是否填充"标记的 Path 列表(已变换到 DXF 坐标系)。"""
+    result: list[_LayerPath] = []
     for layer in sorted(layers, key=lambda item: float(item.get("zIndex", 0))):
         if not _is_exportable(layer):
             continue
@@ -215,19 +226,24 @@ def _collect_layer_shapes(
             children = layer.get("children")
             if not isinstance(children, list):
                 raise _unsupported_layer(layer, "Group layer children must be an array.")
-            result.extend(_collect_layer_shapes(children, matrix, context))
+            result.extend(_collect_layer_paths(children, matrix, context))
         elif layer_type == "path":
             result.extend(
-                _parse_path_shapes(
+                _LayerPath(path)
+                for path in _parse_path_objects(
                     str(layer.get("pathData", "")),
                     matrix,
                     str(layer.get("id", "path")),
                 )
             )
         elif layer_type == "svg":
-            result.extend(_svg_layer_shapes(layer, matrix, context))
+            result.extend(_LayerPath(path) for path in _svg_layer_paths(layer, matrix, context))
         elif layer_type == "text":
-            result.extend(_text_layer_shapes(layer, matrix, context))
+            # 文字字形输出闭合 SPLINE/POLYLINE 轮廓;DXF 内不填充,实心由 EzCad 导入后原生填充完成。
+            result.extend(
+                _LayerPath(path, fill=True)
+                for path in _text_layer_paths(layer, matrix, context)
+            )
         else:
             raise _unsupported_layer(
                 layer,
@@ -252,11 +268,12 @@ def _unsupported_layer(layer: dict[str, Any], message: str) -> DomainError:
     )
 
 
-def _svg_layer_shapes(
+def _svg_render_context(
     layer: dict[str, Any],
     matrix: Matrix,
     context: ExportContext,
-) -> list[PathShape]:
+) -> tuple[ElementTree.Element, Matrix, str]:
+    """解析 SVG 图层、计算 viewBox→图层尺寸的视口矩阵,返回 (根, 基矩阵, 图层id)。"""
     svg_text = layer.get("inlineSvg")
     if not svg_text:
         svg_text = _read_svg_asset(layer)
@@ -281,12 +298,148 @@ def _svg_layer_shapes(
     x_scale = float(layer.get("width", view_box[2])) / view_box[2]
     y_scale = float(layer.get("height", view_box[3])) / view_box[3]
     viewport_matrix = compose(scale(x_scale, y_scale), translate(-view_box[0], -view_box[1]))
-    return _svg_element_shapes(
-        root,
-        compose(matrix, viewport_matrix),
-        str(layer.get("id", "svg")),
-        context,
-    )
+    return root, compose(matrix, viewport_matrix), str(layer.get("id", "svg"))
+
+
+def _svg_path_leaves(
+    element: ElementTree.Element,
+    matrix: Matrix,
+    layer_id: str,
+    context: ExportContext,
+) -> list[tuple[str, Matrix]]:
+    """递归走查 SVG 元素树,产出每个 <path> 的 (d, 累计矩阵),并记录不支持元素告警。
+
+    点集导出(PNG 预览)与 Path 导出(DXF)共用此走查,告警逻辑单一来源。
+    """
+    tag = _local_name(element.tag)
+    element_matrix = compose(matrix, _svg_transform(element.get("transform"), layer_id, context))
+    leaves: list[tuple[str, Matrix]] = []
+
+    if tag in UNSUPPORTED_SVG_TAGS:
+        context.warnings.append(
+            DxfWarning(
+                code="SVG_UNSUPPORTED_FEATURE",
+                message=f"Unsupported SVG element <{tag}> was ignored during DXF export.",
+                layer_id=layer_id,
+            )
+        )
+        return leaves
+
+    if "url(" in element.get("fill", ""):
+        context.warnings.append(
+            DxfWarning(
+                code="SVG_UNSUPPORTED_FEATURE",
+                message="SVG paint servers such as gradients are not preserved in DXF.",
+                layer_id=layer_id,
+            )
+        )
+
+    if tag == "path":
+        leaves.append((str(element.get("d", "")), element_matrix))
+    elif tag not in {"g", "svg"}:
+        context.warnings.append(
+            DxfWarning(
+                code="SVG_UNSUPPORTED_FEATURE",
+                message=f"Unsupported SVG element <{tag}> was ignored during DXF export.",
+                layer_id=layer_id,
+            )
+        )
+
+    for child in list(element):
+        leaves.extend(_svg_path_leaves(child, element_matrix, layer_id, context))
+    return leaves
+
+
+def _svg_layer_shapes(
+    layer: dict[str, Any],
+    matrix: Matrix,
+    context: ExportContext,
+) -> list[PathShape]:
+    """SVG 图层 → 扁平点集 PathShape(供 PNG 预览,不依赖 ezdxf)。"""
+    root, base_matrix, layer_id = _svg_render_context(layer, matrix, context)
+    shapes: list[PathShape] = []
+    for path_data, leaf_matrix in _svg_path_leaves(root, base_matrix, layer_id, context):
+        shapes.extend(_parse_path_shapes(path_data, leaf_matrix, layer_id))
+    return shapes
+
+
+def _svg_layer_paths(
+    layer: dict[str, Any],
+    matrix: Matrix,
+    context: ExportContext,
+) -> list[Any]:
+    """SVG 图层 → ezdxf.path.Path 列表(供 DXF 导出,贝塞尔不扁平)。"""
+    root, base_matrix, layer_id = _svg_render_context(layer, matrix, context)
+    paths: list[Any] = []
+    for path_data, leaf_matrix in _svg_path_leaves(root, base_matrix, layer_id, context):
+        paths.extend(_parse_path_objects(path_data, leaf_matrix, layer_id))
+    return paths
+
+
+def _svg_content_visual_bbox(
+    layer: dict[str, Any],
+    context: ExportContext,
+) -> tuple[float, float, float, float] | None:
+    """SVG 内容在其自身坐标系(viewBox 空间)里的可见墨迹 bbox:(x, y, w, h)。
+
+    用单位基矩阵走查 path(只保留 SVG 内部 transform),得到内容真实包围盒——
+    与桌面预览/PNG 用的"真实墨迹 bbox"同义,供 contain-fit 裁掉 viewBox 留白。"""
+    svg_text = layer.get("inlineSvg") or _read_svg_asset(layer)
+    try:
+        root = ElementTree.fromstring(str(svg_text))
+    except ElementTree.ParseError:
+        return None
+    layer_id = str(layer.get("id", "svg"))
+    xs: list[float] = []
+    ys: list[float] = []
+    for path_data, leaf_matrix in _svg_path_leaves(root, Matrix(), layer_id, context):
+        for shape in _parse_path_shapes(path_data, leaf_matrix, layer_id):
+            for x, y in shape.points:
+                xs.append(x)
+                ys.append(y)
+    if not xs or not ys:
+        return None
+    return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+
+def apply_svg_contain_fit(document: dict[str, Any]) -> None:
+    """把 SVG 图层从"viewBox 非等比拉满框"改成"等比 contain-fit + 居中 + 裁留白",原地改图层几何。
+
+    桌面端导出(desktop_export)对画布素材做了同样的 contain-fit,这里让批量/其它走 export_* 的路径
+    也得到一致结果:既不变形、也按真实墨迹裁掉留白。做法与桌面一致——保留声明 viewBox 不动,把 fit
+    折进图层的 x/y/width/height(因为 export 端按声明 viewBox 映射框):
+        layer_size  = fit.scale * 声明viewBox尺寸
+        layer_origin= 目标框居中量 + fit.scale * (声明viewBox原点 - 内容bbox原点)
+    """
+    context = ExportContext(document=document, target_units="px", exported_at="")
+    for layer in document.get("layers", []):
+        if not isinstance(layer, dict) or layer.get("type") != "svg":
+            continue
+        declared = layer.get("viewBox")
+        if not isinstance(declared, dict):
+            continue
+        view_x = float(declared.get("x", 0) or 0)
+        view_y = float(declared.get("y", 0) or 0)
+        view_w = float(declared.get("width", 0) or 0)
+        view_h = float(declared.get("height", 0) or 0)
+        content = _svg_content_visual_bbox(layer, context)
+        if content is None:
+            continue
+        content_x, content_y, content_w, content_h = content
+        target_w = float(layer.get("width", 0) or 0) * float(layer.get("scaleX", 1) or 1)
+        target_h = float(layer.get("height", 0) or 0) * float(layer.get("scaleY", 1) or 1)
+        target_x = float(layer.get("x", 0) or 0)
+        target_y = float(layer.get("y", 0) or 0)
+        if min(view_w, view_h, content_w, content_h, target_w, target_h) <= 0:
+            continue
+        scale = min(target_w / content_w, target_h / content_h)  # contain(等比)
+        layer["x"] = target_x + (target_w - content_w * scale) / 2 + scale * (view_x - content_x)
+        layer["y"] = target_y + (target_h - content_h * scale) / 2 + scale * (view_y - content_y)
+        layer["width"] = scale * view_w
+        layer["height"] = scale * view_h
+        layer["scaleX"] = 1.0
+        layer["scaleY"] = 1.0
+        # 声明 viewBox 保持不变(export 端会优先用它来映射框)。
 
 
 def _read_svg_asset(layer: dict[str, Any]) -> str:
@@ -309,57 +462,12 @@ def _read_svg_asset(layer: dict[str, Any]) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _svg_element_shapes(
-    element: ElementTree.Element,
-    matrix: Matrix,
-    layer_id: str,
-    context: ExportContext,
-) -> list[PathShape]:
-    tag = _local_name(element.tag)
-    element_matrix = compose(matrix, _svg_transform(element.get("transform"), layer_id, context))
-    shapes: list[PathShape] = []
-
-    if tag in UNSUPPORTED_SVG_TAGS:
-        context.warnings.append(
-            DxfWarning(
-                code="SVG_UNSUPPORTED_FEATURE",
-                message=f"Unsupported SVG element <{tag}> was ignored during DXF export.",
-                layer_id=layer_id,
-            )
-        )
-        return shapes
-
-    fill = element.get("fill", "")
-    if "url(" in fill:
-        context.warnings.append(
-            DxfWarning(
-                code="SVG_UNSUPPORTED_FEATURE",
-                message="SVG paint servers such as gradients are not preserved in DXF.",
-                layer_id=layer_id,
-            )
-        )
-
-    if tag == "path":
-        shapes.extend(_parse_path_shapes(str(element.get("d", "")), element_matrix, layer_id))
-    elif tag not in {"g", "svg"}:
-        context.warnings.append(
-            DxfWarning(
-                code="SVG_UNSUPPORTED_FEATURE",
-                message=f"Unsupported SVG element <{tag}> was ignored during DXF export.",
-                layer_id=layer_id,
-            )
-        )
-
-    for child in list(element):
-        shapes.extend(_svg_element_shapes(child, element_matrix, layer_id, context))
-    return shapes
-
-
-def _text_layer_shapes(
+def _text_layer_paths(
     layer: dict[str, Any],
     matrix: Matrix,
     context: ExportContext,
-) -> list[PathShape]:
+) -> list[Any]:
+    """文字图层 → ezdxf.path.Path 列表(字形闭合轮廓,贝塞尔不扁平,输出 SPLINE/POLYLINE)。"""
     font_path = _resolve_font_path(layer, context)
     try:
         from fontTools.ttLib import TTFont
@@ -390,22 +498,12 @@ def _text_layer_shapes(
     font_size = _positive_float(style.get("fontSize"), 1)
     line_height = _positive_float(style.get("lineHeight"), 1)
     letter_spacing = float(style.get("letterSpacing") or 0)
-    text = _text_with_glyph_overrides(layer)
-    lines = re.split(r"\r\n|\n|\r", text)
-    shapes: list[PathShape] = []
+    line_specs = _resolve_text_line_specs(
+        layer, style, cmap, hmtx, units_per_em, font_size, line_height, letter_spacing
+    )
+    paths: list[Any] = []
 
-    for line_index, line in enumerate(lines):
-        cursor = _aligned_text_offset(
-            line,
-            style,
-            layer,
-            cmap,
-            hmtx,
-            units_per_em,
-            font_size,
-            letter_spacing,
-        )
-        baseline_y = line_index * font_size * line_height
+    for line, cursor, baseline_y in line_specs:
         for char in line:
             codepoint = ord(char)
             glyph_name = cmap.get(codepoint)
@@ -416,24 +514,38 @@ def _text_layer_shapes(
                     details={"layerId": layer.get("id"), "codepoint": f"U+{codepoint:04X}"},
                     recoverable=True,
                 )
-            glyph_shapes = _glyph_shapes(
-                glyph_set[glyph_name],
-                glyph_name,
-                cursor,
-                baseline_y,
-                font_size / units_per_em,
-                matrix,
-                str(layer.get("id", "text")),
+            paths.extend(
+                _glyph_paths(
+                    glyph_set[glyph_name],
+                    glyph_name,
+                    cursor,
+                    baseline_y,
+                    font_size / units_per_em,
+                    matrix,
+                    str(layer.get("id", "text")),
+                )
             )
-            shapes.extend(glyph_shapes)
             advance = float((hmtx.get(glyph_name) or (units_per_em, 0))[0])
             cursor += advance * font_size / units_per_em + letter_spacing
-    return shapes
+    return paths
 
 
 def _resolve_font_path(layer: dict[str, Any], context: ExportContext) -> Path:
     raw_font_ref = layer.get("fontRef")
     font_ref: dict[str, Any] = raw_font_ref if isinstance(raw_font_ref, dict) else {}
+    # 显式字体路径(项目内相对路径)优先:桌面端可任选字体文件,需用所选字体导出。
+    # 经 _safe_project_path 校验,杜绝越界读取任意磁盘字体(API 也走这条入口)。
+    explicit_path = font_ref.get("path")
+    if explicit_path:
+        try:
+            candidate = _safe_project_path(str(explicit_path))
+        except DomainError:
+            candidate = None
+        if candidate is not None and candidate.is_file() and candidate.suffix.casefold() in {
+            ".ttf",
+            ".otf",
+        }:
+            return candidate
     asset_id = str(font_ref.get("assetId") or "")
     candidates: list[Path] = []
     option_no = _font_option_no(font_ref)
@@ -513,6 +625,73 @@ def _business_font_candidates(option_no: int) -> list[Path]:
     return []
 
 
+def _pt(point: Any) -> tuple[float, float]:
+    return (float(point[0]), float(point[1]))
+
+
+def _quadratic_segments(args: tuple[Any, ...]) -> list[tuple]:
+    """把一次 qCurveTo 还原成段。沿用既有 SVG 管线的近似:取首控制点 + 末端点,
+    成一段二次贝塞尔(忽略中间隐含锚点),保证 DXF 字形与 SVG 预览/金标完全一致。"""
+    raw_points = [_pt(point) for point in args if point is not None]
+    if not raw_points:
+        return []
+    return [("quad", raw_points[0], raw_points[-1])]
+
+
+def _glyph_contours(glyph: Any, glyph_name: str, layer_id: str) -> list[tuple]:
+    """把字形走查成中性轮廓:(起点, 段列表, 是否闭合),坐标在字体单位空间。
+
+    段为 ("line", end) | ("quad", ctrl, end) | ("cubic", c1, c2, end)。
+    SVG 导出(点集)与 DXF 导出(ezdxf Path)共用此走查器,避免重复解析。
+    """
+    from fontTools.pens.recordingPen import RecordingPen
+
+    pen = RecordingPen()
+    glyph.draw(pen)
+    contours: list[tuple] = []
+    start = (0.0, 0.0)
+    current = (0.0, 0.0)
+    segments: list[tuple] = []
+    open_contour = False
+
+    def flush(closed: bool) -> None:
+        nonlocal segments, open_contour
+        if open_contour and segments:
+            contours.append((start, segments, closed))
+        segments = []
+        open_contour = False
+
+    for command, args in pen.value:
+        if command == "moveTo":
+            flush(False)
+            start = current = _pt(args[0])
+            open_contour = True
+        elif command == "lineTo":
+            current = _pt(args[0])
+            segments.append(("line", current))
+        elif command == "qCurveTo":
+            for segment in _quadratic_segments(args):
+                segments.append(segment)
+                current = segment[-1]
+        elif command == "curveTo":
+            control_1, control_2, end = (_pt(value) for value in args)
+            segments.append(("cubic", control_1, control_2, end))
+            current = end
+        elif command == "closePath":
+            flush(True)
+        elif command == "endPath":
+            flush(False)
+        else:
+            raise DomainError(
+                code="GLYPH_UNSUPPORTED",
+                message="Font glyph contains unsupported outline commands.",
+                details={"layerId": layer_id, "glyphName": glyph_name, "command": command},
+                recoverable=True,
+            )
+    flush(False)
+    return contours
+
+
 def _glyph_shapes(
     glyph: Any,
     glyph_name: str,
@@ -522,15 +701,8 @@ def _glyph_shapes(
     matrix: Matrix,
     layer_id: str,
 ) -> list[PathShape]:
-    from fontTools.pens.recordingPen import RecordingPen
-
-    pen = RecordingPen()
-    glyph.draw(pen)
-    shapes: list[PathShape] = []
-    points: list[tuple[float, float]] = []
-    current = (0.0, 0.0)
-    start = (0.0, 0.0)
-    # 字形在字体单位空间扁平化,经 scale_factor 再经 matrix 变换到 mm。
+    """字形 → 扁平点集 PathShape(供 SVG 导出与 PNG 预览,不依赖 ezdxf)。"""
+    # 字形在字体单位空间扁平化,经 scale_factor 再经 matrix 变换到目标单位。
     tol = _local_tolerance(matrix, scale_factor)
 
     def convert(point: tuple[float, float]) -> tuple[float, float]:
@@ -538,49 +710,63 @@ def _glyph_shapes(
         y = baseline_y - point[1] * scale_factor
         return apply_matrix(matrix, (x, y))
 
-    for command, args in pen.value:
-        if command == "moveTo":
-            if points:
-                shapes.append(PathShape(layer_id=layer_id, points=points, closed=False))
-            current = args[0]
-            start = current
-            points = [convert(current)]
-        elif command == "lineTo":
-            current = args[0]
-            points.append(convert(current))
-        elif command == "qCurveTo":
-            raw_points = [point for point in args if point is not None]
-            if raw_points:
-                control = raw_points[0]
-                end = raw_points[-1]
-                for point in _flatten_quadratic(current, control, end, tol):
+    shapes: list[PathShape] = []
+    for start, segments, closed in _glyph_contours(glyph, glyph_name, layer_id):
+        points: list[tuple[float, float]] = [convert(start)]
+        previous = start
+        for segment in segments:
+            kind = segment[0]
+            if kind == "line":
+                points.append(convert(segment[1]))
+                previous = segment[1]
+            elif kind == "quad":
+                for point in _flatten_quadratic(previous, segment[1], segment[2], tol):
                     points.append(convert(point))
-                current = end
-        elif command == "curveTo":
-            control_1, control_2, end = args
-            for point in _flatten_cubic(current, control_1, control_2, end, tol):
-                points.append(convert(point))
-            current = end
-        elif command == "closePath":
-            if points and points[0] != points[-1]:
-                points.append(convert(start))
-            if points:
-                shapes.append(PathShape(layer_id=layer_id, points=points, closed=True))
-            points = []
-        elif command == "endPath":
-            if points:
-                shapes.append(PathShape(layer_id=layer_id, points=points, closed=False))
-            points = []
-        else:
-            raise DomainError(
-                code="GLYPH_UNSUPPORTED",
-                message="Font glyph contains unsupported outline commands.",
-                details={"layerId": layer_id, "glyphName": glyph_name, "command": command},
-                recoverable=True,
-            )
-    if points:
-        shapes.append(PathShape(layer_id=layer_id, points=points, closed=False))
+                previous = segment[2]
+            else:  # cubic
+                for point in _flatten_cubic(previous, segment[1], segment[2], segment[3], tol):
+                    points.append(convert(point))
+                previous = segment[3]
+        if closed and points and points[0] != points[-1]:
+            points.append(convert(start))
+        if len(points) >= 2:
+            shapes.append(PathShape(layer_id=layer_id, points=points, closed=closed))
     return shapes
+
+
+def _glyph_paths(
+    glyph: Any,
+    glyph_name: str,
+    cursor_x: float,
+    baseline_y: float,
+    scale_factor: float,
+    matrix: Matrix,
+    layer_id: str,
+) -> list[Any]:
+    """字形 → ezdxf.path.Path(供 DXF 导出,贝塞尔不扁平,输出 SPLINE)。"""
+    from ezdxf import path as ezpath
+
+    def convert(point: tuple[float, float]) -> tuple[float, float]:
+        x = cursor_x + point[0] * scale_factor
+        y = baseline_y - point[1] * scale_factor
+        return apply_matrix(matrix, (x, y))
+
+    paths: list[Any] = []
+    for start, segments, closed in _glyph_contours(glyph, glyph_name, layer_id):
+        path = ezpath.Path(convert(start))
+        for segment in segments:
+            kind = segment[0]
+            if kind == "line":
+                path.line_to(convert(segment[1]))
+            elif kind == "quad":
+                path.curve3_to(convert(segment[2]), convert(segment[1]))
+            else:  # cubic
+                path.curve4_to(convert(segment[3]), convert(segment[1]), convert(segment[2]))
+        if closed:
+            path.close()
+        if _path_has_geometry(path):
+            paths.append(path)
+    return paths
 
 
 def _parse_path_shapes(path_data: str, matrix: Matrix, layer_id: str) -> list[PathShape]:
@@ -685,6 +871,129 @@ def _parse_path_shapes(path_data: str, matrix: Matrix, layer_id: str) -> list[Pa
     if points:
         shapes.append(PathShape(layer_id=layer_id, points=points, closed=False))
     return [shape for shape in shapes if len(shape.points) >= 2]
+
+
+def _path_has_geometry(path: Any) -> bool:
+    return bool(path.has_lines or path.has_curves)
+
+
+def _parse_path_objects(path_data: str, matrix: Matrix, layer_id: str) -> list[Any]:
+    """解析 SVG path 的 d → ezdxf.path.Path 列表(贝塞尔不扁平,经 matrix 变换)。
+
+    每个子路径(M…Z 或 M…M)产出一个独立 Path;直线段保持直线、贝塞尔保持曲线,
+    输出阶段由 render_splines_and_polylines 转成 POLYLINE/SPLINE。
+    """
+    from ezdxf import path as ezpath
+
+    tokens = PATH_TOKEN_RE.findall(path_data)
+    paths: list[Any] = []
+    current: Any = None
+    cursor = (0.0, 0.0)
+    start = (0.0, 0.0)
+    index = 0
+    command = ""
+
+    def has_number() -> bool:
+        return index < len(tokens) and not re.fullmatch(r"[A-Za-z]", tokens[index])
+
+    def number() -> float:
+        nonlocal index
+        if index >= len(tokens) or re.fullmatch(r"[A-Za-z]", tokens[index]):
+            raise DomainError(
+                code="SVG_PARSE_FAILED",
+                message="SVG path data ended unexpectedly.",
+                details={"layerId": layer_id},
+                recoverable=True,
+            )
+        value = float(tokens[index])
+        index += 1
+        return value
+
+    def tx(point: tuple[float, float]) -> tuple[float, float]:
+        return apply_matrix(matrix, point)
+
+    def finish(close: bool) -> None:
+        nonlocal current
+        if current is not None and _path_has_geometry(current):
+            if close:
+                current.close()
+            paths.append(current)
+        current = None
+
+    def line(point: tuple[float, float]) -> None:
+        nonlocal current
+        if current is None:
+            current = ezpath.Path(tx(point))
+        else:
+            current.line_to(tx(point))
+
+    while index < len(tokens):
+        if re.fullmatch(r"[A-Za-z]", tokens[index]):
+            command = tokens[index]
+            index += 1
+        if not command:
+            break
+        absolute = command.isupper()
+        cmd = command.upper()
+
+        if cmd == "M":
+            first = True
+            while has_number():
+                x, y = number(), number()
+                cursor = (x, y) if absolute else (cursor[0] + x, cursor[1] + y)
+                if first:
+                    finish(False)
+                    start = cursor
+                    current = ezpath.Path(tx(cursor))
+                    first = False
+                else:
+                    line(cursor)
+            command = "L" if absolute else "l"
+        elif cmd == "L":
+            while has_number():
+                x, y = number(), number()
+                cursor = (x, y) if absolute else (cursor[0] + x, cursor[1] + y)
+                line(cursor)
+        elif cmd == "H":
+            while has_number():
+                x = number()
+                cursor = (x, cursor[1]) if absolute else (cursor[0] + x, cursor[1])
+                line(cursor)
+        elif cmd == "V":
+            while has_number():
+                y = number()
+                cursor = (cursor[0], y) if absolute else (cursor[0], cursor[1] + y)
+                line(cursor)
+        elif cmd == "Q":
+            while has_number():
+                control = _point(number(), number(), cursor, absolute)
+                end = _point(number(), number(), cursor, absolute)
+                if current is None:
+                    current = ezpath.Path(tx(cursor))
+                current.curve3_to(tx(end), tx(control))
+                cursor = end
+        elif cmd == "C":
+            while has_number():
+                control_1 = _point(number(), number(), cursor, absolute)
+                control_2 = _point(number(), number(), cursor, absolute)
+                end = _point(number(), number(), cursor, absolute)
+                if current is None:
+                    current = ezpath.Path(tx(cursor))
+                current.curve4_to(tx(end), tx(control_1), tx(control_2))
+                cursor = end
+        elif cmd == "Z":
+            finish(True)
+            cursor = start
+            command = ""
+        else:
+            raise DomainError(
+                code="SVG_UNSUPPORTED_PATH_COMMAND",
+                message=f"SVG path command {command!r} is not supported for DXF export.",
+                details={"layerId": layer_id, "command": command},
+                recoverable=True,
+            )
+    finish(False)
+    return paths
 
 
 def _point(x: float, y: float, cursor: tuple[float, float], absolute: bool) -> tuple[float, float]:
@@ -838,60 +1147,65 @@ def _flatten_cubic_fixed(
     return result
 
 
-# 雕花与刻字是同一道激光工序,所有几何用统一颜色,激光软件视为一次操作。
+# 雕花与刻字是同一道激光工序,所有几何放在同一图层、同一颜色,激光软件视为一次操作。
 _ENGRAVE_COLOR = 7  # ACI 7 = 黑/白中性色
-# 输出 DXF R12(AC1009)+ POLYLINE:EzCad2 等激光软件对 R2000+ 的 LWPOLYLINE
-# 支持不全,会导入成"可选中但改不动"的状态;R12+POLYLINE 才是原生可编辑曲线。
-# R12 不支持 $INSUNITS/线宽,EzCad 本就按 mm 解析坐标,不影响尺寸。
-_DXF_VERSION = "R12"
+# 单内容层:与标准样件一致(样件名"图层 1"),花/字同层同色;ezdxf 另自带 0/Defpoints。
+_ENGRAVE_LAYER = "图层 1"
+# 输出 DXF R2018(AC1032):EzCad2"选中改不动"的根因是实体类型(LWPOLYLINE 不可编辑),
+# 而非版本新旧——标准样件正是 R2018+SPLINE 且可编辑。R2018 还能找回 $INSUNITS(mm)。
+# 几何用 ezdxf.path.render_splines_and_polylines 输出:曲线→SPLINE,直线段→POLYLINE(均可编辑)。
+_DXF_VERSION = "R2018"
+# 把一条轮廓的连续贝塞尔段合并成一条 SPLINE,而非每段一条:
+# render_splines_and_polylines 默认只在切线连续(G1)处合并,会把字形/花朵的尖角处
+# 拆成成百上千条单段 SPLINE;调大 g1_tol 让相邻三次贝塞尔合并为一条三次 B 样条
+# (尖角由内部节点重数精确保留,几何不变),实体数大幅下降,贴近标准样件
+# (样件正是每轮廓一条 7/10/13… 控制点的 SPLINE)。
+_SPLINE_JOIN_G1_TOL = 1e9
 
 
-def _write_dxf(shapes: list[PathShape], context: ExportContext, metadata: dict[str, str]) -> str:
+def _write_dxf(
+    paths: list[_LayerPath],
+    context: ExportContext,
+    metadata: dict[str, str],
+) -> str:
     ezdxf = _load_ezdxf()
-    # 抑制 ezdxf 对 R12 不导出 $INSUNITS 的告警(EzCad 按 mm 解析坐标,无影响)。
-    ezdxf_logger = logging.getLogger("ezdxf")
-    previous_level = ezdxf_logger.level
-    ezdxf_logger.setLevel(logging.ERROR)
-    try:
-        doc = ezdxf.new(dxfversion=_DXF_VERSION)
-        doc.header["$INSUNITS"] = INSUNITS[context.target_units]
-        _write_dxf_metadata(doc, metadata)
-        modelspace = doc.modelspace()
+    from ezdxf import path as ezpath
 
-        # 先把用到的图层登记进图层表(原先实体引用未声明的图层,依赖 CAD 自动建层)。
-        declared: set[str] = set()
-        for shape in shapes:
-            layer_name = _dxf_layer_name(shape.layer_id)
-            if layer_name not in declared:
-                _ensure_layer(doc, layer_name)
-                declared.add(layer_name)
+    doc = ezdxf.new(dxfversion=_DXF_VERSION)
+    doc.header["$INSUNITS"] = INSUNITS[context.target_units]
+    _write_dxf_metadata(doc, metadata)
+    modelspace = doc.modelspace()
+    _ensure_layer(doc, _ENGRAVE_LAYER)
 
-        for shape in shapes:
-            cleaned = _dedupe_points(shape.points)
-            if len(cleaned) < 2:
-                continue
-            polyline = modelspace.add_polyline2d(
-                cleaned,
-                dxfattribs={"layer": _dxf_layer_name(shape.layer_id)},
-            )
-            if shape.closed and hasattr(polyline, "close"):
-                polyline.close(True)
+    renderable = [item for item in paths if _path_has_geometry(item.path)]
+    # 实体显式着色 ACI 7:EzCad 等激光软件对 BYLAYER(256)解析不全会显示成红色默认笔;
+    # 显式色 7 才稳定,并与标准样件同色(同一道工序)。颜色"变黑"放在 Ezcad 自动导入项目处理。
+    dxfattribs = {"layer": _ENGRAVE_LAYER, "color": _ENGRAVE_COLOR}
 
-        stream = StringIO()
-        doc.write(stream)
-        return stream.getvalue()
-    finally:
-        ezdxf_logger.setLevel(previous_level)
+    # 花朵/SVG 描边 + 文字闭合字形 → SPLINE/POLYLINE(EzCad 可编辑,非 LWPOLYLINE)。
+    # 文字只输出闭合轮廓、DXF 内不做填充:EzCad 不认 DXF HATCH,实心由 Ezcad 自动导入项目在导入后
+    # 用 EzCad 原生「填充」完成(与点黑色块同一步)。闭合轮廓正好可被 EzCad 选中填充。
+    outlines = [item.path for item in renderable]
+    if outlines:
+        ezpath.render_splines_and_polylines(
+            modelspace,
+            outlines,
+            g1_tol=_SPLINE_JOIN_G1_TOL,
+            dxfattribs=dxfattribs,
+        )
+
+    stream = StringIO()
+    doc.write(stream)
+    return stream.getvalue()
 
 
 def _ensure_layer(doc: Any, name: str) -> None:
     layers = getattr(doc, "layers", None)
     if layers is None or not hasattr(layers, "add"):
-        return  # 测试替身可能不实现图层表;实体仍带 layer 属性
+        return  # 防御:无图层表时实体仍带 layer 属性,CAD 自动建层
     try:
         if hasattr(layers, "has_entry") and layers.has_entry(name):
             return
-        # R12 图层只支持颜色;统一色 7 即可表达"同一道工序"。
         layers.add(name=name, color=_ENGRAVE_COLOR)
     except Exception:
         return  # 重名或 API 差异不应阻断导出
@@ -1107,6 +1421,54 @@ def _aligned_text_offset(
     return 0.0
 
 
+def _resolve_text_line_specs(
+    layer: dict[str, Any],
+    style: dict[str, Any],
+    cmap: dict[int, str],
+    hmtx: dict[str, Any],
+    units_per_em: float,
+    font_size: float,
+    line_height: float,
+    letter_spacing: float,
+) -> list[tuple[str, float, float]]:
+    """每行 (文本, 笔位 cursor, 基线 baseline_y)，box 本地像素。
+
+    桌面端把 text_layout.fit_text_box 的结果烘进 layer['textLayout']（lines + origins，
+    origins 为每行 anchor='ls' 的 (pen_x, baseline_y)）；此时直接复用，保证矢量导出与预览/PNG
+    逐字落点一致。无 textLayout（web 批量/金标）时回退到原“按对齐+行号”排版，行为不变。
+    """
+    box_layout = layer.get("textLayout")
+    if (
+        isinstance(box_layout, dict)
+        and isinstance(box_layout.get("lines"), list)
+        and isinstance(box_layout.get("origins"), list)
+    ):
+        lines = [str(item) for item in box_layout["lines"]]
+        origins = box_layout["origins"]
+        specs: list[tuple[str, float, float]] = []
+        for index, line in enumerate(lines):
+            origin = origins[index] if index < len(origins) else None
+            if isinstance(origin, (list, tuple)) and len(origin) == 2:
+                specs.append((line, float(origin[0]), float(origin[1])))
+            else:
+                cursor = _aligned_text_offset(
+                    line, style, layer, cmap, hmtx, units_per_em, font_size, letter_spacing
+                )
+                specs.append((line, cursor, index * font_size * line_height))
+        return specs
+    text = _text_with_glyph_overrides(layer)
+    return [
+        (
+            line,
+            _aligned_text_offset(
+                line, style, layer, cmap, hmtx, units_per_em, font_size, letter_spacing
+            ),
+            line_index * font_size * line_height,
+        )
+        for line_index, line in enumerate(re.split(r"\r\n|\n|\r", text))
+    ]
+
+
 def _positive_float(value: Any, fallback: float) -> float:
     try:
         number = float(value)
@@ -1164,19 +1526,6 @@ def _physical_size_mm(document: dict[str, Any]) -> tuple[float, float] | None:
     if height <= 0:
         height = width * canvas_height / canvas_width
     return width, height
-
-
-def _dedupe_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    result: list[tuple[float, float]] = []
-    for point in points:
-        rounded = (round(point[0], 6), round(point[1], 6))
-        if not result or rounded != result[-1]:
-            result.append(rounded)
-    return result
-
-
-def _dxf_layer_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_$-]+", "_", value).strip("_")[:255] or "layer"
 
 
 def _metadata(document: dict[str, Any], exported_at: str) -> dict[str, str]:

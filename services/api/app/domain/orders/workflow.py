@@ -12,6 +12,7 @@ from typing import Any
 
 from app.domain import DomainError
 from app.domain.exports import export_dxf, export_svg, rasterize_svg_to_png
+from app.domain.exports.dxf import apply_svg_contain_fit
 from app.domain.orders.batch_import import BatchImport, BatchOrderItem, import_batch_csv, import_orders
 from app.domain.orders.batch_store import (
     find_item,
@@ -222,6 +223,7 @@ def generate_batch_outputs(
     *,
     include_png: bool = False,
     exported_at: str | None = None,
+    layout: dict[str, Any] | None = None,
 ) -> BatchGenerateResult:
     batch = load_batch(batch_id)
     result_items: list[GeneratedBatchItem] = []
@@ -236,6 +238,8 @@ def generate_batch_outputs(
                 job_id=item.order_job_id,
             )
             _apply_review_font_ref(document, item)
+            if layout:
+                _apply_layout_overrides(document, layout)
             saved = _save_document_outputs(
                 item,
                 document,
@@ -288,6 +292,8 @@ def _save_document_outputs(
     include_png: bool,
     exported_at: str | None,
 ) -> SaveOutputsResult:
+    # 与桌面导出一致:先把 SVG 素材做等比 contain-fit+居中+裁留白,避免模板写死框导致的拉伸变形。
+    apply_svg_contain_fit(document)
     svg_export = export_svg(document, exported_at=exported_at)
     dxf_export = export_dxf(
         document,
@@ -307,6 +313,43 @@ def _save_document_outputs(
         png_data_url=png_data_url,
         dxf_content_base64=dxf_export.content_base64,
     )
+
+
+def _apply_layout_overrides(document: dict[str, Any], layout: dict[str, Any]) -> None:
+    """用桌面布局(birth_flower_config.json 的 layout_defaults)覆盖批量文档的画布与花朵/文字框,
+    让批量产出与桌面单单一致 —— 布局单一来源。覆盖后由 _save_document_outputs 的 contain-fit
+    把花朵等比塞进新的花朵框。layout 用普通 dict(键同 EngravingLayout),services/api 不依赖桌面类型。"""
+    canvas = document.setdefault("canvas", {})
+    if layout.get("canvas_width"):
+        canvas["width"] = int(layout["canvas_width"])
+    if layout.get("canvas_height"):
+        canvas["height"] = int(layout["canvas_height"])
+    # 画布比例变了:去掉写死的 heightMm,让导出按新画布比例派生 mm 高度(等比、不变形)。
+    export_settings = document.setdefault("exportSettings", {})
+    physical = export_settings.setdefault("physical", {})
+    if isinstance(physical, dict):
+        physical.pop("heightMm", None)
+    for layer in document.get("layers", []):
+        if not isinstance(layer, dict):
+            continue
+        if layer.get("type") == "svg":
+            layer["x"] = float(layout.get("flower_x", layer.get("x", 0)))
+            layer["y"] = float(layout.get("flower_y", layer.get("y", 0)))
+            layer["width"] = float(layout.get("flower_width", layer.get("width", 0)))
+            layer["height"] = float(layout.get("flower_height", layer.get("height", 0)))
+            layer["scaleX"] = 1.0
+            layer["scaleY"] = 1.0
+        elif layer.get("type") == "text":
+            layer["x"] = float(layout.get("text_x", layer.get("x", 0)))
+            layer["y"] = float(layout.get("text_y", layer.get("y", 0)))
+            layer["width"] = float(layout.get("text_width", layer.get("width", 0)))
+            layer["height"] = float(layout.get("text_height", layer.get("height", 0)))
+            style = layer.get("style")
+            if not isinstance(style, dict):
+                style = {}
+                layer["style"] = style
+            if layout.get("text_size"):
+                style["fontSize"] = float(layout["text_size"])
 
 
 def _mark_png_export(document: dict[str, Any], *, status: str, reason: str | None) -> None:

@@ -15,7 +15,7 @@
   },
   "exportSettings": {
     "physical": {
-      "widthMm": 80
+      "widthMm": 80.0
     },
     "dxf": {
       "textMode": "paths",

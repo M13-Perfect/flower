@@ -38,11 +38,12 @@ class BatchGenerateResult:
     review_csv_path: Path
 
 
-def generate_batch(batch_id: str) -> BatchGenerateResult:
+def generate_batch(batch_id: str, *, layout: dict | None = None) -> BatchGenerateResult:
     batch = parse_order_batch(batch_id)
     # 桌面按钮路径与 CLI 同规则:栅格化可用即产 PNG,不可用降级跳过。
+    # layout(桌面 layout_defaults)非空时,批量按桌面布局产出(单一布局来源)。
     workflow_result = generate_batch_outputs(
-        batch.batch_id, include_png=png_rasterizer_available()
+        batch.batch_id, include_png=png_rasterizer_available(), layout=layout
     )
     generated_items, report_path, review_csv_path = write_reports_for_workflow_result(
         batch.batch_id, workflow_result

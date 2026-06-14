@@ -3,7 +3,112 @@
     "enabled": true,
     "apply_mode": "replace_last_letter",
     "description": "Font 4 ending swash glyphs",
-    "letters": {}
+    "letters": {
+      "a": {
+        "codepoint": "U+E034",
+        "label": "a heart ending glyph"
+      },
+      "b": {
+        "codepoint": "U+E035",
+        "label": "b heart ending glyph"
+      },
+      "c": {
+        "codepoint": "U+E036",
+        "label": "c heart ending glyph"
+      },
+      "d": {
+        "codepoint": "U+E037",
+        "label": "d heart ending glyph"
+      },
+      "e": {
+        "codepoint": "U+E038",
+        "label": "e heart ending glyph"
+      },
+      "f": {
+        "codepoint": "U+E039",
+        "label": "f heart ending glyph"
+      },
+      "g": {
+        "codepoint": "U+E03A",
+        "label": "g heart ending glyph"
+      },
+      "h": {
+        "codepoint": "U+E03B",
+        "label": "h heart ending glyph"
+      },
+      "i": {
+        "codepoint": "U+E03C",
+        "label": "i heart ending glyph"
+      },
+      "j": {
+        "codepoint": "U+E03D",
+        "label": "j heart ending glyph"
+      },
+      "k": {
+        "codepoint": "U+E03E",
+        "label": "k heart ending glyph"
+      },
+      "l": {
+        "codepoint": "U+E03F",
+        "label": "l heart ending glyph"
+      },
+      "m": {
+        "codepoint": "U+E040",
+        "label": "m heart ending glyph"
+      },
+      "n": {
+        "codepoint": "U+E041",
+        "label": "n heart ending glyph"
+      },
+      "o": {
+        "codepoint": "U+E042",
+        "label": "o heart ending glyph"
+      },
+      "p": {
+        "codepoint": "U+E043",
+        "label": "p heart ending glyph"
+      },
+      "q": {
+        "codepoint": "U+E044",
+        "label": "q heart ending glyph"
+      },
+      "r": {
+        "codepoint": "U+E045",
+        "label": "r heart ending glyph"
+      },
+      "s": {
+        "codepoint": "U+E046",
+        "label": "s heart ending glyph"
+      },
+      "t": {
+        "codepoint": "U+E047",
+        "label": "t heart ending glyph"
+      },
+      "u": {
+        "codepoint": "U+E048",
+        "label": "u heart ending glyph"
+      },
+      "v": {
+        "codepoint": "U+E049",
+        "label": "v heart ending glyph"
+      },
+      "w": {
+        "codepoint": "U+E04A",
+        "label": "w heart ending glyph"
+      },
+      "x": {
+        "codepoint": "U+E04B",
+        "label": "x heart ending glyph"
+      },
+      "y": {
+        "codepoint": "U+E04C",
+        "label": "y heart ending glyph"
+      },
+      "z": {
+        "codepoint": "U+E04D",
+        "label": "z heart ending glyph"
+      }
+    }
   },
   "Font 2": {
     "enabled": true,

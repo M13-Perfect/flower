@@ -11,10 +11,10 @@ from glyph_service import (
     candidate_to_variant,
     filter_glyph_candidates,
     font_contains_codepoint,
-    glyph_candidate_to_override,
     recommended_glyph_variants,
     int_to_codepoint,
     normalize_codepoint,
+    codepoint_to_char,
     render_glyph_thumbnail,
     scan_font_glyphs,
 )
@@ -431,6 +431,7 @@ def _select_grid_glyph(
 def _use_manual_codepoint(app, manual_codepoint: tk.StringVar, selected_codepoint: tk.StringVar) -> None:
     try:
         codepoint = normalize_codepoint(manual_codepoint.get())
+        codepoint_to_char(codepoint)
         _warn_if_codepoint_unverified(app, codepoint)
     except (RuntimeError, ValueError) as exc:
         messagebox.showerror("字形码位", str(exc))
@@ -442,6 +443,7 @@ def _use_manual_codepoint(app, manual_codepoint: tk.StringVar, selected_codepoin
 def _bind_selected(app, letter: str, codepoint: str) -> None:
     try:
         clean_codepoint = normalize_codepoint(codepoint)
+        codepoint_to_char(clean_codepoint)
         _warn_if_codepoint_unverified(app, clean_codepoint)
         app.glyph_config.set_glyph_for_letter(app._font_design_label(), letter, clean_codepoint, f"{letter} ending glyph")
         app.glyph_config.save()
@@ -475,7 +477,9 @@ def _bind_batch(app, batch_glyphs: tk.StringVar) -> None:
         return
     try:
         for letter, glyph in zip(LETTERS, glyphs, strict=True):
-            app.glyph_config.set_glyph_for_letter(app._font_design_label(), letter, int_to_codepoint(ord(glyph)), f"{letter} ending glyph")
+            codepoint = int_to_codepoint(ord(glyph))
+            codepoint_to_char(codepoint)
+            app.glyph_config.set_glyph_for_letter(app._font_design_label(), letter, codepoint, f"{letter} ending glyph")
         app.glyph_config.save()
     except ValueError as exc:
         messagebox.showerror("批量绑定失败", str(exc))
