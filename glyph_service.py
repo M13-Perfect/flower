@@ -10,6 +10,7 @@ import re
 import sys
 import unicodedata
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -34,6 +35,12 @@ RUNTIME_DEPENDENCIES = (
     ("freetype-py", "freetype"),
 )
 
+# Font 4 常用心形结尾字形：按 a-z 顺序连续映射到 PUA E034-E04D。
+FONT4_DEFAULT_ENDING_GLYPHS = {
+    letter: f"U+{0xE034 + index:04X}"
+    for index, letter in enumerate("abcdefghijklmnopqrstuvwxyz")
+}
+
 # Font 2 常用结尾字形：截图中的 a.005-z.005，按 a-z 顺序连续映射到 PUA E068-E081。
 FONT2_DEFAULT_ENDING_GLYPHS = {
     letter: f"U+{0xE068 + index:04X}"
@@ -49,6 +56,7 @@ class GlyphVariant:
     replacement_char: str
     codepoint: str
     glyph_name: str
+    glyph_id: int
     font_id: str
     font_path: str
     display_name: str
@@ -68,11 +76,17 @@ class GlyphVariant:
         raw_codepoint = str(value.get("codepoint") or value.get("unicode") or "").strip()
         clean_codepoint = _codepoint_hex(raw_codepoint)
         replacement_char = str(value.get("replacement_char") or value.get("char") or "")
-        if not replacement_char and clean_codepoint:
+        if clean_codepoint:
             try:
-                replacement_char = chr(int(clean_codepoint, 16))
-            except (TypeError, ValueError):
-                LOGGER.warning("GlyphVariant codepoint 无效：%s", raw_codepoint)
+                replacement_char = get_safe_glyph_unicode({"unicode": clean_codepoint}) or ""
+            except ValueError as exc:
+                LOGGER.warning("GlyphVariant codepoint unsafe: %s reason=%s", raw_codepoint, exc)
+                replacement_char = ""
+        elif replacement_char:
+            try:
+                replacement_char = _safe_glyph_char(replacement_char, label="replacement_char")
+            except ValueError as exc:
+                LOGGER.warning("GlyphVariant replacement_char unsafe: %r reason=%s", replacement_char, exc)
                 replacement_char = ""
         usage = str(value.get("usage") or "any").strip().casefold()
         if usage not in VALID_GLYPH_USAGES:
@@ -100,6 +114,7 @@ class GlyphVariant:
             replacement_char=replacement_char,
             codepoint=clean_codepoint,
             glyph_name=str(value.get("glyph_name") or (f"uni{clean_codepoint}" if clean_codepoint else "")),
+            glyph_id=_safe_int(value.get("glyph_id"), -1),
             font_id=str(value.get("font_id") or font_id),
             font_path=str(value.get("font_path") or font_path),
             display_name=str(value.get("display_name") or value.get("glyph_name") or clean_codepoint or replacement_char),
@@ -119,6 +134,7 @@ class GlyphVariant:
             "replacement_char": self.replacement_char,
             "codepoint": self.codepoint,
             "glyph_name": self.glyph_name,
+            "glyph_id": self.glyph_id,
             "font_id": self.font_id,
             "font_path": self.font_path,
             "usage": self.usage,
@@ -194,6 +210,72 @@ class GlyphCandidate:
     @property
     def preview_text(self) -> str:
         return self.char or self.glyph_name
+
+
+def debug_text_codepoints(label: str, text: str) -> None:
+    """调试文本码位；只在 DEBUG 日志打开时输出，避免正常导出刷屏。"""
+    if not LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    value = "" if text is None else str(text)
+    LOGGER.debug("%s repr=%r", label, value)
+    for index, char in enumerate(value):
+        codepoint = ord(char)
+        LOGGER.debug(
+            "%s[%s] repr=%r U+%04X category=%s name=%s",
+            label,
+            index,
+            char,
+            codepoint,
+            unicodedata.category(char),
+            unicodedata.name(char, "<unnamed>"),
+        )
+
+
+def get_safe_glyph_unicode(glyph_info: Any) -> str | None:
+    """只从真实 Unicode/codepoint 字段取字符；绝不把 glyph_id/GID 当 Unicode。"""
+    raw_value = _glyph_info_value(glyph_info, "unicode")
+    if raw_value is None:
+        raw_value = _glyph_info_value(glyph_info, "codepoint")
+    if raw_value is None:
+        return None
+    return _safe_glyph_char(raw_value, label="glyph unicode")
+
+
+def _glyph_info_value(glyph_info: Any, key: str) -> Any:
+    if isinstance(glyph_info, Mapping):
+        return glyph_info.get(key)
+    return getattr(glyph_info, key, None)
+
+
+def _safe_glyph_char(value: Any, *, label: str) -> str:
+    if isinstance(value, int):
+        if not 0 <= value <= 0x10FFFF:
+            raise ValueError(f"{label} 超出 Unicode 范围：{value}")
+        return _reject_control_char(chr(value), label=label)
+    raw_text = str(value or "")
+    if len(raw_text) == 1:
+        return _reject_control_char(raw_text, label=label)
+    text = raw_text.strip()
+    if not text:
+        raise ValueError(f"{label} 为空")
+    if len(text) == 1:
+        return _reject_control_char(text, label=label)
+    match = re.fullmatch(r"(?:U\+|0X)?([0-9A-Fa-f]{4,6})", text)
+    if not match:
+        raise ValueError(f"{label} 格式无效：{value}")
+    code = int(match.group(1), 16)
+    if not 0 <= code <= 0x10FFFF:
+        raise ValueError(f"{label} 超出 Unicode 范围：{value}")
+    return _reject_control_char(chr(code), label=label)
+
+
+def _reject_control_char(char: str, *, label: str) -> str:
+    if len(char) != 1:
+        raise ValueError(f"{label} 必须是单个 Unicode 字符")
+    category = unicodedata.category(char)
+    if category == "Cc":
+        raise ValueError(f"{label} 是 Unicode control character：U+{ord(char):04X}")
+    return char
 
 
 def check_runtime_dependencies(import_checker: Callable[[str], bool] | None = None) -> RuntimeDependencyStatus:
@@ -312,7 +394,13 @@ def default_glyph_map_payload() -> dict[str, Any]:
             "enabled": True,
             "apply_mode": "replace_last_letter",
             "description": "Font 4 ending swash glyphs",
-            "letters": {},
+            "letters": {
+                letter: {
+                    "codepoint": codepoint,
+                    "label": f"{letter} heart ending glyph",
+                }
+                for letter, codepoint in FONT4_DEFAULT_ENDING_GLYPHS.items()
+            },
         },
         "Font 2": {
             "enabled": True,
@@ -439,6 +527,8 @@ def scan_font_glyphs(font_path: str | Path, pua_only: bool = False, limit: int |
     for code, glyph_name_value in sorted(best_cmap.items()):
         if not 0 <= int(code) <= 0x10FFFF:
             continue
+        if not _is_displayable_glyph_code(int(code)):
+            continue
         glyph_name = str(glyph_name_value)
         if glyph_name not in glyph_set:
             continue
@@ -537,6 +627,7 @@ def glyph_candidate_to_override(glyph: GlyphCandidate, original_char: str) -> di
         "glyph_id": glyph.glyph_id,
         "codepoint": glyph.unicode,
         "char": glyph.char,
+        "unicode_char": glyph.char,
         "is_pua": glyph.is_pua,
         "is_mapped": glyph.is_mapped,
     }
@@ -583,12 +674,98 @@ def apply_glyph_overrides(
             "glyph_id": glyph_id,
             "codepoint": clean_codepoint,
             "char": glyph_char,
+            "unicode_char": glyph_char,
             "is_pua": is_pua,
             "is_mapped": clean_codepoint is not None,
         }
         if clean_codepoint is None:
             reasons.append(f"{glyph_name} 可预览但暂不支持导出；后续需要通过 glyph outline 转路径。")
     return "".join(chars), clean_overrides, reasons
+
+
+def apply_glyph_to_text_layer(
+    layer: Any,
+    index: int,
+    glyph_info: Any,
+) -> tuple[str, dict[int, dict[str, Any]], list[str]]:
+    """统一的按字符字形应用入口；只保存覆盖规则，不破坏 raw/original 文本。"""
+    raw_text = str(
+        getattr(layer, "raw_text", "")
+        or getattr(layer, "original_text", "")
+        or getattr(layer, "text", "")
+        or ""
+    )
+    try:
+        selected_index = int(index)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("请选择当前文字中的有效字符。") from exc
+    if selected_index < 0 or selected_index >= len(raw_text):
+        raise ValueError("请选择当前文字中的有效字符。")
+
+    selected_char = _glyph_info_value(glyph_info, "selected_char")
+    if selected_char is None:
+        selected_char = _glyph_info_value(glyph_info, "base_char")
+    if selected_char is None:
+        selected_char = _glyph_info_value(glyph_info, "original_char")
+    if selected_char:
+        expected = str(selected_char)[:1]
+        if raw_text[selected_index] != expected:
+            debug_text_codepoints("glyph-index-mismatch.raw_text", raw_text)
+            raise ValueError(
+                f"索引错位：raw_text[{selected_index}]={raw_text[selected_index]!r}，"
+                f"选中字符={expected!r}。"
+            )
+
+    unicode_char = get_safe_glyph_unicode(glyph_info)
+    if unicode_char is None:
+        raise ValueError("当前字形没有 Unicode 映射，不能用文本方式应用，请使用轮廓渲染模式。")
+
+    glyph_id = _safe_int(_glyph_info_value(glyph_info, "glyph_id"), -1)
+    glyph_name = str(_glyph_info_value(glyph_info, "glyph_name") or f"uni{ord(unicode_char):04X}")
+    font_path = str(_glyph_info_value(glyph_info, "font_path") or getattr(layer, "font_path", "") or "")
+    codepoint = f"{ord(unicode_char):04X}"
+    base_char = raw_text[selected_index]
+    source = str(_glyph_info_value(glyph_info, "source") or "manual")
+    if source == "cmap":
+        source = "manual"
+
+    overrides = {
+        int(k): dict(v)
+        for k, v in (getattr(layer, "glyph_overrides", {}) or {}).items()
+    }
+    overrides[selected_index] = {
+        "index": selected_index,
+        "base_char": base_char,
+        "original_char": base_char,
+        "glyph_name": glyph_name,
+        "glyph_id": glyph_id,
+        "unicode_char": unicode_char,
+        "unicode": int_to_codepoint(ord(unicode_char)),
+        "replacement_char": unicode_char,
+        "char": unicode_char,
+        "codepoint": codepoint,
+        "font_path": font_path,
+        "font_id": str(_glyph_info_value(glyph_info, "font_id") or ""),
+        "usage": str(_glyph_info_value(glyph_info, "usage") or "any"),
+        "source": source,
+        "is_pua": is_pua_codepoint(ord(unicode_char)),
+        "is_mapped": True,
+    }
+
+    setattr(layer, "raw_text", raw_text)
+    setattr(layer, "original_text", raw_text)
+    setattr(layer, "text", raw_text)
+    render_text, clean_overrides, warnings = rebuild_render_text(
+        raw_text,
+        overrides,
+        font_path=getattr(layer, "font_path", None),
+        text_layer_id=str(getattr(layer, "id", "")),
+    )
+    setattr(layer, "render_text", render_text)
+    setattr(layer, "glyph_overrides", clean_overrides)
+    debug_text_codepoints("apply_glyph.raw_text", raw_text)
+    debug_text_codepoints("apply_glyph.render_text", render_text)
+    return render_text, clean_overrides, warnings
 
 
 def font_contains_codepoint(font_path: str | Path, codepoint: str) -> bool:
@@ -623,7 +800,7 @@ def normalize_codepoint(value: str) -> str:
 
 
 def codepoint_to_char(codepoint: str) -> str:
-    return chr(int(normalize_codepoint(codepoint)[2:], 16))
+    return _safe_glyph_char(normalize_codepoint(codepoint), label="codepoint")
 
 
 def int_to_codepoint(value: int) -> str:
@@ -734,7 +911,10 @@ def _merged_default_payload(payload: dict[str, Any]) -> dict[str, Any]:
         target["description"] = str(policy.get("description", target.get("description", "")))
         letters = policy.get("letters", {})
         if isinstance(letters, dict):
-            target_letters: dict[str, dict[str, str]] = {}
+            target_letters = target.get("letters")
+            if not isinstance(target_letters, dict):
+                target_letters = {}
+                target["letters"] = target_letters
             for letter, entry in letters.items():
                 if not isinstance(entry, dict):
                     continue
@@ -747,7 +927,6 @@ def _merged_default_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         }
                 except ValueError:
                     continue
-            target["letters"] = target_letters
     return merged
 
 
@@ -879,6 +1058,18 @@ class GlyphBindingsConfig:
 def default_glyph_bindings_payload() -> dict[str, Any]:
     return {
         "fonts": {
+            "Font 4": {
+                "font_path": "",
+                "bindings": {
+                    codepoint.removeprefix("U+"): {
+                        "base_char": letter,
+                        "usage": "end",
+                        "display_name": f"{letter} heart ending glyph",
+                        "glyph_name": f"uni{codepoint.removeprefix('U+')}",
+                    }
+                    for letter, codepoint in FONT4_DEFAULT_ENDING_GLYPHS.items()
+                },
+            },
             "Font 2": {
                 "font_path": "",
                 "bindings": {
@@ -926,7 +1117,13 @@ def default_glyph_rules_payload() -> dict[str, Any]:
     return {
         "enabled": True,
         "fonts": {
-            "Font 4": {"end_char_rules": {}, "start_char_rules": {}},
+            "Font 4": {
+                "end_char_rules": {
+                    letter: codepoint.removeprefix("U+")
+                    for letter, codepoint in FONT4_DEFAULT_ENDING_GLYPHS.items()
+                },
+                "start_char_rules": {},
+            },
             "Font 2": {
                 "end_char_rules": {
                     letter: codepoint.removeprefix("U+")
@@ -978,6 +1175,8 @@ def build_glyph_catalog(font_path: str | Path, font_id: str = "", bindings: Glyp
     hmtx = font["hmtx"].metrics if "hmtx" in font else {}
     binding_config = bindings or GlyphBindingsConfig.load()
     for code, glyph_name in sorted(cmap.items()):
+        if not _is_displayable_glyph_code(int(code)):
+            continue
         code_hex = f"{int(code):04X}"
         char = chr(int(code))
         glyph = glyph_set.get(glyph_name) if hasattr(glyph_set, "get") else None
@@ -1055,11 +1254,34 @@ def rebuild_render_text(original_text: str, glyph_overrides: Mapping[int, Mappin
             continue
         replacement = str(raw.get("replacement_char") or raw.get("char") or "")
         codepoint = _codepoint_hex(str(raw.get("codepoint") or raw.get("unicode") or ""))
-        if not replacement and codepoint:
+        if codepoint:
             try:
-                replacement = chr(int(codepoint, 16))
-            except (TypeError, ValueError):
-                replacement = ""
+                replacement = get_safe_glyph_unicode({"unicode": codepoint}) or ""
+            except ValueError as exc:
+                warnings.append(f"位置 {index} 字形 Unicode 不安全：{exc}，已使用原字符。")
+                LOGGER.warning(
+                    "字形替换失败：text_layer_id=%s original_text=%r index=%s codepoint=%s reason=%s",
+                    text_layer_id,
+                    text,
+                    index,
+                    codepoint,
+                    exc,
+                )
+                continue
+        elif replacement:
+            try:
+                replacement = _safe_glyph_char(replacement, label="replacement_char")
+            except ValueError as exc:
+                warnings.append(f"位置 {index} 字形 replacement_char 不安全：{exc}，已使用原字符。")
+                LOGGER.warning(
+                    "字形替换失败：text_layer_id=%s original_text=%r index=%s replacement_char=%r reason=%s",
+                    text_layer_id,
+                    text,
+                    index,
+                    raw.get("replacement_char"),
+                    exc,
+                )
+                continue
         if not replacement:
             warnings.append(f"位置 {index} replacement_char 无效，已使用原字符。")
             LOGGER.warning("字形替换失败：text_layer_id=%s original_text=%r index=%s base_char=%r replacement_char=%r", text_layer_id, text, index, base_char, raw.get("replacement_char"))
@@ -1082,7 +1304,9 @@ def rebuild_render_text(original_text: str, glyph_overrides: Mapping[int, Mappin
             "replacement_char": replacement,
             "char": replacement,
             "codepoint": codepoint,
+            "unicode_char": replacement,
             "glyph_name": str(raw.get("glyph_name") or (f"uni{codepoint}" if codepoint else "glyph")),
+            "glyph_id": _safe_int(raw.get("glyph_id"), -1),
             "font_id": str(raw.get("font_id") or ""),
             "font_path": str(raw.get("font_path") or font_path or ""),
             "usage": str(raw.get("usage") or "any") if str(raw.get("usage") or "any") in VALID_GLYPH_USAGES else "any",
@@ -1097,13 +1321,16 @@ def apply_glyph_variant_to_text(original_text: str, glyph_overrides: Mapping[int
     if index < 0 or index >= len(original_text or ""):
         LOGGER.warning("字形替换失败：text_layer_id=%s original_text=%r index=%s glyph_name=%s", text_layer_id, original_text, index, variant.glyph_name)
         raise ValueError("请选择当前文字中的有效字符。")
-    overrides = {int(k): dict(v) for k, v in (glyph_overrides or {}).items()}
-    base_char = original_text[index]
-    override = variant.to_override(index, source=variant.source if variant.source != "cmap" else "manual")
-    override["base_char"] = base_char
-    override["original_char"] = base_char
-    overrides[index] = override
-    return rebuild_render_text(original_text, overrides, font_path=font_path, text_layer_id=text_layer_id)
+    layer = SimpleNamespace(
+        raw_text=original_text or "",
+        original_text=original_text or "",
+        text=original_text or "",
+        render_text=original_text or "",
+        glyph_overrides={int(k): dict(v) for k, v in (glyph_overrides or {}).items()},
+        font_path=font_path,
+        id=text_layer_id,
+    )
+    return apply_glyph_to_text_layer(layer, index, variant)
 
 
 def remove_glyph_override(original_text: str, glyph_overrides: Mapping[int, Mapping[str, Any]] | None, index: int, *, font_path: str | Path | None = None, text_layer_id: str = "") -> tuple[str, dict[int, dict[str, Any]], list[str]]:
@@ -1146,14 +1373,27 @@ def apply_automatic_glyph_rules(original_text: str, font_id: str, font_path: str
                 warnings.append(f"自动字形 {clean_code} 校验失败")
                 LOGGER.warning("自动字形规则失败：order_id=%s font_id=%s rule=%s reason=%s", order_id, font_id, rule_name, exc)
                 return
+        try:
+            replacement_char = codepoint_to_char(clean_code)
+        except ValueError as exc:
+            warnings.append(f"自动字形 {clean_code} 不安全")
+            LOGGER.warning(
+                "自动字形规则失败：order_id=%s font_id=%s rule=%s reason=%s",
+                order_id,
+                font_id,
+                rule_name,
+                exc,
+            )
+            return
         base_char = original_text[index]
         overrides[index] = {
             "index": index,
             "base_char": base_char,
             "original_char": base_char,
-            "replacement_char": chr(int(clean_code, 16)),
-            "char": chr(int(clean_code, 16)),
+            "replacement_char": replacement_char,
+            "char": replacement_char,
             "codepoint": clean_code,
+            "unicode_char": replacement_char,
             "glyph_name": f"uni{clean_code}",
             "font_id": _font_key(font_id),
             "font_path": str(font_path or ""),
@@ -1189,6 +1429,7 @@ def candidate_to_variant(glyph: GlyphCandidate, *, font_id: str, font_path: str 
         "replacement_char": glyph.char or (codepoint_to_char(glyph.unicode) if glyph.unicode else ""),
         "codepoint": glyph.unicode or "",
         "glyph_name": glyph.glyph_name,
+        "glyph_id": glyph.glyph_id,
         "font_id": font_id,
         "font_path": str(font_path),
         "display_name": glyph.glyph_name,

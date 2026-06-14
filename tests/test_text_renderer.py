@@ -65,7 +65,7 @@ def test_text_renderer_rerenders_after_text_changes():
     assert first.image is not second.image
 
 
-def test_text_renderer_fills_text_box_with_real_ink_bounds():
+def test_text_renderer_centers_ink_without_stretching_text_box():
     layer = TextLayer(
         text="Hi",
         width=240,
@@ -79,11 +79,16 @@ def test_text_renderer_fills_text_box_with_real_ink_bounds():
 
     result = TextRenderer().render_layer(layer)
 
+    assert result.image.size == (240, 80)
     assert result.ink_bbox is not None
-    assert result.ink_bbox.left <= 1
-    assert result.ink_bbox.top <= 1
-    assert result.ink_bbox.right >= 239
-    assert result.ink_bbox.bottom >= 79
+    ink = result.ink_bbox
+    # 等比改造：墨迹不再拉伸铺满四边，而是按真实比例居中、四周留白。
+    assert ink.left > 1
+    assert ink.right < 239
+    assert ink.top > 1
+    assert ink.bottom < 79
+    # 水平居中（默认 align=center）。
+    assert abs((ink.left + ink.right) / 2 - 120) <= 12
 
 
 def test_document_png_uses_text_renderer_for_text_layers(monkeypatch, tmp_path):

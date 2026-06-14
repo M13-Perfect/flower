@@ -4,9 +4,10 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
-from birth_flower_parser import parse_order_remark
 from gpt_parser import parse_order_remark_with_gpt
+from local_order_parser import parse_order_remark_local
 from models import AIParseConfig, ParseResult
+from order_catalog import LibraryBundle, enrich_parse_result
 
 
 Parser = Callable[..., ParseResult]
@@ -18,10 +19,27 @@ def parse_order_remark_auto(
     gpt_parser: Parser | None = None,
     local_parser: LocalParser | None = None,
     ai_config: AIParseConfig | None = None,
+    bundle: LibraryBundle | None = None,
+) -> ParseResult:
+    """根据配置选择解析顺序；若传入 bundle（产品素材/字体库），再把结果落到具体素材/字体 key。
+
+    不传 bundle 时行为与旧版完全一致（向后兼容，现有调用/测试不受影响）。
+    """
+    result = _resolve_order_remark(remark, gpt_parser, local_parser, ai_config)
+    if bundle is not None:
+        result = enrich_parse_result(result, bundle)
+    return result
+
+
+def _resolve_order_remark(
+    remark: str,
+    gpt_parser: Parser | None = None,
+    local_parser: LocalParser | None = None,
+    ai_config: AIParseConfig | None = None,
 ) -> ParseResult:
     """根据配置选择解析顺序：勾选 AI 优先时先调 API，否则只走本地规则。"""
     gpt = gpt_parser or parse_order_remark_with_gpt
-    local = local_parser or parse_order_remark
+    local = local_parser or parse_order_remark_local
 
     if _should_prefer_ai(ai_config):
         gpt_error = ""

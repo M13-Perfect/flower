@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from glyph_service import (
     GlyphBindingsConfig,
     GlyphRulesConfig,
     GlyphVariant,
     apply_automatic_glyph_rules,
+    apply_glyph_to_text_layer,
     apply_glyph_variant_to_text,
     default_glyph_bindings_payload,
     default_glyph_rules_payload,
+    get_safe_glyph_unicode,
     rebuild_render_text,
     remove_glyph_override,
 )
@@ -32,6 +33,129 @@ def _variant() -> GlyphVariant:
             "source": "manual_binding",
         }
     )
+
+
+def test_get_safe_glyph_unicode_never_falls_back_to_glyph_id():
+    assert get_safe_glyph_unicode({"glyph_id": 10, "glyph_name": "linefeed.alt"}) is None
+
+
+def test_get_safe_glyph_unicode_rejects_control_codepoint_and_allows_pua():
+    assert get_safe_glyph_unicode({"unicode": "U+E001"}) == "\ue001"
+
+    try:
+        get_safe_glyph_unicode({"unicode": "U+000A"})
+    except ValueError as exc:
+        assert "control" in str(exc).casefold() or "控制" in str(exc)
+    else:
+        raise AssertionError("control codepoint must be rejected")
+
+
+def test_apply_glyph_to_text_layer_preserves_raw_text_and_stores_override():
+    layer = TextLayer(text="name")
+
+    render_text, overrides, warnings = apply_glyph_to_text_layer(
+        layer,
+        1,
+        {
+            "unicode": "U+E001",
+            "glyph_name": "a.swash",
+            "glyph_id": 10,
+            "font_path": "font.ttf",
+        },
+    )
+
+    assert warnings == []
+    assert layer.raw_text == "name"
+    assert layer.original_text == "name"
+    assert render_text == "n\ue001me"
+    assert "\n" not in render_text
+    assert overrides[1]["base_char"] == "a"
+    assert overrides[1]["glyph_name"] == "a.swash"
+    assert overrides[1]["glyph_id"] == 10
+    assert overrides[1]["unicode_char"] == "\ue001"
+    assert overrides[1]["font_path"] == "font.ttf"
+
+
+def test_apply_glyph_to_text_layer_rejects_unmapped_glyph_id_without_newline():
+    layer = TextLayer(text="name")
+
+    try:
+        apply_glyph_to_text_layer(layer, 1, {"glyph_id": 10, "glyph_name": "a.alt"})
+    except ValueError as exc:
+        assert "Unicode" in str(exc)
+    else:
+        raise AssertionError("unmapped glyph must not be applied as text")
+
+    assert layer.raw_text == "name"
+    assert layer.original_text == "name"
+    assert layer.render_text == "name"
+    assert layer.glyph_overrides == {}
+
+
+def test_legacy_control_character_override_is_ignored():
+    render_text, overrides, warnings = rebuild_render_text(
+        "name",
+        {
+            1: {
+                "index": 1,
+                "base_char": "a",
+                "replacement_char": "\n",
+                "glyph_id": 10,
+                "glyph_name": "a.bad",
+            }
+        },
+    )
+
+    assert render_text == "name"
+    assert overrides == {}
+    assert "\n" not in render_text
+    assert any("control" in warning.casefold() or "控制" in warning for warning in warnings)
+
+
+def test_preset_and_existing_text_glyph_paths_are_consistent():
+    variant = GlyphVariant.from_mapping(
+        {
+            "base_char": "a",
+            "replacement_char": "\ue001",
+            "codepoint": "U+E001",
+            "glyph_name": "a.swash",
+            "glyph_id": 10,
+            "font_path": "font.ttf",
+        }
+    )
+    pre_render, pre_overrides, pre_warnings = apply_glyph_variant_to_text("name", {}, 1, variant)
+
+    layer = TextLayer(text="name")
+    post_render, post_overrides, post_warnings = apply_glyph_to_text_layer(
+        layer,
+        1,
+        {
+            "unicode": "U+E001",
+            "glyph_name": "a.swash",
+            "glyph_id": 10,
+            "font_path": "font.ttf",
+        },
+    )
+
+    assert pre_warnings == post_warnings == []
+    assert pre_render == post_render == "n\ue001me"
+    assert pre_overrides[1]["base_char"] == post_overrides[1]["base_char"] == "a"
+    assert pre_overrides[1]["replacement_char"] == post_overrides[1]["replacement_char"] == "\ue001"
+
+
+def test_text_layer_json_round_trip_preserves_raw_text_and_glyph_overrides():
+    from dataclasses import asdict
+
+    layer = TextLayer(text="name")
+    apply_glyph_to_text_layer(layer, 1, {"unicode": "U+E001", "glyph_name": "a.swash", "glyph_id": 10})
+
+    payload = json.loads(json.dumps(asdict(layer), ensure_ascii=False, default=str))
+    loaded = TextLayer(**payload)
+
+    assert loaded.raw_text == "name"
+    assert loaded.original_text == "name"
+    assert 1 in loaded.glyph_overrides
+    assert loaded.glyph_overrides[1]["base_char"] == "a"
 
 
 def test_manual_glyph_variant_updates_render_text_without_changing_original():
@@ -120,6 +244,32 @@ def test_font2_default_bindings_and_rules_cover_common_ending_glyphs():
     assert applied is True
     assert render_text == "Jazmi\ue075"
     assert overrides[5]["codepoint"] == "E075"
+
+
+def test_font4_default_bindings_and_rules_cover_heart_ending_glyphs():
+    bindings = default_glyph_bindings_payload()["fonts"]["Font 4"]["bindings"]
+    rules = default_glyph_rules_payload()["fonts"]["Font 4"]["end_char_rules"]
+
+    assert len(bindings) == 26
+    assert bindings["E034"]["base_char"] == "a"
+    assert bindings["E041"]["base_char"] == "n"
+    assert bindings["E04D"]["base_char"] == "z"
+    assert rules["a"] == "E034"
+    assert rules["n"] == "E041"
+    assert rules["z"] == "E04D"
+
+    render_text, overrides, warnings, applied = apply_automatic_glyph_rules(
+        "Jazmin",
+        "Font 4",
+        None,
+        {},
+        GlyphRulesConfig(data=default_glyph_rules_payload()),
+    )
+
+    assert warnings == []
+    assert applied is True
+    assert render_text == "Jazmi\ue041"
+    assert overrides[5]["codepoint"] == "E041"
 
 
 def test_manual_override_wins_over_automatic_rule():

@@ -61,19 +61,23 @@ def test_name_layout_shrinks_to_fit_explicit_text_box_size():
     assert abs((layout.text_bounds.top + layout.text_bounds.bottom) / 2 - 436) < 1
 
 
-def test_name_layout_stretches_ink_bounds_to_fill_explicit_text_box():
+def test_name_layout_fits_uniformly_without_stretching_explicit_text_box():
     engraving_layout = EngravingLayout(text_x=500, text_y=400, text_width=300, text_height=90)
 
     layout = layout_personalization_text("Hi", engraving_layout, personalization_type="name")
 
     assert layout.did_fit is True
-    assert layout.text_bounds.left == pytest.approx(engraving_layout.text_x)
-    assert layout.text_bounds.top == pytest.approx(engraving_layout.text_y)
-    assert layout.text_bounds.width == pytest.approx(engraving_layout.text_width)
-    assert layout.text_bounds.height == pytest.approx(engraving_layout.text_height)
+    # 等比改造：不再非等比拉伸铺满，render_scale 恒为 1，墨迹按真实比例居中。
+    assert layout.render_scale_x == pytest.approx(1.0)
+    assert layout.render_scale_y == pytest.approx(1.0)
     assert layout.ink_bounds is not None
-    assert layout.render_scale_x == pytest.approx(engraving_layout.text_width / layout.ink_bounds.width)
-    assert layout.render_scale_y == pytest.approx(engraving_layout.text_height / layout.ink_bounds.height)
+    # 墨迹在框内（不超框），且居中。
+    assert layout.text_bounds.width <= engraving_layout.text_width + 1
+    assert layout.text_bounds.height <= engraving_layout.text_height + 1
+    center_x = engraving_layout.text_x + engraving_layout.text_width / 2
+    center_y = engraving_layout.text_y + engraving_layout.text_height / 2
+    assert abs((layout.text_bounds.left + layout.text_bounds.right) / 2 - center_x) < 1
+    assert abs((layout.text_bounds.top + layout.text_bounds.bottom) / 2 - center_y) < 1
 
 
 def test_name_layout_centers_real_ink_bbox_for_descenders_and_accents():

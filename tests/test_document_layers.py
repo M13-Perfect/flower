@@ -1,7 +1,3 @@
-from pathlib import Path
-
-import pytest
-
 from models import Document, TextLayer, add_image_layer, add_text_layer, delete_layer, move_layer
 from renderer import render_document_png
 

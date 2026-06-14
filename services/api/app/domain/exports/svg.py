@@ -185,10 +185,9 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
     from app.domain.exports.dxf import (
         ExportContext,
         Matrix,
-        _aligned_text_offset,
         _glyph_shapes,
         _resolve_font_path,
-        _text_with_glyph_overrides as dxf_text_with_glyph_overrides,
+        _resolve_text_line_specs,
     )
 
     try:
@@ -226,21 +225,12 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
     fill = str(style.get("fill") or "#000000")
     stroke = str(style.get("stroke") or "")
     stroke_width = float(style.get("strokeWidth") or 0)
-    text = dxf_text_with_glyph_overrides(layer)
+    line_specs = _resolve_text_line_specs(
+        layer, style, cmap, hmtx, units_per_em, font_size_value, line_height, letter_spacing
+    )
     paths: list[str] = []
 
-    for line_index, line in enumerate(re.split(r"\r\n|\n|\r", text)):
-        cursor = _aligned_text_offset(
-            line,
-            style,
-            layer,
-            cmap,
-            hmtx,
-            units_per_em,
-            font_size_value,
-            letter_spacing,
-        )
-        baseline_y = line_index * font_size_value * line_height
+    for line, cursor, baseline_y in line_specs:
         for char in line:
             codepoint = ord(char)
             glyph_name = cmap.get(codepoint)

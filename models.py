@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 import logging
 
+from production import ProductionParams
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,6 +27,11 @@ class ParseResult:
     selected_font_asset: str | None = None
     parse_confidence: float = 0.0
     asset_confidence: float = 0.0
+    # 新素材库体系：解析器把订单落到「哪个库 + 库内 key」，供图层引用与跨库识别（见 order_catalog）。
+    material_library_id: str = ""
+    material_key: str = ""
+    font_library_id: str = ""
+    font_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -100,6 +107,15 @@ def _new_layer_id() -> str:
     return uuid.uuid4().hex
 
 
+def _coerce_production(value: Any) -> ProductionParams | None:
+    """容忍生产参数以 dict（反序列化）或已是 ProductionParams 传入；其它一律视为无覆盖。"""
+    if value is None or isinstance(value, ProductionParams):
+        return value
+    if isinstance(value, dict):
+        return ProductionParams.from_mapping(value)
+    return None
+
+
 @dataclass
 class Layer:
     """Photoshop 风格图层基类，所有可编辑对象都继承这些通用变换字段。"""
@@ -135,6 +151,17 @@ class ImageLayer(Layer):
     material_id: str = ""
     material_name: str = ""
     lock_aspect_ratio: bool = True
+    # 新素材库体系：记录「引用哪个库 + 库内素材 key」，便于跨库引用与订单解析回查；
+    # production = 该图层的生产参数 override（None=回落到素材/库/产品默认，见 production.resolve_chain）。
+    library_id: str = ""
+    material_key: str = ""
+    production: ProductionParams | None = None
+
+    def __post_init__(self) -> None:
+        """旧素材图层只有 material_id：迁移出 material_key；production 容忍 dict 反序列化。"""
+        if not self.material_key and self.material_id:
+            self.material_key = self.material_id
+        self.production = _coerce_production(self.production)
 
 
 @dataclass
@@ -142,6 +169,7 @@ class TextLayer(Layer):
     """可编辑文本图层；保留原始文字，并用 render_text 承载字形替换后的视觉输出。"""
 
     text: str = "Text"
+    raw_text: str = ""
     original_text: str = ""
     render_text: str = ""
     glyph_overrides: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -157,16 +185,34 @@ class TextLayer(Layer):
     text_box_width: float = 400.0
     text_box_height: float = 160.0
     type: str = "text"
+    # 新素材库体系：文本图层记录引用的字体库 + 字体 key + 生产参数 override。
+    font_library_id: str = ""
+    font_key: str = ""
+    production: ProductionParams | None = None
 
     def __post_init__(self) -> None:
         """兼容旧 TextLayer：旧数据只有 text 时，迁移出 original_text/render_text。"""
+        if self.raw_text and not self.original_text:
+            self.original_text = self.raw_text
         if not self.original_text:
             self.original_text = self.text
             logger.info("迁移旧文本图层到 original_text：layer_id=%s", self.id)
+        if not self.raw_text:
+            self.raw_text = self.original_text
         if not self.render_text:
             self.render_text = self.original_text
         if self.text != self.original_text:
             self.text = self.original_text
+        normalized_overrides: dict[int, dict[str, Any]] = {}
+        for raw_index, override in (self.glyph_overrides or {}).items():
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                logger.warning("忽略无效 glyph_overrides key：layer_id=%s key=%r", self.id, raw_index)
+                continue
+            if isinstance(override, dict):
+                normalized_overrides[index] = override
+        self.glyph_overrides = normalized_overrides
         # 新旧字段并存：旧 UI 仍读写 color/letter_spacing，新渲染器使用 fill_color/tracking。
         if not self.fill_color:
             self.fill_color = self.color or "#111111"
@@ -176,6 +222,10 @@ class TextLayer(Layer):
             self.tracking = self.letter_spacing
         elif self.letter_spacing == 0 and self.tracking != 0:
             self.letter_spacing = self.tracking
+        # 旧文本图层只有 font_path：best-effort 迁移出 font_key（取文件名），生产参数容忍 dict。
+        if not self.font_key and self.font_path is not None:
+            self.font_key = Path(self.font_path).stem
+        self.production = _coerce_production(self.production)
 
     def display_text(self) -> str:
         """UI 可读文本：避免直接展示 PUA 乱码。"""
@@ -239,8 +289,15 @@ def add_image_layer(
     material_id: str = "",
     material_name: str = "",
     lock_aspect_ratio: bool = True,
+    library_id: str = "",
+    material_key: str = "",
+    production: ProductionParams | None = None,
 ) -> ImageLayer:
-    """添加素材永远创建新 ImageLayer，绝不覆盖已有图层或旧选择。"""
+    """添加素材永远创建新 ImageLayer，绝不覆盖已有图层或旧选择。
+
+    新素材库体系：传 ``library_id``/``material_key`` 记录该图层引用的库与素材；
+    ``production`` 为该图层生产参数 override（None=回落到素材/库/产品默认）。
+    """
     asset_path = Path(path)
     layer = ImageLayer(
         name=name or asset_path.stem,
@@ -253,6 +310,9 @@ def add_image_layer(
         material_id=material_id or asset_path.stem,
         material_name=material_name or name or asset_path.stem,
         lock_aspect_ratio=lock_aspect_ratio,
+        library_id=library_id,
+        material_key=material_key,
+        production=production,
     )
     document.layers.append(layer)
     document.selected_layer_id = layer.id
@@ -271,11 +331,19 @@ def add_text_layer(
     width: float = 400,
     height: float = 160,
     font_size: int = 120,
+    font_library_id: str = "",
+    font_key: str = "",
+    production: ProductionParams | None = None,
 ) -> TextLayer:
-    """添加可编辑 TextLayer；文本属性保留在图层上，便于属性面板反复修改。"""
+    """添加可编辑 TextLayer；文本属性保留在图层上，便于属性面板反复修改。
+
+    新素材库体系：传 ``font_library_id``/``font_key`` 记录引用的字体库与字体；
+    ``production`` 为该图层生产参数 override（None=回落到库/产品默认）。
+    """
     layer = TextLayer(
         name=name or "Text",
         text=text,
+        raw_text=text,
         original_text=text,
         render_text=text,
         font_path=Path(font_path) if font_path else None,
@@ -287,6 +355,9 @@ def add_text_layer(
         text_box_height=height,
         font_size=font_size,
         z_index=len(document.layers),
+        font_library_id=font_library_id,
+        font_key=font_key,
+        production=production,
     )
     document.layers.append(layer)
     document.selected_layer_id = layer.id

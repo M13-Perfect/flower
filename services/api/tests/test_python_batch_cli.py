@@ -362,3 +362,32 @@ def assert_production_svg(svg: str) -> None:
     assert "<text" not in svg
     assert "<image" not in svg
     assert ET.fromstring(svg) is not None
+
+
+def test_apply_layout_overrides_uses_desktop_layout():
+    """批量按桌面 layout_defaults 覆盖画布与花朵/文字框(单一布局来源),与桌面单单一致。"""
+    from app.domain.orders.workflow import _apply_layout_overrides
+
+    document = {
+        "canvas": {"width": 3000, "height": 3000, "unit": "px"},
+        "exportSettings": {"physical": {"widthMm": 80, "heightMm": 80}},
+        "layers": [
+            {"type": "svg", "x": 900, "y": 420, "width": 1200, "height": 1400, "scaleX": 1, "scaleY": 1},
+            {"type": "text", "x": 600, "y": 2200, "width": 1800, "height": 260, "style": {"fontSize": 180}},
+        ],
+    }
+    layout = {
+        "canvas_width": 1732, "canvas_height": 1280,
+        "flower_x": 310, "flower_y": 40, "flower_width": 1060, "flower_height": 1060,
+        "text_x": 700, "text_y": 830, "text_width": 804, "text_height": 260, "text_size": 190,
+    }
+    _apply_layout_overrides(document, layout)
+
+    assert (document["canvas"]["width"], document["canvas"]["height"]) == (1732, 1280)
+    # 去掉写死 heightMm → 导出按画布比例派生 mm 高度(等比、不变形)。
+    assert "heightMm" not in document["exportSettings"]["physical"]
+    flower = document["layers"][0]
+    assert (flower["x"], flower["y"], flower["width"], flower["height"]) == (310, 40, 1060, 1060)
+    text = document["layers"][1]
+    assert (text["x"], text["y"], text["width"], text["height"]) == (700, 830, 804, 260)
+    assert text["style"]["fontSize"] == 190

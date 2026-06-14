@@ -6,6 +6,7 @@ from typing import Any
 
 from glyph_service import rebuild_render_text
 from models import TextLayer
+from text_layout import fit_text_box
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,8 @@ class TextRenderer:
         text = self._source_text(layer)
         if getattr(layer, "original_text", "") != text:
             layer.original_text = text
+        if getattr(layer, "raw_text", "") != text:
+            layer.raw_text = text
 
         glyph_warnings = self._raw_glyph_warnings(getattr(layer, "glyph_overrides", {}) or {})
         render_text, clean_overrides, rebuild_warnings = rebuild_render_text(
@@ -66,22 +69,40 @@ class TextRenderer:
             warnings.append("空文本：已渲染透明文本图层。")
             return TextRenderResult(image, render_text, clean_overrides, None, warnings)
 
-        font = self._load_font(ImageFont, font_path, font_size, warnings)
-        fill = self._fill_color(layer)
+        align = str(getattr(layer, "align", "center") or "center").casefold()
+        vertical_align = str(getattr(layer, "vertical_align", "middle") or "middle").casefold()
         line_spacing = self._line_spacing(layer)
         tracking = self._tracking(layer)
-        lines = render_text.splitlines() or [render_text]
+        # 统一适配：等比选字号 + 断行，与矢量导出共用同一套 fit_text_box（不再非等比拉伸铺满框）。
+        # layer.font_size 作为字号上限（cap），真实字号由文本框大小自适应得出。
+        fit = fit_text_box(
+            render_text,
+            box_width,
+            box_height,
+            font_path,
+            personalization_type="auto",
+            font_size_cap=font_size,
+            align=align,
+            vertical_align=vertical_align,
+            line_spacing=line_spacing,
+            letter_spacing=tracking,
+        )
+        if fit.warnings:
+            warnings.extend(fit.warnings)
+        font = self._load_font(ImageFont, font_path, fit.font_size, warnings)
+        fill = self._fill_color(layer)
+        lines = list(fit.lines) or render_text.splitlines() or [render_text]
         line_images = [self._render_line(Image, ImageDraw, font, line, fill, tracking) for line in lines]
         non_empty_lines = [line_image for line_image in line_images if line_image is not None]
         if not non_empty_lines:
             warnings.append("文本没有可见墨迹：已渲染透明文本图层。")
             return TextRenderResult(image, render_text, clean_overrides, None, warnings)
 
-        text_image = self._compose_text_image(Image, non_empty_lines, layer, font_size, line_spacing)
+        text_image = self._compose_text_image(Image, non_empty_lines, layer, fit.font_size, line_spacing)
         if text_image is None:
             warnings.append("文本没有可见墨迹：已渲染透明文本图层。")
             return TextRenderResult(image, render_text, clean_overrides, None, warnings)
-        image = self._fill_text_box_with_ink(Image, text_image, box_width, box_height)
+        image = self._place_text_in_box(Image, text_image, box_width, box_height, align, vertical_align)
 
         ink = image.getbbox()
         ink_bbox = InkBounds(*ink) if ink else None
@@ -161,12 +182,33 @@ class TextRenderer:
         ink = image.getbbox()
         return image.crop(ink) if ink else None
 
-    def _fill_text_box_with_ink(self, image_module, text_image, box_width: int, box_height: int):
-        """把真实墨迹边界映射到文本框四边；结果无字体行框空白。"""
-        if text_image.size == (box_width, box_height):
-            return text_image
-        resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS", 1)
-        return text_image.resize((box_width, box_height), resampling)
+    def _place_text_in_box(self, image_module, text_image, box_width: int, box_height: int, align: str, vertical_align: str):
+        """把真实墨迹按等比尺寸居中贴进文本框：保留花体横竖比例，不再非等比 resize 铺满。
+
+        与 text_layout/矢量导出一致——都按墨迹居中。fit_text_box 已保证装得下，这里仅在
+        极端情况（1px 溢出）兜底等比缩小。"""
+        box = image_module.new("RGBA", (max(1, box_width), max(1, box_height)), (0, 0, 0, 0))
+        if text_image.width <= 0 or text_image.height <= 0:
+            return box
+        scale = min(1.0, box_width / text_image.width, box_height / text_image.height)
+        if scale < 1.0:
+            resampling = getattr(getattr(image_module, "Resampling", image_module), "LANCZOS", 1)
+            new_size = (max(1, int(text_image.width * scale)), max(1, int(text_image.height * scale)))
+            text_image = text_image.resize(new_size, resampling)
+        if align == "left":
+            offset_x = 0
+        elif align == "right":
+            offset_x = box_width - text_image.width
+        else:
+            offset_x = (box_width - text_image.width) // 2
+        if vertical_align == "top":
+            offset_y = 0
+        elif vertical_align == "bottom":
+            offset_y = box_height - text_image.height
+        else:
+            offset_y = (box_height - text_image.height) // 2
+        box.alpha_composite(text_image, (max(0, int(offset_x)), max(0, int(offset_y))))
+        return box
 
     def _horizontal_offset(self, layer: TextLayer, box_width: int, line_width: int) -> int:
         align = str(getattr(layer, "align", "center") or "center").casefold()

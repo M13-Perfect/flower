@@ -1,5 +1,166 @@
 {
   "fonts": {
+    "Font 4": {
+      "font_path": "",
+      "bindings": {
+        "E034": {
+          "base_char": "a",
+          "usage": "end",
+          "display_name": "a heart ending glyph",
+          "glyph_name": "uniE034"
+        },
+        "E035": {
+          "base_char": "b",
+          "usage": "end",
+          "display_name": "b heart ending glyph",
+          "glyph_name": "uniE035"
+        },
+        "E036": {
+          "base_char": "c",
+          "usage": "end",
+          "display_name": "c heart ending glyph",
+          "glyph_name": "uniE036"
+        },
+        "E037": {
+          "base_char": "d",
+          "usage": "end",
+          "display_name": "d heart ending glyph",
+          "glyph_name": "uniE037"
+        },
+        "E038": {
+          "base_char": "e",
+          "usage": "end",
+          "display_name": "e heart ending glyph",
+          "glyph_name": "uniE038"
+        },
+        "E039": {
+          "base_char": "f",
+          "usage": "end",
+          "display_name": "f heart ending glyph",
+          "glyph_name": "uniE039"
+        },
+        "E03A": {
+          "base_char": "g",
+          "usage": "end",
+          "display_name": "g heart ending glyph",
+          "glyph_name": "uniE03A"
+        },
+        "E03B": {
+          "base_char": "h",
+          "usage": "end",
+          "display_name": "h heart ending glyph",
+          "glyph_name": "uniE03B"
+        },
+        "E03C": {
+          "base_char": "i",
+          "usage": "end",
+          "display_name": "i heart ending glyph",
+          "glyph_name": "uniE03C"
+        },
+        "E03D": {
+          "base_char": "j",
+          "usage": "end",
+          "display_name": "j heart ending glyph",
+          "glyph_name": "uniE03D"
+        },
+        "E03E": {
+          "base_char": "k",
+          "usage": "end",
+          "display_name": "k heart ending glyph",
+          "glyph_name": "uniE03E"
+        },
+        "E03F": {
+          "base_char": "l",
+          "usage": "end",
+          "display_name": "l heart ending glyph",
+          "glyph_name": "uniE03F"
+        },
+        "E040": {
+          "base_char": "m",
+          "usage": "end",
+          "display_name": "m heart ending glyph",
+          "glyph_name": "uniE040"
+        },
+        "E041": {
+          "base_char": "n",
+          "usage": "end",
+          "display_name": "n heart ending glyph",
+          "glyph_name": "uniE041"
+        },
+        "E042": {
+          "base_char": "o",
+          "usage": "end",
+          "display_name": "o heart ending glyph",
+          "glyph_name": "uniE042"
+        },
+        "E043": {
+          "base_char": "p",
+          "usage": "end",
+          "display_name": "p heart ending glyph",
+          "glyph_name": "uniE043"
+        },
+        "E044": {
+          "base_char": "q",
+          "usage": "end",
+          "display_name": "q heart ending glyph",
+          "glyph_name": "uniE044"
+        },
+        "E045": {
+          "base_char": "r",
+          "usage": "end",
+          "display_name": "r heart ending glyph",
+          "glyph_name": "uniE045"
+        },
+        "E046": {
+          "base_char": "s",
+          "usage": "end",
+          "display_name": "s heart ending glyph",
+          "glyph_name": "uniE046"
+        },
+        "E047": {
+          "base_char": "t",
+          "usage": "end",
+          "display_name": "t heart ending glyph",
+          "glyph_name": "uniE047"
+        },
+        "E048": {
+          "base_char": "u",
+          "usage": "end",
+          "display_name": "u heart ending glyph",
+          "glyph_name": "uniE048"
+        },
+        "E049": {
+          "base_char": "v",
+          "usage": "end",
+          "display_name": "v heart ending glyph",
+          "glyph_name": "uniE049"
+        },
+        "E04A": {
+          "base_char": "w",
+          "usage": "end",
+          "display_name": "w heart ending glyph",
+          "glyph_name": "uniE04A"
+        },
+        "E04B": {
+          "base_char": "x",
+          "usage": "end",
+          "display_name": "x heart ending glyph",
+          "glyph_name": "uniE04B"
+        },
+        "E04C": {
+          "base_char": "y",
+          "usage": "end",
+          "display_name": "y heart ending glyph",
+          "glyph_name": "uniE04C"
+        },
+        "E04D": {
+          "base_char": "z",
+          "usage": "end",
+          "display_name": "z heart ending glyph",
+          "glyph_name": "uniE04D"
+        }
+      }
+    },
     "Font 2": {
       "font_path": "",
       "bindings": {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import logging
 import os
 from pathlib import Path
@@ -37,7 +38,8 @@ from models import AIParseConfig, BirthFlowerDesign, Document, EngravingLayout, 
 from order_importer import load_order_remark_from_file
 from parse_pipeline import parse_order_remark_auto
 from gpt_parser import DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, parse_order_remark_with_gpt
-from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_document_png, render_document_svg, render_dxf, render_png, render_svg
+from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_document_png, render_dxf, render_png, render_svg
+from desktop_export import render_document_dxf, render_document_vector_svg
 from text_layout import measure_text_ink_bbox, layout_personalization_text
 
 
@@ -48,6 +50,9 @@ IMPORTABLE_VECTOR_SUFFIXES = {".svg"}
 IMPORTABLE_BITMAP_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 IMPORTABLE_ASSET_SUFFIXES = IMPORTABLE_VECTOR_SUFFIXES | IMPORTABLE_BITMAP_SUFFIXES
 SINGLE_REMARK_SUFFIXES = {".txt", ".json", ".csv"}
+# 三态大小写切换:点击循环 默认→大写→小写;影响"识别内容"的输出大小写。
+TEXT_CASE_ORDER = ("default", "upper", "lower")
+TEXT_CASE_LABELS = {"default": "默认", "upper": "大写", "lower": "小写"}
 SERVICES_API_DIR = Path(__file__).resolve().parent / "services" / "api"
 APP_COLORS = {
     "background": "#f6f7f8",
@@ -70,7 +75,7 @@ def ensure_services_api_import_path() -> Path:
     return SERVICES_API_DIR
 
 
-def import_dianxiaomi_xlsx_batch(path: Path | str) -> object:
+def import_dianxiaomi_xlsx_batch(path: Path | str, layout: dict | None = None) -> object:
     ensure_services_api_import_path()
     from app.domain.orders.batch_generate import generate_batch
     from app.domain.orders.batch_import import import_orders
@@ -78,7 +83,8 @@ def import_dianxiaomi_xlsx_batch(path: Path | str) -> object:
 
     batch = import_orders(Path(path), adapter_name="dianxiaomi-xlsx")
     save_batch(batch)
-    return generate_batch(batch.batch_id)
+    # layout(桌面 layout_defaults)非空时,批量按桌面布局产出,与单单一致(单一布局来源)。
+    return generate_batch(batch.batch_id, layout=layout)
 
 
 # 当前产品线唯一模板;多产品后改为按当前模板选择。
@@ -517,7 +523,8 @@ class BirthFlowerApp:
         self.font_var = tk.StringVar(value="1")
         self.flower_var = tk.StringVar(value="1")
         self.confidence_var = tk.StringVar(value="Readiness: -")
-        self.case_sensitive_var = tk.BooleanVar(value=True)
+        # 三态大小写:default=不改、upper=全大写输出、lower=全小写输出。
+        self.text_case_var = tk.StringVar(value="default")
         self.personalization_type_var = tk.StringVar(value="unknown")
         self.output_var = tk.StringVar(value=str(normalize_output_path(self.config.output_path)))
         self.flower_dir_var = tk.StringVar(value=str(self.config.flower_dir or DEFAULT_FLOWER_DIR))
@@ -578,7 +585,7 @@ class BirthFlowerApp:
         self._drag_start: tuple[int, int] | None = None
         self._drag_mode: str = "move"
         self.selected_preview_item: str | None = None
-        # 素材下拉框的当前值先作为待添加素材保存；只有点击“添加素材为新图层”才真正创建 ImageLayer。
+        # 素材下拉框的当前值先作为待添加素材保存；只有点击“添加素材”才真正创建 ImageLayer。
         self.pending_flower_asset_label: str = ""
         # 初始化、刷新列表、解析订单等程序化更新期间，不让控件事件触发业务写入。
         self._is_programmatic_update = False
@@ -795,9 +802,12 @@ class BirthFlowerApp:
         fields.grid(row=3, column=0, sticky="ew")
         self._add_row(fields, 0, "内容", ttk.Entry(fields, textvariable=self.name_var))
         self._add_row(fields, 1, "月份", ttk.Spinbox(fields, from_=1, to=12, textvariable=self.month_var, width=8))
-        ttk.Checkbutton(fields, text="区分大小写", variable=self.case_sensitive_var).grid(
-            row=2, column=1, sticky="w", pady=(6, 2)
+        ttk.Label(fields, text="大小写").grid(row=2, column=0, sticky="w", pady=(6, 2))
+        self.case_button = ttk.Button(
+            fields, text=TEXT_CASE_LABELS[self.text_case_var.get()], width=8,
+            command=self._cycle_text_case,
         )
+        self.case_button.grid(row=2, column=1, sticky="w", pady=(6, 2))
         ttk.Label(fields, textvariable=self.warning_var, style="Warning.TLabel", wraplength=240).grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0)
         )
@@ -845,12 +855,12 @@ class BirthFlowerApp:
         self.font_combo.grid(row=1, column=1, sticky="ew", pady=4)
         action_row = ttk.Frame(asset_group)
         action_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(action_row, text="添加素材为新图层", command=self._add_selected_flower_to_canvas).pack(side="left")
+        ttk.Button(action_row, text="添加素材", command=self._add_selected_flower_to_canvas).pack(side="left")
         ttk.Button(action_row, text="添加文本", command=self._add_text_layer_from_fields).pack(side="left", padx=(8, 0))
 
         ttk.Label(
             panel,
-            text="全局布局默认值已移至：编辑 -> 布局设置...；新建图层会读取该默认值。",
+            text="布局默认值：编辑 → 布局设置",
             style="Status.TLabel",
             wraplength=260,
         ).grid(row=1, column=0, sticky="ew")
@@ -866,12 +876,13 @@ class BirthFlowerApp:
             ttk.Checkbutton(format_row, text=label, variable=self.output_format_vars[output_format]).pack(
                 side="left", padx=(0, 6)
             )
+        # 文字实心交由 Ezcad 自动导入项目在导入后用 EzCad 原生「填充」完成,这里不再放开关。
         ttk.Entry(bar, textvariable=self.output_var, width=28).grid(row=0, column=2, sticky="ew")
         ttk.Button(bar, text="选择", command=self.choose_output).grid(row=0, column=3, sticky="e", padx=(8, 0))
         ttk.Label(bar, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=4, sticky="w", padx=(10, 0))
         self.confirm_button = ttk.Button(
             bar,
-            text="人工确认并生成",
+            text="生成",
             command=self.confirm_and_generate,
             style="Primary.TButton",
         )
@@ -1234,8 +1245,14 @@ class BirthFlowerApp:
         self._set_warnings([])
 
     def _import_xlsx_batch_file(self, path: Path) -> None:
+        # 批量复用桌面布局(单一来源):在主线程读当前布局默认值,传进批量,产出与桌面单单一致。
+        try:
+            layout = dataclasses.asdict(layout_from_values(self.layout_vars))
+        except (ValueError, TypeError):
+            layout = None
+
         def work() -> object:
-            return import_dianxiaomi_xlsx_batch(path)
+            return import_dianxiaomi_xlsx_batch(path, layout=layout)
 
         def on_success(result: object) -> None:
             show_xlsx_batch_import_summary(self.root, result)
@@ -1748,7 +1765,20 @@ class BirthFlowerApp:
 
     def _content_text_for_render(self) -> str:
         text = self.name_var.get()
-        return text if self.case_sensitive_var.get() else text.lower()
+        mode = self.text_case_var.get()
+        if mode == "upper":
+            return text.upper()
+        if mode == "lower":
+            return text.lower()
+        return text  # default:不改变大小写
+
+    def _cycle_text_case(self) -> None:
+        """循环切换大小写模式 默认→大写→小写,按钮文字随之变化;改变会触发预览重绘。"""
+        current = self.text_case_var.get()
+        index = TEXT_CASE_ORDER.index(current) if current in TEXT_CASE_ORDER else 0
+        next_mode = TEXT_CASE_ORDER[(index + 1) % len(TEXT_CASE_ORDER)]
+        self.case_button.configure(text=TEXT_CASE_LABELS[next_mode])
+        self.text_case_var.set(next_mode)  # 触发 trace → _on_personalization_change 重绘
 
     def _resolve_current_glyph(self) -> GlyphApplyResult:
         render_source = self._content_text_for_render()
@@ -1776,6 +1806,15 @@ class BirthFlowerApp:
             )
         self.current_glyph_result = result
         return result
+
+    def _template_physical_width_mm(self) -> float | None:
+        """读产品模板的输出物理宽度(布局设置里配置的同一数据源);失败则返回 None,
+        导出端退回默认 80mm。这样「布局设置 → 输出宽度(mm)」对按钮导出立即生效。"""
+        try:
+            return float(load_template_physical_size().width_mm)
+        except Exception as exc:
+            LOGGER.warning("读取模板物理宽度失败,DXF 用默认尺寸: %s", exc)
+            return None
 
     def confirm_and_generate(self) -> None:
         glyph_result = self._resolve_current_glyph()
@@ -1826,15 +1865,32 @@ class BirthFlowerApp:
         if not confirmed:
             return
 
+        # 输出物理宽度来自产品模板(布局设置里配置),让 DXF 写出正确 mm 尺寸。
+        physical_width_mm = self._template_physical_width_mm()
         generated_paths: list[Path] = []
         try:
             base_output_path = normalize_output_path(self.output_var.get())
             for output_format in selected_formats:
                 target_path = output_path_for_format(base_output_path, output_format)
+                # 有图层时走 services/api 真实矢量导出:DXF/SVG 在 CAD 里可编辑、纯矢量。
                 if self.document.layers and output_format == "svg":
-                    generated_paths.append(render_document_svg(self.document, target_path))
+                    generated_paths.append(
+                        render_document_vector_svg(
+                            self.document,
+                            target_path,
+                            physical_width_mm=physical_width_mm,
+                        )
+                    )
                 elif self.document.layers and output_format == "png":
                     generated_paths.append(render_document_png(self.document, target_path))
+                elif self.document.layers and output_format == "dxf":
+                    generated_paths.append(
+                        render_document_dxf(
+                            self.document,
+                            target_path,
+                            physical_width_mm=physical_width_mm,
+                        )
+                    )
                 elif output_format == "svg":
                     generated_paths.append(render_svg(design, target_path))
                 elif output_format == "dxf":
@@ -2017,7 +2073,6 @@ class BirthFlowerApp:
             "width": layer.width,
             "height": layer.height,
             "lock_aspect_ratio": layer.lock_aspect_ratio,
-            "locked": layer.locked,
         }
         ratio = (layer.width / layer.height) if layer.height else 1.0
         window = tk.Toplevel(self.root)
@@ -2034,25 +2089,16 @@ class BirthFlowerApp:
             "width": tk.StringVar(value=str(layer.width)),
             "height": tk.StringVar(value=str(layer.height)),
             "lock_aspect_ratio": tk.BooleanVar(value=layer.lock_aspect_ratio),
-            "locked": tk.BooleanVar(value=layer.locked),
         }
-        geometry_entries: list[ttk.Entry] = []
         fields = (("图层名称", "name"), ("material_id", "material_id"), ("material_name", "material_name"), ("x", "x"), ("y", "y"), ("width", "width"), ("height", "height"))
         for row, (label, key) in enumerate(fields):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
             entry = ttk.Entry(frame, textvariable=vars_map[key], width=24)
             entry.grid(row=row, column=1, sticky="ew", pady=3)
-            if key in {"x", "y", "width", "height"}:
-                geometry_entries.append(entry)
+        # 「锁定宽高比」保留;图层整体「锁定/解锁」改由右键图层菜单负责,这里不再重复一个复选框。
         ttk.Checkbutton(frame, text="锁定宽高比", variable=vars_map["lock_aspect_ratio"]).grid(row=len(fields), column=1, sticky="w", pady=3)
-        ttk.Checkbutton(frame, text="是否锁定", variable=vars_map["locked"], command=lambda: sync_entry_state()).grid(row=len(fields) + 1, column=1, sticky="w", pady=3)
         frame.columnconfigure(1, weight=1)
         applying = {"busy": False}
-
-        def sync_entry_state() -> None:
-            state = "disabled" if vars_map["locked"].get() else "normal"
-            for entry in geometry_entries:
-                entry.configure(state=state)
 
         def apply_live(_name=None, _index=None, _mode=None) -> None:
             if applying["busy"]:
@@ -2063,25 +2109,22 @@ class BirthFlowerApp:
                 layer.material_id = vars_map["material_id"].get().strip()
                 layer.material_name = vars_map["material_name"].get().strip()
                 layer.lock_aspect_ratio = bool(vars_map["lock_aspect_ratio"].get())
-                layer.locked = bool(vars_map["locked"].get())
-                if not layer.locked:
-                    x = float(vars_map["x"].get())
-                    y = float(vars_map["y"].get())
-                    width = max(1.0, float(vars_map["width"].get()))
-                    height = max(1.0, float(vars_map["height"].get()))
-                    if layer.lock_aspect_ratio and ratio > 0:
-                        # 实时预览时保留初始宽高比，减少误操作造成的素材变形。
-                        height = width / ratio
-                        vars_map["height"].set(f"{height:g}")
-                    layer.x = x
-                    layer.y = y
-                    layer.width = width
-                    layer.height = height
-                sync_entry_state()
+                x = float(vars_map["x"].get())
+                y = float(vars_map["y"].get())
+                width = max(1.0, float(vars_map["width"].get()))
+                height = max(1.0, float(vars_map["height"].get()))
+                if layer.lock_aspect_ratio and ratio > 0:
+                    # 实时预览时保留初始宽高比，减少误操作造成的素材变形。
+                    height = width / ratio
+                    vars_map["height"].set(f"{height:g}")
+                layer.x = x
+                layer.y = y
+                layer.width = width
+                layer.height = height
                 self._refresh_layers_panel()
                 self._redraw_preview()
             except ValueError:
-                sync_entry_state()
+                pass
             finally:
                 applying["busy"] = False
 
@@ -2095,11 +2138,10 @@ class BirthFlowerApp:
         for var in vars_map.values():
             var.trace_add("write", apply_live)
         buttons = ttk.Frame(frame)
-        buttons.grid(row=len(fields) + 2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        buttons.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="确定", command=window.destroy).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="取消", command=restore_snapshot).pack(side="left")
         window.protocol("WM_DELETE_WINDOW", restore_snapshot)
-        sync_entry_state()
 
     def _refresh_layers_panel(self) -> None:
         """刷新右下角图层面板，显示名称、类型、显隐和锁定状态。"""
@@ -2263,7 +2305,7 @@ class BirthFlowerApp:
             return
         # 未选中图层或当前选中的是文本图层时，下拉框仅更新 pending 素材，不能影响现有图层。
         self._set_pending_flower_asset(material_id, sync_fields=True)
-        self.status_var.set("已选择待添加素材，请点击“添加素材为新图层”")
+        self.status_var.set("已选择待添加素材，请点击“添加素材”")
 
     def _set_pending_flower_asset(self, material_id: str, *, sync_fields: bool = False) -> None:
         """保存待添加素材；可选同步旧版月份/flower 字段但不触发新增图层。"""
@@ -2472,7 +2514,7 @@ class BirthFlowerApp:
         for var in self.layout_vars.values():
             var.trace_add("write", lambda *_: self._redraw_preview())
         self.name_var.trace_add("write", lambda *_: self._on_personalization_change())
-        self.case_sensitive_var.trace_add("write", lambda *_: self._on_personalization_change())
+        self.text_case_var.trace_add("write", lambda *_: self._on_personalization_change())
         self.month_var.trace_add("write", lambda *_: self._on_flower_field_change())
         self.flower_var.trace_add("write", lambda *_: self._on_flower_field_change())
         self.font_var.trace_add("write", lambda *_: self._on_font_field_change())
@@ -3132,7 +3174,29 @@ def _preview_text_fill_image(text: str, font_size: int, font_path: Path | None, 
     return image.resize(target_size, resampling)
 
 
+def _reexec_with_complete_env() -> None:
+    """DXF 导出(ezdxf→numpy)和物理尺寸读取(pydantic)需要完整依赖。若当前解释器装不全
+    (常见是缺 numpy/pydantic 的 MSYS .venv),自动用项目内 .venv-win 重新启动应用,
+    免得用户每次手动切解释器、也避免 DXF 一直报"需要 ezdxf"。"""
+    if os.environ.get("FLOWER_PY_REEXEC") or getattr(sys, "frozen", False):
+        return
+    try:
+        import numpy  # noqa: F401  ezdxf 依赖;缺它代表当前解释器不完整
+        return
+    except ImportError:
+        pass
+    candidate = Path(__file__).resolve().parent / ".venv-win" / "Scripts" / "python.exe"
+    if not candidate.is_file():
+        LOGGER.warning("当前 Python 缺 numpy 且未找到 .venv-win;DXF 导出会失败,请用完整环境启动")
+        return
+    LOGGER.info("当前 Python 依赖不全,改用 %s 重新启动应用", candidate)
+    env = dict(os.environ, FLOWER_PY_REEXEC="1")
+    result = subprocess.run([str(candidate), *sys.argv], env=env)
+    sys.exit(result.returncode)
+
+
 def main() -> None:
+    _reexec_with_complete_env()
     root = tk.Tk()
     BirthFlowerApp(root)
     root.mainloop()

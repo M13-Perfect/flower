@@ -126,7 +126,9 @@ $env:OPENAI_API_KEY="你的 OpenAI API Key"
 $env:OPENAI_MODEL="gpt-5-nano"
 $env:OPENAI_PROJECT="proj_xxx"
 $env:OPENAI_ORG_ID="org_xxx"
-.\.venv\bin\python.exe birth_flower_mvp.py
+# 桌面 App 需要完整依赖(ezdxf/numpy/pydantic 等);用 .venv-win 启动,
+# 旧的 MSYS .venv 缺 numpy/pydantic 会导致 DXF 导出报错、物理尺寸设置不可用。
+.\.venv-win\Scripts\python.exe birth_flower_mvp.py
 ```
 
 DeepSeek 速度/准确率测试示例：

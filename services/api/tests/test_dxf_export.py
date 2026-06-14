@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import base64
-import sys
+import io
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
+import ezdxf
 import pytest
+from ezdxf import bbox as ezbbox
 from fastapi.testclient import TestClient
 from fontTools.fontBuilder import FontBuilder
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 
-from app.domain.exports.dxf import _text_with_glyph_overrides
+from app.domain.exports.dxf import _ENGRAVE_LAYER, _text_with_glyph_overrides
 from app.main import app
 
 
@@ -19,7 +20,6 @@ EXPORTED_AT = "2026-06-11T13:14:15.000Z"
 
 
 def test_dxf_export_converts_simple_text_to_path_geometry(tmp_path, monkeypatch) -> None:
-    install_fake_ezdxf(monkeypatch)
     install_project_root(tmp_path, monkeypatch)
     build_test_font(tmp_path / "assets" / "fonts" / "specimen.ttf")
     document = base_document(
@@ -35,15 +35,46 @@ def test_dxf_export_converts_simple_text_to_path_geometry(tmp_path, monkeypatch)
 
     assert response.status_code == 200
     payload = response.json()
-    dxf_text = decode_dxf(payload)
     assert payload["fileName"] == "birth-flower-card_order-1_2026-06-11T13-14-15-000Z.dxf"
     assert payload["metadata"]["templateId"] == "birth-flower-card"
     assert payload["warnings"] == []
-    assert "INSUNITS=0" in dxf_text
-    assert "LAYER=text_1" in dxf_text
-    # Y 翻转(画布高 200):旧 (12,20) -> (12,180),让 DXF 与 SVG 视觉一致。
-    assert "POINT 12.0000,180.0000" in dxf_text
-    assert "TEXT" not in dxf_text
+
+    doc = load_dxf(payload)
+    assert doc.dxfversion == "AC1032"  # R2018
+    assert doc.header["$INSUNITS"] == 0  # px 画布无物理单位
+    types = entity_types(doc)
+    assert "TEXT" not in types
+    # 文字只输出闭合轮廓,DXF 内不填充:EzCad 不认 DXF HATCH,实心改由 EzCad 导入后原生「填充」完成。
+    assert "HATCH" not in types
+    assert "LINE" not in types  # flower 不在 DXF 里排扫描线填充
+    # 字形是可编辑的闭合 POLYLINE/SPLINE 轮廓,正好可被 EzCad 选中填充。
+    assert "POLYLINE" in types
+    assert content_layers(doc) == {_ENGRAVE_LAYER}
+    # Y 翻转(画布高 200):方块字形左上角落在 (12,180)。
+    assert (12.0, 180.0) in all_points(doc)
+
+
+def test_dxf_text_outline_mode_emits_editable_polyline(tmp_path, monkeypatch) -> None:
+    install_project_root(tmp_path, monkeypatch)
+    build_test_font(tmp_path / "assets" / "fonts" / "specimen.ttf")
+    document = base_document(
+        layers=[text_layer("text_1", "A", x=12, y=34, width=80, height=40, font_size=20)],
+    )
+    # 空心模式:字形改输出 SPLINE/POLYLINE 轮廓,而非 HATCH。
+    document["exportSettings"]["text"] = {"fill": "outline"}
+
+    response = TestClient(app).post(
+        "/exports/dxf",
+        json={"document": document, "exportedAt": EXPORTED_AT},
+    )
+
+    assert response.status_code == 200
+    doc = load_dxf(response.json())
+    types = entity_types(doc)
+    assert "HATCH" not in types
+    assert "LINE" not in types  # 空心模式不生成扫描线填充
+    assert "POLYLINE" in types  # 方块字形是直线段 → POLYLINE 轮廓
+    assert (12.0, 180.0) in all_points(doc)
 
 
 def test_dxf_text_helper_ignores_control_character_glyph_override() -> None:
@@ -62,7 +93,6 @@ def test_dxf_text_helper_ignores_control_character_glyph_override() -> None:
 
 
 def test_dxf_export_converts_simple_inline_svg_to_path_geometry(tmp_path, monkeypatch) -> None:
-    install_fake_ezdxf(monkeypatch)
     install_project_root(tmp_path, monkeypatch)
     document = base_document(
         layers=[
@@ -83,16 +113,16 @@ def test_dxf_export_converts_simple_inline_svg_to_path_geometry(tmp_path, monkey
     )
 
     assert response.status_code == 200
-    dxf_text = decode_dxf(response.json())
-    assert "LAYER=svg_1" in dxf_text
+    doc = load_dxf(response.json())
+    assert content_layers(doc) == {_ENGRAVE_LAYER}
+    points = all_points(doc)
     # Y 翻转(画布高 200):y -> 200-y。
-    assert "POINT 5.0000,193.0000" in dxf_text
-    assert "POINT 25.0000,193.0000" in dxf_text
-    assert "POINT 25.0000,173.0000" in dxf_text
+    assert (5.0, 193.0) in points
+    assert (25.0, 193.0) in points
+    assert (25.0, 173.0) in points
 
 
 def test_dxf_export_normalizes_group_transforms_and_units(tmp_path, monkeypatch) -> None:
-    install_fake_ezdxf(monkeypatch)
     install_project_root(tmp_path, monkeypatch)
     document = base_document(
         canvas_unit="mm",
@@ -118,19 +148,19 @@ def test_dxf_export_normalizes_group_transforms_and_units(tmp_path, monkeypatch)
     )
 
     assert response.status_code == 200
-    dxf_text = decode_dxf(response.json())
-    assert "INSUNITS=4" in dxf_text
-    assert "LAYER=path_1" in dxf_text
+    doc = load_dxf(response.json())
+    assert doc.header["$INSUNITS"] == 4
+    assert content_layers(doc) == {_ENGRAVE_LAYER}
+    points = all_points(doc)
     # Y 翻转(画布高 200):y -> 200-y。
-    assert "POINT 20.0000,180.0000" in dxf_text
-    assert "POINT 40.0000,180.0000" in dxf_text
+    assert (20.0, 180.0) in points
+    assert (40.0, 180.0) in points
 
 
 def test_dxf_export_scales_px_canvas_to_template_physical_width_mm(
     tmp_path,
     monkeypatch,
 ) -> None:
-    install_fake_ezdxf(monkeypatch)
     install_project_root(tmp_path, monkeypatch)
     document = base_document(
         dxf_units="mm",
@@ -151,15 +181,13 @@ def test_dxf_export_scales_px_canvas_to_template_physical_width_mm(
     )
 
     assert response.status_code == 200
-    dxf_text = decode_dxf(response.json())
-    points = dxf_points(dxf_text)
-    xs = [point[0] for point in points]
-    assert "INSUNITS=4" in dxf_text
-    assert max(xs) - min(xs) == pytest.approx(80, abs=0.01)
+    doc = load_dxf(response.json())
+    assert doc.header["$INSUNITS"] == 4
+    extents = ezbbox.extents(doc.modelspace())
+    assert extents.size.x == pytest.approx(80, abs=0.01)
 
 
 def test_dxf_export_returns_warnings_for_unsupported_svg_features(tmp_path, monkeypatch) -> None:
-    install_fake_ezdxf(monkeypatch)
     install_project_root(tmp_path, monkeypatch)
     document = base_document(
         layers=[
@@ -183,11 +211,10 @@ def test_dxf_export_returns_warnings_for_unsupported_svg_features(tmp_path, monk
     assert response.status_code == 200
     payload = response.json()
     assert any(warning["code"] == "SVG_UNSUPPORTED_FEATURE" for warning in payload["warnings"])
-    assert "LAYER=svg_1" in decode_dxf(payload)
+    assert content_layers(load_dxf(payload)) == {_ENGRAVE_LAYER}
 
 
 def test_dxf_export_rejects_unsupported_layers_without_file(tmp_path, monkeypatch) -> None:
-    install_fake_ezdxf(monkeypatch)
     install_project_root(tmp_path, monkeypatch)
     document = base_document(
         layers=[
@@ -211,8 +238,7 @@ def test_dxf_export_rejects_unsupported_layers_without_file(tmp_path, monkeypatc
     assert "contentBase64" not in payload
 
 
-def test_dxf_declares_layers_with_uniform_engrave_style(tmp_path, monkeypatch) -> None:
-    install_fake_ezdxf(monkeypatch)
+def test_dxf_collects_all_geometry_on_single_engrave_layer(tmp_path, monkeypatch) -> None:
     install_project_root(tmp_path, monkeypatch)
     document = base_document(
         layers=[
@@ -239,16 +265,15 @@ def test_dxf_declares_layers_with_uniform_engrave_style(tmp_path, monkeypatch) -
     )
 
     assert response.status_code == 200
-    dxf_text = decode_dxf(response.json())
-    # 两个引用图层都必须登记进图层表(R12 只支持颜色;统一色 7 表示同一道工序)。
-    assert "LAYERDEF=layer_flower,color=7" in dxf_text
-    assert "LAYERDEF=layer_text,color=7" in dxf_text
+    doc = load_dxf(response.json())
+    # 花与字必须落在同一内容层、同一颜色 7(同一道激光工序),对齐标准样件。
+    assert content_layers(doc) == {_ENGRAVE_LAYER}
+    assert doc.layers.get(_ENGRAVE_LAYER).dxf.color == 7
 
 
-def test_dxf_adaptive_flattening_keeps_endpoints_and_limits_points(tmp_path, monkeypatch) -> None:
-    install_fake_ezdxf(monkeypatch)
+def test_dxf_cubic_path_becomes_spline_preserving_endpoints(tmp_path, monkeypatch) -> None:
     install_project_root(tmp_path, monkeypatch)
-    # 一条平缓的三次贝塞尔:自适应扁平化应只产少量点,而非固定 16 段。
+    # 一条三次贝塞尔:导出为 SPLINE(平滑可编辑曲线),而非扁平折线。
     document = base_document(
         canvas_unit="mm",
         dxf_units="mm",
@@ -268,12 +293,15 @@ def test_dxf_adaptive_flattening_keeps_endpoints_and_limits_points(tmp_path, mon
     )
 
     assert response.status_code == 200
-    points = dxf_points(decode_dxf(response.json()))
-    # 近直曲线点数应远小于旧固定 16 段(含起点),且端点精确保留。
+    doc = load_dxf(response.json())
+    splines = [e for e in doc.modelspace() if e.dxftype() == "SPLINE"]
+    assert len(splines) == 1
+    control = [(round(float(p[0]), 4), round(float(p[1]), 4)) for p in splines[0].control_points]
+    # 单段三次贝塞尔 → 4 个控制点,且端点精确保留。
     # Y 翻转(画布高 200):端点 y=0 -> 200。
-    assert len(points) <= 6
-    assert points[0] == (0.0, 200.0)
-    assert points[-1] == (3.0, 200.0)
+    assert len(control) == 4
+    assert control[0] == (0.0, 200.0)
+    assert control[-1] == (3.0, 200.0)
 
 
 def install_project_root(path: Path, monkeypatch) -> None:
@@ -281,79 +309,38 @@ def install_project_root(path: Path, monkeypatch) -> None:
     (path / "assets" / "fonts").mkdir(parents=True, exist_ok=True)
 
 
-def install_fake_ezdxf(monkeypatch) -> None:
-    fake = ModuleType("ezdxf")
-    fake.new = lambda dxfversion="R2010": FakeDxfDocument(dxfversion)
-    monkeypatch.setitem(sys.modules, "ezdxf", fake)
+def load_dxf(payload: dict[str, Any]) -> Any:
+    text = base64.b64decode(payload["contentBase64"]).decode("utf-8")
+    return ezdxf.read(io.StringIO(text))
 
 
-class FakeLayerTable:
-    def __init__(self) -> None:
-        self.entries: dict[str, dict[str, Any]] = {}
-
-    def has_entry(self, name: str) -> bool:
-        return name in self.entries
-
-    def add(self, name: str, color: int | None = None) -> None:
-        self.entries[name] = {"color": color}
+def entity_types(doc: Any) -> list[str]:
+    return [entity.dxftype() for entity in doc.modelspace()]
 
 
-class FakeDxfDocument:
-    def __init__(self, dxfversion: str) -> None:
-        self.dxfversion = dxfversion
-        self.header: dict[str, Any] = {}
-        self.units: int | None = None
-        self._modelspace = FakeModelspace()
-        self.layers = FakeLayerTable()
-
-    def modelspace(self) -> "FakeModelspace":
-        return self._modelspace
-
-    def write(self, stream) -> None:
-        stream.write(f"VERSION={self.dxfversion}\n")
-        stream.write(f"INSUNITS={self.header.get('$INSUNITS')}\n")
-        for name, entry in self.layers.entries.items():
-            stream.write(f"LAYERDEF={name},color={entry['color']}\n")
-        for item in self._modelspace.polylines:
-            stream.write(f"LAYER={item['layer']}\n")
-            stream.write(f"CLOSED={item['closed']}\n")
-            for x, y in item["points"]:
-                stream.write(f"POINT {x:.4f},{y:.4f}\n")
+def content_layers(doc: Any) -> set[str]:
+    return {entity.dxf.layer for entity in doc.modelspace()}
 
 
-class FakePolyline:
-    def __init__(self, record: dict[str, Any]) -> None:
-        self._record = record
-
-    def close(self, state: bool = True) -> None:
-        self._record["closed"] = bool(state)
-
-
-class FakeModelspace:
-    def __init__(self) -> None:
-        self.polylines: list[dict[str, Any]] = []
-
-    def add_polyline2d(self, points, dxfattribs=None) -> FakePolyline:
-        record = {
-            "points": [(float(x), float(y)) for x, y in points],
-            "closed": False,
-            "layer": (dxfattribs or {}).get("layer", "0"),
-        }
-        self.polylines.append(record)
-        return FakePolyline(record)
+def _entity_points(entity: Any) -> list[tuple[float, float]]:
+    kind = entity.dxftype()
+    if kind == "SPLINE":
+        raw = entity.control_points
+    elif kind == "POLYLINE":
+        raw = list(entity.points())
+    elif kind == "LWPOLYLINE":
+        raw = list(entity.get_points("xy"))
+    elif kind == "LINE":
+        raw = [entity.dxf.start, entity.dxf.end]
+    else:
+        raw = []
+    return [(round(float(point[0]), 4), round(float(point[1]), 4)) for point in raw]
 
 
-def decode_dxf(payload: dict[str, Any]) -> str:
-    return base64.b64decode(payload["contentBase64"]).decode("utf-8")
-
-
-def dxf_points(dxf_text: str) -> list[tuple[float, float]]:
+def all_points(doc: Any) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
-    for line in dxf_text.splitlines():
-        if not line.startswith("POINT "):
-            continue
-        x_text, y_text = line.removeprefix("POINT ").split(",", maxsplit=1)
-        points.append((float(x_text), float(y_text)))
+    for entity in doc.modelspace():
+        points.extend(_entity_points(entity))
     return points
 
 

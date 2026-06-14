@@ -1,4 +1,5 @@
 from models import AIParseConfig, ParseResult
+import parse_pipeline as parse_pipeline_module
 from parse_pipeline import parse_order_remark_auto
 
 
@@ -21,6 +22,47 @@ def test_parse_order_remark_auto_uses_local_when_ai_is_not_preferred():
     assert result.flower == 2
     assert calls == []
     assert result.warnings == []
+
+
+def test_parse_order_remark_auto_default_local_uses_web_local_rules():
+    def forbidden_gpt(*_args, **_kwargs):
+        raise AssertionError("GPT should not be called")
+
+    result = parse_order_remark_auto(
+        "Customer Name: Ava Chen\n"
+        "Birth Month: June\n"
+        "Flower: Rose\n"
+        "Font Design: Font 8",
+        ai_config=AIParseConfig(enabled=False, prefer_ai=True),
+        gpt_parser=forbidden_gpt,
+    )
+
+    assert result.text == "Ava Chen"
+    assert result.month == 6
+    assert result.flower == 1
+    assert result.font == 8
+    assert result.warnings == []
+
+
+def test_parse_order_remark_auto_defaults_to_shared_local_parser(monkeypatch):
+    calls = []
+
+    def shared_local(remark):
+        calls.append(remark)
+        return ParseResult(text="Shared", month=9, font=8, flower=2, confidence=0.97)
+
+    monkeypatch.setattr(parse_pipeline_module, "parse_order_remark_local", shared_local)
+
+    result = parse_order_remark_auto(
+        "web local format",
+        ai_config=AIParseConfig(enabled=False, prefer_ai=False),
+    )
+
+    assert result.text == "Shared"
+    assert result.month == 9
+    assert result.font == 8
+    assert result.flower == 2
+    assert calls == ["web local format"]
 
 
 def test_parse_order_remark_auto_uses_gpt_first_when_ai_is_preferred():

@@ -31,6 +31,21 @@ class AIProfile:
 
 
 @dataclass(frozen=True)
+class ProductConfig:
+    """一个产品（每窗口=一个产品）：声明该产品可用的素材库/字体库目录与默认生产参数。
+
+    见 docs/superpowers/plans/2026-06-14-layer-material-library-system.md §3。
+    """
+
+    id: str = "birth-flower-card"
+    name: str = "生日花卡"
+    image_library_dirs: tuple[Path, ...] = ()
+    font_library_dirs: tuple[Path, ...] = ()
+    defaults: EngravingLayout = EngravingLayout()
+    manual_fields: tuple[str, ...] = ()  # 人工确认字段集；空=用产品默认（Phase 2 UI 消费）
+
+
+@dataclass(frozen=True)
 class AppConfig:
     flower_dir: Path = Path("BirthMonth flowers")
     font_source: Path = Path("Birthmonth_font.ttf")
@@ -39,6 +54,20 @@ class AppConfig:
     ai_profiles: tuple[AIProfile, ...] = (AIProfile(),)
     active_ai_profile: str = DEFAULT_AI_PROFILE_NAME
     layout_defaults: EngravingLayout = EngravingLayout()
+    # 新产品体系：每个产品引用自己的素材库/字体库目录列表 + 默认生产参数。
+    # 旧配置无 products 时由 __post_init__ 迁移合成「产品0」，用户零感知。
+    products: tuple[ProductConfig, ...] = ()
+    active_product_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.products:
+            object.__setattr__(
+                self,
+                "products",
+                _ensure_products((), self.flower_dir, self.font_source, self.layout_defaults),
+            )
+        if not self.active_product_id:
+            object.__setattr__(self, "active_product_id", self.products[0].id)
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
@@ -65,6 +94,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         ai_profiles=profiles,
         active_ai_profile=active_profile,
         layout_defaults=_layout_from_payload(payload.get("layout_defaults")),
+        products=_products_from_payload(payload.get("products")),
+        active_product_id=_string_value(payload, "active_product_id", ""),
     )
 
 
@@ -80,6 +111,8 @@ def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Pa
         "ai_profiles": [_ai_profile_to_payload(profile) for profile in config.ai_profiles],
         "active_ai_profile": active_ai_profile(config).name,
         "layout_defaults": _layout_to_payload(config.layout_defaults),
+        "products": [_product_to_payload(product) for product in config.products],
+        "active_product_id": active_product(config).id,
     }
     config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return config_path
@@ -146,6 +179,75 @@ def active_ai_profile(config: AppConfig) -> AIProfile:
         if profile.name == config.active_ai_profile:
             return profile
     return config.ai_profiles[0] if config.ai_profiles else AIProfile()
+
+
+def active_product(config: AppConfig) -> ProductConfig:
+    """返回当前激活产品；找不到时回退到第一个（products 恒非空，见 AppConfig.__post_init__）。"""
+    for product in config.products:
+        if product.id == config.active_product_id:
+            return product
+    return config.products[0] if config.products else ProductConfig()
+
+
+def _ensure_products(
+    products: tuple[ProductConfig, ...],
+    flower_dir: Path,
+    font_source: Path,
+    layout_defaults: EngravingLayout,
+) -> tuple[ProductConfig, ...]:
+    """已有 products 原样返回；否则把旧全局 flower_dir/font_source/layout_defaults 合成「产品0=生日花卡」。"""
+    if products:
+        return products
+    return (
+        ProductConfig(
+            id="birth-flower-card",
+            name="生日花卡",
+            image_library_dirs=(flower_dir,),
+            font_library_dirs=(font_source,),
+            defaults=layout_defaults,
+        ),
+    )
+
+
+def _products_from_payload(value: Any) -> tuple[ProductConfig, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(_product_from_payload(item) for item in value if isinstance(item, dict))
+
+
+def _product_from_payload(payload: dict[str, Any]) -> ProductConfig:
+    product_id = _string_value(payload, "id", "product")
+    return ProductConfig(
+        id=product_id,
+        name=_string_value(payload, "name", product_id),
+        image_library_dirs=_path_tuple(payload.get("image_library_dirs")),
+        font_library_dirs=_path_tuple(payload.get("font_library_dirs")),
+        defaults=_layout_from_payload(payload.get("defaults")),
+        manual_fields=_str_tuple(payload.get("manual_fields")),
+    )
+
+
+def _product_to_payload(product: ProductConfig) -> dict[str, Any]:
+    return {
+        "id": product.id,
+        "name": product.name,
+        "image_library_dirs": [str(path) for path in product.image_library_dirs],
+        "font_library_dirs": [str(path) for path in product.font_library_dirs],
+        "defaults": _layout_to_payload(product.defaults),
+        "manual_fields": list(product.manual_fields),
+    }
+
+
+def _path_tuple(value: Any) -> tuple[Path, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(Path(str(item)) for item in value if str(item).strip())
+
+
+def _str_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(item).strip() for item in value if str(item).strip())
 
 
 def _string_value(payload: dict[str, Any], key: str, default: str) -> str:

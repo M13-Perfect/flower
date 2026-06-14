@@ -50,6 +50,10 @@ SAFE_MARGIN_Y = 70
 MESSAGE_MIN_FONT_SIZE = 36
 NAME_MIN_FONT_SIZE = 48
 LINE_HEIGHT_RATIO = 1.18
+# 名字墨迹高度占文本框高度的比例：让不同订单的名字视觉大小一致（而不是各自撑满框）。
+NAME_HEIGHT_RATIO = 0.62
+# 量字基准字号：在该字号下测墨迹，再线性换算到目标字号，避免反复栅格化。
+_REF_FONT_SIZE = 200
 
 
 def layout_personalization_text(
@@ -68,6 +72,198 @@ def layout_personalization_text(
     return _layout_name(raw_text, layout, safe_area, font_path)
 
 
+@dataclass(frozen=True)
+class BoxTextFit:
+    """文本框内统一排版结果（box 本地坐标）。预览/PNG/矢量导出共用同一份，保证所见即所得。"""
+
+    font_size: int
+    lines: tuple[str, ...]
+    # 每行 (pen_x, baseline_y)：anchor="ls"（左侧+基线）绘制锚点；矢量端把笔位放这里逐字推进。
+    origins: tuple[tuple[float, float], ...]
+    did_fit: bool
+    warnings: tuple[str, ...]
+    ink_bounds: Bounds | None
+
+
+def fit_text_box(
+    text: str,
+    box_width: float,
+    box_height: float,
+    font_path: Path | str | None = None,
+    *,
+    personalization_type: str = "auto",
+    font_size_cap: float | None = None,
+    align: str = "center",
+    vertical_align: str = "middle",
+    line_spacing: float = LINE_HEIGHT_RATIO,
+    letter_spacing: float = 0.0,
+) -> BoxTextFit:
+    """文本框内统一适配：选最大等比字号 + 断行 + 每行基线锚点（box 本地像素）。
+
+    这是“排版只算一次”的单一入口：TextRenderer（Pillow 预览/PNG）与桌面导出（烘给
+    dxf/svg 矢量端）都调用它，拿到同一组 font_size/lines/origins，从而预览==导出。
+    返回的 origins 与 lines 严格一一对应（零墨迹行也占一个锚点）。
+    """
+    box_w = max(1.0, float(box_width))
+    box_h = max(1.0, float(box_height))
+    raw = "" if text is None else str(text)
+    clean = raw.strip()
+    ptype = _resolved_personalization_type(clean, personalization_type)
+    if ptype == "message":
+        font_size, lines = _fit_message_box(raw, box_w, box_h, font_path, font_size_cap)
+    else:
+        font_size = _fit_name_font_size(raw, box_w, box_h, font_path, font_size_cap)
+        lines = [raw]
+    origins, ink_union = _placement_origins_ls(
+        lines, font_size, box_w, box_h, font_path,
+        align=align, vertical_align=vertical_align, line_spacing=line_spacing,
+        letter_spacing=letter_spacing,
+    )
+    # ink_union 为 None 表示没有可见墨迹（空白/不可见字符）——视为已适配，不报警告。
+    did_fit = ink_union is None or (
+        ink_union.left >= -0.5
+        and ink_union.top >= -0.5
+        and ink_union.right <= box_w + 0.5
+        and ink_union.bottom <= box_h + 0.5
+    )
+    warnings: tuple[str, ...] = () if did_fit else ("文字超出文本框，请缩短文字或调整文本框。",)
+    return BoxTextFit(int(max(1, font_size)), tuple(lines), tuple(origins), bool(did_fit), warnings, ink_union)
+
+
+def _fit_name_font_size(
+    text: str,
+    box_w: float,
+    box_h: float,
+    font_path: Path | str | None,
+    cap: float | None = None,
+) -> int:
+    """单行名字的等比字号：墨迹高度取框高的 NAME_HEIGHT_RATIO，太宽则等比缩到框宽。"""
+    box_w = max(1.0, float(box_w))
+    box_h = max(1.0, float(box_h))
+    if not str(text).strip():
+        return max(1, min(NAME_MIN_FONT_SIZE, int(box_h / LINE_HEIGHT_RATIO) or 1))
+    ink = measure_text_ink_bbox(text, _REF_FONT_SIZE, font_path)
+    if ink.width <= 0 or ink.height <= 0:
+        return max(1, min(NAME_MIN_FONT_SIZE, int(box_h / LINE_HEIGHT_RATIO) or 1))
+    fit_by_height = _REF_FONT_SIZE * (box_h * NAME_HEIGHT_RATIO) / ink.height
+    fit_by_width = _REF_FONT_SIZE * box_w / ink.width
+    size = min(fit_by_height, fit_by_width)
+    if cap and cap > 0:
+        size = min(size, float(cap))
+    # 下限优先保证装得下：宽度受限的长名字可以低于 NAME_MIN_FONT_SIZE。
+    size = max(size, min(float(NAME_MIN_FONT_SIZE), fit_by_width))
+    size = max(1, int(size))
+    # 栅格化/线性外推有误差：按真实墨迹校正，确保最终字号下墨迹仍装进框（宁可略小，绝不溢出）。
+    for _ in range(8):
+        ink_now = measure_text_ink_bbox(text, size, font_path)
+        if ink_now.width <= box_w and ink_now.height <= box_h:
+            break
+        shrink = min(box_w / max(1.0, ink_now.width), box_h / max(1.0, ink_now.height))
+        next_size = max(1, int(size * shrink))
+        size = next_size if next_size < size else size - 1
+        if size <= 1:
+            break
+    return max(1, size)
+
+
+def _fit_message_box(
+    text: str,
+    box_w: float,
+    box_h: float,
+    font_path: Path | str | None,
+    cap: float | None = None,
+) -> tuple[int, list[str]]:
+    """多行祝福语：二分最大字号 + 分词换行（沿用既有逻辑，box 即 slot）。cap 为字号上限。"""
+    slot = Bounds(0.0, 0.0, max(1.0, float(box_w)), max(1.0, float(box_h)))
+    best_lines: tuple[str, ...] = (text,)
+    best_font = MESSAGE_MIN_FONT_SIZE
+    high_limit = min(int(slot.height / LINE_HEIGHT_RATIO), 160)
+    if cap and cap > 0:
+        high_limit = min(high_limit, int(cap))
+    low, high = MESSAGE_MIN_FONT_SIZE, max(MESSAGE_MIN_FONT_SIZE, high_limit)
+    while low <= high:
+        candidate = (low + high) // 2
+        lines = _wrap_text(text, candidate, slot.width, font_path)
+        if _lines_fit(lines, candidate, slot, font_path):
+            best_font = candidate
+            best_lines = tuple(lines)
+            low = candidate + 1
+        else:
+            high = candidate - 1
+    return best_font, list(best_lines)
+
+
+def _placement_origins_ls(
+    lines: list[str],
+    font_size: int,
+    box_w: float,
+    box_h: float,
+    font_path: Path | str | None,
+    *,
+    align: str = "center",
+    vertical_align: str = "middle",
+    line_spacing: float = LINE_HEIGHT_RATIO,
+    letter_spacing: float = 0.0,
+) -> tuple[list[tuple[float, float]], Bounds | None]:
+    """按真实墨迹把多行文本居中放进框，返回**每行**一个 anchor='ls' 锚点 (pen_x, baseline_y)。
+
+    锚点与 lines 严格一一对应（零墨迹行也占位），矢量端按位置取用不会错位。
+    letter_spacing!=0 时字间距让墨迹整体变宽，居中按补偿后的总宽计算，避免导出右偏。
+    """
+    box_w = max(1.0, float(box_w))
+    box_h = max(1.0, float(box_h))
+    font_size = max(1, int(font_size))
+    ascent, _descent = _font_ascent_descent(font_path, font_size)
+    line_height = font_size * line_spacing
+    per_line: list[tuple[float, float]] = []  # 每行 (pen_x, baseline_la)，与 lines 一一对应
+    union_left = union_top = float("inf")
+    union_right = union_bottom = float("-inf")
+    for index, line in enumerate(lines):
+        baseline_la = ascent + index * line_height  # 基线在 la 空间（顶端=0）
+        ink = measure_text_ink_bbox(line, font_size, font_path)
+        if ink.width <= 0 or ink.height <= 0:
+            # 零墨迹行（空行/不可见字符）：仍占一个锚点，保持 lines↔origins 一一对应。
+            default_pen = 0.0 if align == "left" else (box_w if align == "right" else box_w / 2)
+            per_line.append((default_pen, baseline_la))
+            continue
+        spacing_pad = max(0, len(line) - 1) * float(letter_spacing)
+        spread_width = ink.width + spacing_pad
+        if align == "center":
+            pen_x = (box_w - spread_width) / 2 - ink.left
+        elif align == "right":
+            pen_x = box_w - ink.right - spacing_pad
+        else:
+            pen_x = -ink.left
+        per_line.append((pen_x, baseline_la))
+        union_left = min(union_left, pen_x + ink.left)
+        union_right = max(union_right, pen_x + ink.left + spread_width)
+        union_top = min(union_top, ink.top + index * line_height)
+        union_bottom = max(union_bottom, ink.bottom + index * line_height)
+    if union_bottom <= union_top:  # 全部为零墨迹行：无需竖直居中
+        return [(pen_x, baseline_la) for (pen_x, baseline_la) in per_line], None
+    block_height = union_bottom - union_top
+    if vertical_align in ("middle", "center"):
+        shift_y = (box_h - block_height) / 2 - union_top
+    elif vertical_align == "bottom":
+        shift_y = box_h - block_height - union_top
+    else:
+        shift_y = -union_top
+    origins = [(pen_x, baseline_la + shift_y) for (pen_x, baseline_la) in per_line]
+    ink_union = Bounds(union_left, union_top + shift_y, union_right, union_bottom + shift_y)
+    return origins, ink_union
+
+
+def _font_ascent_descent(font_path: Path | str | None, font_size: int) -> tuple[float, float]:
+    try:
+        from PIL import ImageFont
+
+        font = _load_pillow_font(ImageFont, _font_path_key(font_path), max(1, int(font_size)))
+        ascent, descent = font.getmetrics()
+        return float(ascent), float(descent)
+    except Exception:
+        return float(font_size), float(font_size) * 0.25
+
+
 def _safe_area(layout: EngravingLayout) -> Bounds:
     return Bounds(
         SAFE_MARGIN_X,
@@ -84,11 +280,10 @@ def _layout_name(
     font_path: Path | str | None,
 ) -> TextLayoutResult:
     slot = _name_slot(layout, safe_area)
-    min_size = min(8, max(1, int(slot.height / LINE_HEIGHT_RATIO)))
-    max_size = max(min_size, int(slot.height / LINE_HEIGHT_RATIO))
-    font_size = _largest_single_line_font(text, max_size, min_size, slot, font_path)
+    # 等比适配：选最大字号让真实墨迹放进文本框（绝不非等比拉伸花体），再把墨迹居中。
+    font_size = _fit_name_font_size(text, slot.width, slot.height, font_path)
     ink_bounds = measure_text_ink_bbox(text, font_size, font_path)
-    bounds, draw_x, draw_y, render_scale_x, render_scale_y = _position_ink_bounds_to_fill_slot(ink_bounds, slot)
+    bounds, draw_x, draw_y = _position_ink_bounds_in_slot(ink_bounds, slot)
     warnings: list[str] = []
     did_fit = _bounds_within(bounds, safe_area)
     if not did_fit:
@@ -107,8 +302,8 @@ def _layout_name(
         draw_y=draw_y,
         ink_bounds=ink_bounds,
         line_origins=((draw_x, draw_y),),
-        render_scale_x=render_scale_x,
-        render_scale_y=render_scale_y,
+        render_scale_x=1.0,
+        render_scale_y=1.0,
     )
 
 
@@ -198,28 +393,6 @@ def _clip_bounds(bounds: Bounds, safe_area: Bounds) -> Bounds:
     return Bounds(left, top, right, bottom)
 
 
-def _largest_single_line_font(
-    text: str,
-    max_size: int,
-    min_size: int,
-    slot: Bounds,
-    font_path: Path | str | None,
-) -> int:
-    if not text.strip():
-        return min_size
-    low, high = min_size, max_size
-    best = min_size
-    while low <= high:
-        candidate = (low + high) // 2
-        bbox = measure_text_ink_bbox(text, candidate, font_path)
-        if bbox.width <= slot.width and bbox.height <= slot.height:
-            best = candidate
-            low = candidate + 1
-        else:
-            high = candidate - 1
-    return best
-
-
 def _wrap_text(text: str, font_size: int, max_width: float, font_path: Path | str | None) -> list[str]:
     tokens = _wrap_tokens(text)
     lines: list[str] = []
@@ -283,18 +456,6 @@ def _position_ink_bounds_in_slot(ink_bounds: Bounds, slot: Bounds) -> tuple[Boun
     draw_x = left - ink_bounds.left
     draw_y = top - ink_bounds.top
     return Bounds(left, top, left + ink_bounds.width, top + ink_bounds.height), draw_x, draw_y
-
-
-def _position_ink_bounds_to_fill_slot(ink_bounds: Bounds, slot: Bounds) -> tuple[Bounds, float, float, float, float]:
-    """单行姓名按真实墨迹 bbox 非等比铺满用户方框，四边直接贴合方框边界。"""
-    if ink_bounds.width <= 0 or ink_bounds.height <= 0:
-        bounds, draw_x, draw_y = _position_ink_bounds_in_slot(ink_bounds, slot)
-        return bounds, draw_x, draw_y, 1.0, 1.0
-    render_scale_x = slot.width / ink_bounds.width
-    render_scale_y = slot.height / ink_bounds.height
-    draw_x = slot.left - ink_bounds.left
-    draw_y = slot.top - ink_bounds.top
-    return slot, draw_x, draw_y, render_scale_x, render_scale_y
 
 
 def _centered_bounds(center_x: float, center_y: float, width: float, height: float) -> Bounds:

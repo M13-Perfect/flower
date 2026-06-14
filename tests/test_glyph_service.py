@@ -33,6 +33,38 @@ def test_font2_default_payload_binds_26_ending_glyphs():
     assert result.glyph_codepoint == "U+E075"
 
 
+def test_font4_default_payload_binds_26_heart_ending_glyphs():
+    payload = default_glyph_map_payload()
+    letters = payload["Font 4"]["letters"]
+
+    assert tuple(letters) == tuple("abcdefghijklmnopqrstuvwxyz")
+    assert letters["a"]["codepoint"] == "U+E034"
+    assert letters["n"]["codepoint"] == "U+E041"
+    assert letters["z"]["codepoint"] == "U+E04D"
+
+    config = GlyphMapConfig.load(Path("glyph_maps/glyph_maps.json"))
+    result = resolve_glyph("Jazmin", "Font 4", config)
+
+    assert result.render_text == "Jazmi" + chr(0xE041)
+    assert result.source_letter == "n"
+    assert result.glyph_codepoint == "U+E041"
+
+
+def test_font4_defaults_are_merged_into_legacy_empty_config(tmp_path):
+    config_path = tmp_path / "glyph_maps.json"
+    config_path.write_text(
+        '{"Font 4": {"enabled": true, "apply_mode": "replace_last_letter", "letters": {}}}',
+        encoding="utf-8",
+    )
+
+    config = GlyphMapConfig.load(config_path)
+    result = resolve_glyph("Jazmin", "Font 4", config)
+
+    assert result.render_text == "Jazmi" + chr(0xE041)
+    assert config.get_glyph_for_letter("Font 4", "n")["codepoint"] == "U+E041"
+    assert config.get_glyph_for_letter("Font 2", "n")["codepoint"] == "U+E075"
+
+
 def test_font4_jazmin_replaces_last_n_when_mapping_exists(tmp_path):
     config = _config(tmp_path, {"n": "U+E014"})
 
@@ -82,8 +114,23 @@ def test_chinese_name_needs_review_without_glyph(tmp_path):
     assert "未找到英文字母" in result.reason
 
 
-def test_missing_letter_mapping_does_not_apply_glyph(tmp_path):
-    result = resolve_glyph("Jazmin", "Font 4", _config(tmp_path, {"a": "U+E001"}))
+def test_missing_letter_mapping_does_not_apply_glyph_for_custom_font(tmp_path):
+    config_path = tmp_path / "glyph_maps.json"
+    config = GlyphMapConfig.load(config_path)
+    config.data["Font 9"] = {
+        "enabled": True,
+        "apply_mode": "replace_last_letter",
+        "description": "Custom test font",
+        "letters": {
+            "a": {
+                "codepoint": "U+E001",
+                "label": "a ending glyph",
+            }
+        },
+    }
+    config.save()
+
+    result = resolve_glyph("Jazmin", "Font 9", GlyphMapConfig.load(config_path))
 
     assert result.render_text == "Jazmin"
     assert result.source_letter == "n"
