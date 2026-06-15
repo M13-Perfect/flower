@@ -25,6 +25,15 @@
 6. 桌面文本输入框加**右键复制/粘贴**菜单。
 > **2026-06-14 新需求（已出 ExecPlan，待实现）**：把「单产品 + 全局单素材库 + month/flower 定位 + 全局生产参数」演进为 **Product → 素材库 → 素材(key/别名/标签/默认参数) → 图层(可挂库+生产参数 override)**。素材/字体不再单一；月份字段→「素材库+素材」选择器；订单解析改为把库 catalog 注入 GPT、动态枚举校验 material_key（本地不写死）。演进兼容（birth-flower=产品0，month/flower 降为标签，金标/批量不破）；后期左侧加产品切换器（每窗口=一个产品）。**设计与分阶段计划见 `docs/superpowers/plans/2026-06-14-layer-material-library-system.md`**。本轮只出文档未改代码。
 
+## 本会话改动（2026-06-15 · Phase 2 增量 3-4-5 全部落地）
+
+承接上一会话（已提交本线两提交）。用户拍板「完成剩下的 345」，且增量3 选「完整重构」。按风险从低到高 4→5→3 实现，每增量先测后提交，全量 **358 passed, ruff clean**。
+- **增量4（属性面板生产参数随图层）** `e723e82`：图层面板加 位置X/Y/宽/高 编辑；`_apply_layer_production` 写回画布几何（与拖拽同路径，不旁路 `_apply_canvas_fit`）+ 记 `layer.production`；新增 `_slot_defaults/_layer_library_entry_defaults/_layer_effective_production`（§5 resolve_chain：产品默认→库默认→素材默认→override）。
+- **增量5（设置窗口管库目录）** `72ea927`：`config_store.with_product_library_dirs`（纯函数，只改激活产品 + 首目录回写顶层迁移入口）；设置「素材库/字体库」tab 改目录列表编辑器（Listbox+增删）；`_scan_assets` bundle = 主库(单目录入口即时生效)+产品配置附加库 → 多库。**顺手修潜伏 BUG**：`_save_current_config` 原整体重建 AppConfig 会清空 products/active/收展态（与 `_save_settings_window` 同坑），改 `dataclasses.replace`。
+- **增量3（人工确认面板重构，完整版）** `4ff0706`：订单面板去掉手填「月份」Spinbox → 只读「素材月份」chip；生产参数区在 素材/字体 下拉上方加「素材库/字体库」选择器（数据驱动 `active_bundle`，选库 → `_assets_for_selected_*_library` 按 `path.name` 过滤候选）；`_merge_additional_library_assets` 把首库之外的库 entries 转 FlowerAsset/FontAsset 并入候选（**单库时空操作 → 当前生产零行为变化**）。**关键安全设计**：`month_var/flower_var/font_var` 保留为**内部派生态**（随选中素材/字体程序化设置），导出/金标/批量/导入全走旧路径不变，仅 UI 不再手填。
+- ⚠️ **真机手测仍待用户做**：只过了自动化测试 + 真 Tk root 构造冒烟，没在真实窗口里点完整链路。改完 Python **务必完全关掉 App 重开再测**（选库切换、调几何、加不同库素材、导一单核 ezdxf 实体类型应仍 R2018+SPLINE/POLYLINE 无 TEXT/HATCH）。
+- 设计/接线契约与逐 Step 勾选见 `docs/superpowers/plans/2026-06-14-layer-material-library-system.md` Task 2。
+
 ## 本会话改动（2026-06-15 · 审查并提交本线两提交）
 
 - **审查 + 选择性提交本线工作**（用户拍板"审查+提交本线"）。先全量复跑 **348 passed / 19.46s**、ruff clean，再按概念分两提交（显式 path 暂存，**Electron 改动/dev-*.log/tmp_out/.claude 全排除在外**）：

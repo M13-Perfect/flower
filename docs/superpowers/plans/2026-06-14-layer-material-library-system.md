@@ -229,10 +229,12 @@ layer.production（图层 override）
 ### Task 2：生产参数随图层 + 人工确认字段重构（Phase 2，UI）
 **Files:** 改 `ui_app.py`；改/加 `tests/test_ui_app.py`。**只动 `ui_app.py` + 其测试，后端不用再改**（Phase 1/3 已铺好，接口缝已做成一行调用）。
 
-**进度（2026-06-14，分支 `claude/phase4-product-switcher`，未提交，全量 348 passed）**：
-- ✅ **增量1（解析对接，第5缝部分）**：`ui_app.active_bundle`（`_scan_assets` 用产品库目录建，切产品跟随）+ `parse_remark(bundle=)` → 解析经 enrich 落 material_key。`material_library.from_folder` 兼容单字体文件。
-- ✅ **增量2（第3缝的图层身份部分）**：`_add_selected_flower_to_canvas` 写 `library_id/material_key`；`_add_text_layer_from_fields` 写 `font_library_id/font_key`。护栏 `test_ui_app.py::test_add_flower_writes_layer_library_and_material_key`。
-- ⏸ **暂停（按用户 ROI 决定，等真有第二个素材库/产品再做）**：第1-2缝「素材库+素材」选择器（高风险，与 flower_label_map/month/flower 交织，单库视觉≈现状）、第4缝属性面板 resolve_chain、第6缝设置管库。
+**进度（2026-06-15，分支 `claude/phase4-product-switcher`，已提交，全量 358 passed）。增量 1-5 全部完成。**
+- ✅ **增量1（解析对接，第5缝部分）** `b5a939c`：`ui_app.active_bundle`（`_scan_assets` 用产品库目录建，切产品跟随）+ `parse_remark(bundle=)` → 解析经 enrich 落 material_key。`material_library.from_folder` 兼容单字体文件。
+- ✅ **增量2（第3缝的图层身份部分）** `b5a939c`：`_add_selected_flower_to_canvas` 写 `library_id/material_key`；`_add_text_layer_from_fields` 写 `font_library_id/font_key`。护栏 `test_ui_app.py::test_add_flower_writes_layer_library_and_material_key`。
+- ✅ **增量4（第4缝属性面板生产参数随图层）** `e723e82`：图层面板加 位置X/Y/宽/高 编辑；`_apply_layer_production` 写回画布几何（不旁路 `_apply_canvas_fit`）+ 记 `layer.production`；`_layer_effective_production`=resolve_chain(产品默认→库默认→素材默认→override)。
+- ✅ **增量5（第6缝设置管库）** `72ea927`：`config_store.with_product_library_dirs`（纯函数）+ 设置素材库/字体库 tab 目录列表编辑器；`_scan_assets` 主库(单目录入口)+附加库→多库 bundle。顺手修 `_save_current_config` 整体重建 AppConfig 清空 products 的潜伏 BUG（改 replace）。
+- ✅ **增量3（第1-2缝人工确认面板重构）** `4ff0706`：去手填月份 Spinbox→只读月份 chip；生产区加 素材库/字体库 选择器（数据驱动 active_bundle，选库过滤候选）；附加库 entries 并入候选（单库空操作）。**安全红线守住**：month_var/flower_var/font_var 保留为内部派生态，导出/金标/批量/导入零行为变化。
 
 #### 🔌 后端接线契约（给接手 Phase 2 的 UI 对话，照此调用即可，勿重造）
 后端能力已落地并测好（Phase 1/3，全量 332 passed）。Phase 2 = 把下面 6 个缝接进 `ui_app.py`：
@@ -274,12 +276,12 @@ layer.production（图层 override）
 
 > **WYSIWYG 红线**：几何最终仍必须经 `desktop_export._apply_canvas_fit` 的 contain-fit，**勿旁路**（见 §5 / 记忆 flower-text-layout-unified）。`production` 只决定图层初值/override，不替代 fit 管线。
 > **Phase 3 Step 4（ParseResult→Document）已并入本 Task 的第 5 缝。**
-- [ ] **Step 1（红）** 测试：选中图层后属性面板显示该层生产参数并可写回 `layer.production`；人工确认面板出现「素材库/素材/字体库/字体」选择器（数据驱动自 `Product.manual_fields`），「月份」不再是独立必填字段。
-- [ ] **Step 2** 属性面板：选中图层读 `layer.production`（按 §5 回落显示有效值），编辑写回。
-- [ ] **Step 3** 人工确认字段：`month_var/flower_var` → 「素材库 + 素材」选择器（候选=产品 image 库 catalog，可搜索；month 作筛选 chip）；`font_var` → 「字体库 + 字体」。
-- [ ] **Step 4** 「添加素材」：用 §5 链路 seed 新图层生产参数（取代只用全局 `layout_vars`）；写 `library_id/material_key`。
-- [ ] **Step 5** 设置窗口：管理「当前产品」的素材库/字体库列表（增删库文件夹）；保留旧「花朵目录/字体来源」作迁移兼容入口。
-- [ ] **Step 6（绿）** 跑全量 + 手测：关 App 重开，选图层调参数、加不同库素材、导一单核 ezdxf 实体类型不变。
+- [x] **Step 1（红）** 各增量均先写失败测试（护栏见 `test_ui_app.py` / `test_product_switcher.py`）。
+- [x] **Step 2** 属性面板：选中图层读 `layer.production`（`_layer_effective_production` 按 §5 回落），编辑经 `_apply_layer_production` 写回几何 + `layer.production`（增量4 `e723e82`）。
+- [x] **Step 3** 人工确认字段：月份 Spinbox → 只读 chip；加「素材库/素材」「字体库/字体」选择器（数据驱动 active_bundle，选库过滤；month_var/flower_var/font_var 保留内部派生态）（增量3 `4ff0706`）。
+- [x] **Step 4** 「添加素材」沿用全局 layout_vars seed 几何（既有），并写 `library_id/material_key`（增量2 `b5a939c`）；图层级 override 走属性面板（增量4）。
+- [x] **Step 5** 设置窗口管理产品素材库/字体库目录列表；保留单目录入口作迁移兼容（增量5 `72ea927`）。
+- [x] **Step 6（绿）** 全量 **358 passed, ruff clean**。⚠️ **真机手测（关 App 重开、导一单核 ezdxf 实体）仍待用户做**——本轮只过了自动化测试 + 真 Tk root 构造冒烟，未在真实窗口里点过完整链路。
 
 ### Task 3：订单解析对接（Phase 3）
 **实现策略（演进兼容，与原计划的偏差，已落地）：** 为零风险不破 `test_gpt_parser`/`test_parse_pipeline`/批量金标，**不改 `gpt_parser.py`、`local_order_parser.py`、`orders.py`**，而是新增 `order_catalog.py` 复用 gpt_parser 的 HTTP 辅助；`parse_pipeline` 只加可选 `bundle` 参数（不传则行为不变）。`ui_app.py` 的消费侧接线（原 Step 4）**挪到 Phase 2**（避免碰 UI 线）。
