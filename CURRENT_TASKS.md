@@ -92,7 +92,7 @@
 - 用户拍板：**7 个按钮全删走纯 PS 风 / 完整嵌套图组 / 一次性全做**。详见 `AGENTS.md` 顶部「进行中」段。
 - **Stage 1 ✅ `51bd8cf`**：`models.GroupLayer` 嵌套图组 + `Document` 递归化 + `group_layers`/`ungroup_layer`；渲染/导出改走 `flat_render_layers()`，无图组时字节零变化（370 passed）。护栏 `tests/test_layer_groups.py`。
 - **Stage 2/3 ⏳（下一轮专注做，UI 大）**：`ui_app._build_layers_panel` 由 `tk.Listbox`+7 按钮 → `ttk.Treeview`（嵌套+逐层眼睛/锁图标+拖动排序+多选）；右键图层菜单（置顶/置底/编辑/组合/解组/删除）+ 右键空白菜单（添加图层/全选/展开折叠）；空白图层工作流（删生产参数区「添加素材/添加文本」按钮 →「添加图层」建空白叶子层，选中再选素材/字体填充）；组合/解组接 Stage 1 的 `group_layers/ungroup_layer`。**需真机测**（Tkinter 拖放/图标命中无法纯自动化）。
-- **`&` 符号 bug 待用户复现**：4 字体都含 `&` glyph，预览 + SVG/DXF 导出在复现里都正常；待用户指明坏在哪一步（预览/生成文件/EzCad）+ 发文件。`♡`=Font 4 自动结尾爱心字形（非 bug）。
+- ✅ **「`&` 无法显示」已修复**（`fix(export)`）：实为草书平滑字形（大写 A 等）在矢量端被压成实心块；修 `_quadratic_segments`(多控制点 qCurveTo 展开) + `svg._render_text_layer`(一字形 contour 合一 path 成镂空孔)。详见 `AGENTS.md`。护栏 `test_glyph_vector_fidelity.py`。
 
 
 ### A. EzCad 端闭环（最高优先,核心生产链路）—— 在**独立的 Ezcad 自动导入项目**做（不是本仓库）
