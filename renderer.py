@@ -206,8 +206,8 @@ def render_document_png(document: Document, output_path: Path | str) -> Path:
     # 背景透明:激光雕刻按位图明暗下刀,实心背景(原来的米色)会把整块底也刻出来;
     # 透明底只保留花/字墨迹,导入 EzCad 雕刻时背景不出刀。
     canvas = Image.new("RGBA", (document.canvas_width, document.canvas_height), (0, 0, 0, 0))
-    # 渲染流程：先清空画布，再按 z_index 从底到顶合成所有 visible 图层。
-    for layer in document.sorted_layers():
+    # 渲染流程：先清空画布，再按 z_index 从底到顶合成所有 visible 叶子图层（图组已摊平）。
+    for layer in document.flat_render_layers():
         if not layer.visible:
             continue
         if isinstance(layer, ImageLayer):
@@ -229,7 +229,7 @@ def render_document_svg(document: Document, output_path: Path | str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     body: list[str] = []
     notes: list[str] = []
-    for layer in document.sorted_layers():
+    for layer in document.flat_render_layers():
         if not layer.visible:
             continue
         transform = _svg_layer_transform(layer)
