@@ -629,13 +629,35 @@ def _pt(point: Any) -> tuple[float, float]:
     return (float(point[0]), float(point[1]))
 
 
-def _quadratic_segments(args: tuple[Any, ...]) -> list[tuple]:
-    """把一次 qCurveTo 还原成段。沿用既有 SVG 管线的近似:取首控制点 + 末端点,
-    成一段二次贝塞尔(忽略中间隐含锚点),保证 DXF 字形与 SVG 预览/金标完全一致。"""
-    raw_points = [_pt(point) for point in args if point is not None]
-    if not raw_points:
+def _midpoint(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float]:
+    return ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+
+
+def _quadratic_segments(current: tuple[float, float], args: tuple[Any, ...]) -> list[tuple]:
+    """把一次 TrueType qCurveTo（可含多个离曲线控制点）正确展开成多段二次贝塞尔。
+
+    TrueType 约定：相邻离曲线控制点之间有「隐含在线锚点」=两者中点；末参数为 ``None``
+    表示整条 contour 全是离曲线点（隐含起点=末控制点与首控制点的中点，已由 moveTo 落到
+    ``current``）。**旧实现把整段塌缩成单段 quad(首控制点, 末端点)，丢掉所有中间隐含锚点**
+    → 平滑字形（如大写 A、&）被压成实心块/错位轮廓（预览用 Pillow 真字体则正常，故只坏矢量）。
+    """
+    points = [(_pt(point) if point is not None else None) for point in args]
+    if not points:
         return []
-    return [("quad", raw_points[0], raw_points[-1])]
+    if points[-1] is None:  # 全离曲线闭合 contour：依次取相邻中点，末段回到隐含起点 current
+        offs = [point for point in points[:-1] if point is not None]
+        if not offs:
+            return []
+        ends = [_midpoint(offs[i], offs[i + 1]) for i in range(len(offs) - 1)]
+        ends.append(current)
+        return [("quad", ctrl, end) for ctrl, end in zip(offs, ends)]
+    end = points[-1]
+    offs = [point for point in points[:-1] if point is not None]
+    if not offs:  # 没有控制点 → 退化成直线
+        return [("line", end)]
+    ends = [_midpoint(offs[i], offs[i + 1]) for i in range(len(offs) - 1)]
+    ends.append(end)
+    return [("quad", ctrl, segment_end) for ctrl, segment_end in zip(offs, ends)]
 
 
 def _glyph_contours(glyph: Any, glyph_name: str, layer_id: str) -> list[tuple]:
@@ -670,7 +692,7 @@ def _glyph_contours(glyph: Any, glyph_name: str, layer_id: str) -> list[tuple]:
             current = _pt(args[0])
             segments.append(("line", current))
         elif command == "qCurveTo":
-            for segment in _quadratic_segments(args):
+            for segment in _quadratic_segments(current, args):
                 segments.append(segment)
                 current = segment[-1]
         elif command == "curveTo":
