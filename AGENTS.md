@@ -25,6 +25,13 @@
 6. 桌面文本输入框加**右键复制/粘贴**菜单。
 > **2026-06-14 新需求（已出 ExecPlan，待实现）**：把「单产品 + 全局单素材库 + month/flower 定位 + 全局生产参数」演进为 **Product → 素材库 → 素材(key/别名/标签/默认参数) → 图层(可挂库+生产参数 override)**。素材/字体不再单一；月份字段→「素材库+素材」选择器；订单解析改为把库 catalog 注入 GPT、动态枚举校验 material_key（本地不写死）。演进兼容（birth-flower=产品0，month/flower 降为标签，金标/批量不破）；后期左侧加产品切换器（每窗口=一个产品）。**设计与分阶段计划见 `docs/superpowers/plans/2026-06-14-layer-material-library-system.md`**。本轮只出文档未改代码。
 
+## 本会话改动（2026-06-15 · 两个 UX 升级：文字排版 + 解析失败弹窗）
+
+承接 Phase 2 收尾后，用户反馈两点（均看 mockup 定方案后实现）：
+- **图1 文字自动排版升级（全套）** `629e21a`（`text_layout.py`）：`fit_text_box` 名字分支由「永远单行」改为 `_fit_name_layout`——长名(多词)在 1..`NAME_MAX_LINES`(=2) 行里挑能放最大字号的均衡断行(`_balanced_wrap` 按真实墨迹宽最小化最宽行、单词不拆)；多一行需比单行大 `NAME_WRAP_GAIN`(8%) 才换行(短名零回归)；两侧留 `NAME_SIDE_PAD_RATIO`(4%) 边距；多行墨迹块占框高 `NAME_BLOCK_HEIGHT_RATIO`(0.86)；最终 `_lines_fit` clamp 不溢出。**仍走同一 fit_text_box → 预览==导出不变；高度受限的普通名字结果不变(无 WYSIWYG 回归)**。
+- **图2 解析失败弹窗重做** `d1ac530`（`ui_app.py`）：`_apply_parse_result` 里的原生 `messagebox.showwarning("无法解析")` 换成 `_show_parse_warning_dialog`(主题化 `_themed_toplevel`)——顶部「需人工确认 N 个字段」，中间按 `parse_missing_field_hints`(None 字段=内容/月份/字体/花材) 生成醒目字段卡，AI/本地原文折到「识别详情」只读框，按钮「复制原文 / 知道了去确认」。
+- 全量 **363 passed, ruff clean**。⚠️ 两项均**待用户真机手测**（看长名实际断行效果、弹窗实际观感）。
+
 ## 本会话改动（2026-06-15 · Phase 2 增量 3-4-5 全部落地）
 
 承接上一会话（已提交本线两提交）。用户拍板「完成剩下的 345」，且增量3 选「完整重构」。按风险从低到高 4→5→3 实现，每增量先测后提交，全量 **358 passed, ruff clean**。

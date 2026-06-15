@@ -100,6 +100,8 @@
   让 EzCad 直接识别闭合区域。原因：当前 `render_splines_and_polylines` 会把一条字形轮廓切成多段开口曲线（端点相接），EzCad hatch 不一定能自动连。
 
 ### C. 杂项 flower 端
+- ✅ **（2026-06-15）文字自动排版升级** `629e21a`：长名自动均衡断行(`text_layout._fit_name_layout`，最多 2 行)+ 边距 + 多行更满；短名零回归、预览==导出不变。**待真机看长名效果。**
+- ✅ **（2026-06-15）解析失败弹窗重做** `d1ac530`：原生 messagebox → 主题化 `_show_parse_warning_dialog`（字段卡 + 详情折叠 + 复制原文）。**待真机看观感。**
 - **导出朝向「文字在上、花在下」未解决**（2026-06-14 用户 EzCad 实测仍反；合成测试未复现）。待用户给：哪个导出按钮 + 哪朵花 + 实际文档，再定位（图层位置 / 素材 viewBox / 哪条导出路径）。详见 `AGENTS.md` 已知问题。
 - `test_physical_size` 那个红（见上，待用户点头）。
 - Stage 3：花左上/名右下的**对角默认布局**（调 `birth_flower_config.json` layout_defaults / `models.EngravingLayout`）。
