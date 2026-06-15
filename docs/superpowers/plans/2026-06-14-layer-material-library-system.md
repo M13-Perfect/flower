@@ -287,9 +287,16 @@ layer.production（图层 override）
 
 **Task 3 后端完成（2026-06-14）。** 剩 Step 4（ui_app 接线）并入 Phase 2。`services/api/.../orders.py`（web/批量 pydantic schema）待 web/批量需要 material_key 时再对齐。
 
-### Task 4（Phase 4，后期）：多产品 UI + 产品切换器
-**Files:** `ui_app.py`、`config_store.py`、文档。
-- [ ] 左侧产品切换器（每窗口=一个产品）；新增第二个产品 + 其库验证模型通用性；更新 `PROJECT_INDEX.md`/`CURRENT_TASKS.md`/`AGENTS.md`。
+### Task 4（Phase 4）：多产品 UI + 产品切换器
+**Files:** `ui_app.py`、`config_store.py`、`tests/test_product_switcher.py`、文档。
+**状态（2026-06-14）：产品切换器骨架已实现（方案2 可收/展），全量 341 passed。** 分支 `claude/phase4-product-switcher`（未提交，待 review）。
+- [x] 左侧产品切换列：最左新增一列（pack `side="left"`，原「预览 + 功能区」两栏布局不动）；渲染 `config.products`、高亮激活、«/» 收/展；收/展态持久化 `AppConfig.products_panel_collapsed`（默认收起）。
+- [x] 切换产品 `_switch_product`：`active_product_id` 持久化 + 把该产品首个图像/字体库目录灌进现有扫描入口 `_scan_assets` 重扫。
+- [x] 新建产品对话框 `_open_new_product_dialog`：名称 + 自动 ID（`config_store.unique_product_id` 去重，中文名回退 `product`）+ 选图像库/字体库目录 → `config_store.with_added_product` 追加并切过去。
+- [x] 顺手修 BUG：`_save_settings_window` 由「整体重建 AppConfig」改为 `dataclasses.replace`，否则保存设置会清空 `products`/`active_product_id`/收展态。
+- [x] 纯逻辑单测 `tests/test_product_switcher.py`(9)：收展往返、id 去重、`with_added_product`、replace 保留产品、rail 展示数据。运行态用 withdrawn root 冒烟过（收/展两态均成功 build）。
+- [ ] **待 Phase 2（Task 2）才完整**：切产品后人工确认面板字段尚未随产品级联（面板仍是旧 month/flower 选择器）。当前切换只换「加素材用的库目录」，不换面板字段集。
+- [ ] 端到端多产品验证：生产配置目前只有 birth-flower 一个产品；新建对话框已具备，但尚未在真实配置里加第二个产品跑通全链路（导出/批量）验证模型通用性。
 
 ## 9. 风险与验证
 

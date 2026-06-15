@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,8 @@ class AppConfig:
     # 旧配置无 products 时由 __post_init__ 迁移合成「产品0」，用户零感知。
     products: tuple[ProductConfig, ...] = ()
     active_product_id: str = ""
+    # 左侧产品切换列默认收起（方案2 可收/展），收/展状态随配置持久化。
+    products_panel_collapsed: bool = True
 
     def __post_init__(self) -> None:
         if not self.products:
@@ -96,6 +99,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         layout_defaults=_layout_from_payload(payload.get("layout_defaults")),
         products=_products_from_payload(payload.get("products")),
         active_product_id=_string_value(payload, "active_product_id", ""),
+        products_panel_collapsed=_bool_value(payload, "products_panel_collapsed", True),
     )
 
 
@@ -113,6 +117,7 @@ def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Pa
         "layout_defaults": _layout_to_payload(config.layout_defaults),
         "products": [_product_to_payload(product) for product in config.products],
         "active_product_id": active_product(config).id,
+        "products_panel_collapsed": bool(config.products_panel_collapsed),
     }
     config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return config_path
@@ -187,6 +192,46 @@ def active_product(config: AppConfig) -> ProductConfig:
         if product.id == config.active_product_id:
             return product
     return config.products[0] if config.products else ProductConfig()
+
+
+def _slugify(value: str) -> str:
+    """把产品名转成 ASCII slug；非 ASCII（如中文）字符忽略，便于生成稳定 id。"""
+    chars: list[str] = []
+    for ch in value.strip().lower():
+        if ch.isascii() and ch.isalnum():
+            chars.append(ch)
+        elif ch in " -_":
+            chars.append("-")
+    slug = "".join(chars).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug
+
+
+def unique_product_id(name: str, existing_ids: Iterable[str]) -> str:
+    """从产品名生成唯一稳定 id：slug 化（中文/空名回退 product），冲突按 -2/-3 递增。"""
+    existing = set(existing_ids)
+    base = _slugify(name) or "product"
+    if base not in existing:
+        return base
+    index = 2
+    while f"{base}-{index}" in existing:
+        index += 1
+    return f"{base}-{index}"
+
+
+def with_added_product(
+    config: AppConfig, product: ProductConfig, *, activate: bool = True
+) -> AppConfig:
+    """返回追加了新产品的配置（不可变）；activate=True 时同时切为激活产品。"""
+    products = config.products + (product,)
+    active = product.id if activate else config.active_product_id
+    return replace(config, products=products, active_product_id=active)
+
+
+def _bool_value(payload: dict[str, Any], key: str, default: bool) -> bool:
+    value = payload.get(key, default)
+    return value if isinstance(value, bool) else default
 
 
 def _ensure_products(

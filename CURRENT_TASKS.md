@@ -6,9 +6,45 @@
 ## 测试基线
 
 `PYTHONPATH=".;services\api" .\.venv-win\Scripts\python.exe -m pytest tests services/api/tests -q`
-→ **293 passed, 1 failed**（2026-06-14 文字排版统一后；新增 `tests/test_text_wysiwyg_consistency.py` 等护栏）。唯一失败 = `test_physical_size.py::test_get_physical_size_derives_height_from_canvas_ratio`，
-**与本轮无关**：分支早先给 `templates/products/birth-flower-card.json` 加了 `"heightMm": 80`（使 `height_derived=False`，
-测试期望 True）。一行可修（删掉那个冗余 heightMm 让高度派生），但那是别人未提交改动，**未经用户同意没动**（已挂独立 task）。
+→ **341 passed, 0 failed**（2026-06-14 Phase 4 产品切换器后 = 332 后端基线 `62556c0` + 9 个 `tests/test_product_switcher.py`）。ruff clean。
+
+## 本轮（2026-06-14）已完成：Phase 4 产品切换器（方案2 可收/展）
+
+分支 `claude/phase4-product-switcher`（**未提交，待 review**；基于后端基线 `62556c0`）。详见 ExecPlan §8 Task 4。
+- 左侧新增可收/展产品列（最左一列，原预览+功能区两栏不动）；列出 `config.products`、高亮激活、«/» 收展（状态持久化 `products_panel_collapsed`，默认收起）。
+- 切换产品 = 持久化 `active_product_id` + 把该产品库目录灌进 `_scan_assets` 重扫；新建产品对话框（`unique_product_id` 去重 + `with_added_product` 追加）。
+- 顺手修 BUG：`_save_settings_window` 改 `dataclasses.replace`，避免保存设置清空 products/active/收展态。
+- ⚠️ **未完**：切产品**不会**让人工确认面板字段随产品级联（仍是旧 month/flower）——那属 Task 2（Phase 2）。多产品端到端验证也未做（生产配置仍只有 birth-flower 一个产品）。
+
+## 本轮（2026-06-14）UI 换肤：CustomTkinter 深色（阶段 1-3 全部完成）
+
+依赖 `customtkinter>=5.2`（已装 `.venv-win` + 登记 requirements）。同分支 `claude/phase4-product-switcher`，全量 341 passed，ruff clean。
+- **阶段1**：全局深色（`ctk.set_appearance_mode` + `_configure_styles` 刷 ttk + `APP_COLORS` 翻深色）+ 产品列 CTk 圆角。
+- **阶段2**：功能区 `CTkScrollableFrame`；五大面板 `_ctk_card` 圆角卡片；按钮/输入/备注/勾选/下拉全 CTk（素材下拉=CTkOptionMenu，command 取代 `<<ComboboxSelected>>`）。
+- **阶段3**：弹窗全 `ctk.CTkToplevel` 深色；新建产品对话框全 CTk。**小尾巴**：设置/布局/素材弹窗内部控件仍 ttk-dark（未逐控件圆角化）。
+- 画板**保持白底**（浅色木料，预览深灰线+黑墨，翻黑会看不见）。
+- 修坑：PhotoImage 绑 `master=canvas`、`tests/conftest.py` 清 CTk tracker、`_widget_texts` 容错、context-menu 测试 `monkeypatch.undo`。
+- **⚠️ 启动闪退回归（已修）**：顶层 `import customtkinter` 让非 `.venv-win` 解释器（MSYS `.venv`）启动即崩（早于 `_reexec`）。已改 `try/except ctk=None` + `set_appearance` 守卫 + `_reexec` 自检 customtkinter。`.venv` 启动现可正常 re-exec 运行。
+
+## 本轮（2026-06-14）UI 续：Ezcad 同款顶部 + 产品列外推
+
+参考 `Ezcad2.7.6`（= `ctk.CTk()` + 无原生菜单栏 + CTk 卡片圆角，非无边框/外框圆角）。全量 341 passed。
+- 根窗 `main()` 改 `ctk.CTk()`（深色标题栏）；去原生菜单栏白条 → `_build_menubar` 顶栏 CTk 按钮 + `_popup_menu` tk_popup 弹深色菜单。
+- 产品列展开改为窗口加宽（不挤画板，实测画板 694→694）。
+- 标题栏深色（DWM 仅 tk.Tk 兜底）；**外框圆角未做**（Win10 直角，需 overrideredirect，用户暂未选）。
+- 截图 `tmp_out/ui_ctk_top.png`。
+- **收尾修复**：箭头方向纠正（收起`«`外/展开`»`内）；`glyph_panel.py` 换 CTkToplevel + 网格 canvas 深色（原唯一白窗）；菜单弹窗去白边（relief flat）；**修 ctk.CTk 致命坑**：`_toggle_product_rail` 原调 `root.minsize()` 无参 getter，CTk 上抛 TypeError → 真机点收/展即崩（tk.Tk 测试不报），改用常量 `MIN_WINDOW_WIDTH/HEIGHT`。
+- **对话框白标题栏修复**（设置/布局/字形/字形说明）：CTkToplevel 自带深色标题栏不稳（采样仍白）。统一 `_themed_toplevel()`：DWM 设属性 + **1px 几何微调强制重绘**（`after(60)+after(350)` 兜复杂窗）。字形说明由 messagebox→CTk 窗口（文案→`GLYPH_HELP_TEXT`）。4 窗标题栏采样全 (0,0,0)。
+- **下拉菜单改自绘 `CtkMenu`**（overrideredirect+CTk 行，无系统白边）：菜单数据驱动 `self._menus`；「导入」拍平为顶层两项。白角坑→Toplevel `bg=panel` 兜底（角像素 240→36）。右键上下文菜单仍 tk.Menu（未改）。**346 passed，ruff clean**。
+
+## 后续 UI 待办（下次对话继续；本轮 UI 已收尾）
+
+> 分支 `claude/phase4-product-switcher` 整轮 UI 改动（产品切换器 + 深色换肤 + Ezcad 同款顶部 + 启动/崩溃修复 + 对话框/下拉去白边）**尚未提交**，待 review/commit。
+- **右键上下文菜单仍是原生 `tk.Menu`**（画板右键 `_show_canvas_context_menu` / 图层右键 `_show_layer_context_menu`），可能仍有系统白边 → 用同一个 `CtkMenu` 改（已预留"禁用项"`enabled` 支持；上下文菜单有动态项 + 测试用 `FakeMenu`，改时要同步更新 `test_canvas_context_menu...`）。
+- **设置/布局/素材编辑等弹窗的内部控件**仍是 ttk-dark（已深色但非 CTk 圆角）：`ttk.Notebook` 无干净 CTk 等价物，如要统一圆角风需逐控件换 CTk（工作量中、收益低）。
+- **外框圆角（真无边框窗口）未做**：Win10 需 `overrideredirect` 自绘标题栏（丢系统贴边/最大化），已评估，用户暂未选。
+- 复用约定：新对话框一律用 `BirthFlowerApp._themed_toplevel()`（自动深色标题栏）；下拉/弹出菜单用 `CtkMenu`；颜色取 `APP_COLORS`（后续"全局背景色设置"只需改这里）。
+- 运行截图：`tmp_out/stage1_*.png`、`stage2_main.png`、`stage3_settings.png`、`stage3_newproduct.png`。
 
 ## 本轮（2026-06-14）已完成：文字自动排版引擎统一
 

@@ -12,11 +12,27 @@ import threading
 from collections.abc import Callable, Mapping
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+try:
+    import customtkinter as ctk
+except ImportError:  # 引导解释器（如 MSYS .venv）可能没装 ctk；容忍导入，交给 _reexec 切到 .venv-win
+    ctk = None  # type: ignore[assignment]
 from typing import TypeVar
 
 from asset_resolver import find_flower_asset, scan_flower_assets, scan_font_assets
 from canvas_text_item import CanvasTextItem, FloatingTextEditor
-from config_store import AIProfile, AppConfig, active_ai_profile, load_config, normalize_output_path, save_config
+from config_store import (
+    AIProfile,
+    AppConfig,
+    ProductConfig,
+    active_ai_profile,
+    active_product,
+    load_config,
+    normalize_output_path,
+    save_config,
+    unique_product_id,
+    with_added_product,
+)
 from generation_readiness import GenerationReadiness, build_generation_readiness
 from glyph_service import (
     GlyphApplyResult,
@@ -54,16 +70,190 @@ SINGLE_REMARK_SUFFIXES = {".txt", ".json", ".csv"}
 TEXT_CASE_ORDER = ("default", "upper", "lower")
 TEXT_CASE_LABELS = {"default": "默认", "upper": "大写", "lower": "小写"}
 SERVICES_API_DIR = Path(__file__).resolve().parent / "services" / "api"
+# 深色工作台配色（CustomTkinter 迁移，阶段1）。画板本身保持浅色（代表浅色木料，
+# 雕刻预览是深灰折线 + 黑墨字），故 preview_canvas 仍用白底，不读这里的 panel 色。
 APP_COLORS = {
-    "background": "#f6f7f8",
-    "panel": "#ffffff",
-    "border": "#d6d9de",
-    "text": "#20242a",
-    "muted": "#667085",
-    "warning": "#9a5b00",
+    "background": "#1b1b1b",
+    "panel": "#242424",
+    "border": "#3a3a3a",
+    "text": "#e9e9e9",
+    "muted": "#9aa0a6",
+    "warning": "#e0b04a",
+    "accent": "#3a7afe",
+    "accent_soft": "#26354f",
+    "input": "#2b2b2b",
 }
+
+# 全局深色外观（CustomTkinter）；模块导入即设定，App 与离线冒烟脚本都生效。
+# 引导解释器没装 ctk（ctk=None）时跳过；_reexec 会切到装了 ctk 的 .venv-win 再真正建 UI。
+if ctk is not None:
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("dark-blue")
+
+# 产品切换列（方案2）收起/展开两种宽度（像素）。
+PRODUCT_RAIL_COLLAPSED_WIDTH = 48
+PRODUCT_RAIL_EXPANDED_WIDTH = 168
+# 主窗口最小尺寸；产品列外推时用常量而非 root.minsize() 读回（ctk.CTk 的无参 minsize 会抛 TypeError）。
+MIN_WINDOW_WIDTH = 760
+MIN_WINDOW_HEIGHT = 560
+
+GLYPH_HELP_TEXT = (
+    "Font 2 已内置 a-z 26 个结尾字形：a=U+E068，z=U+E081，中间按字母顺序连续递增。\n\n"
+    "默认模式 replace_last_letter 会用配置的 PUA 字形替换最后一个英文字母，例如 Jazmin -> Jazmi + n.005。\n\n"
+    "人工绑定：编辑 -> 管理字形绑定，选择 Font 2，筛选 PUA only；单个绑定时选择映射字母、"
+    "输入 U+E068 这类 codepoint，再点绑定到映射字母。\n\n"
+    "批量绑定：按 a-z 顺序粘贴 26 个 PUA 字符，再点按 a-z 绑定。\n\n"
+    "按位置替换只影响当前订单；映射绑定会保存到 glyph_maps/glyph_maps.json。\n\n"
+    "SVG 和 DXF 当前仍依赖字体文件显示 PUA 字符，换环境可能显示异常。"
+)
+
+
+def product_initial(name: str) -> str:
+    """产品收起时显示的单字图标：取首个非空字符，无则问号。"""
+    text = (name or "").strip()
+    return text[0].upper() if text else "?"
+
+
+def product_rail_items(config: "AppConfig") -> list[dict[str, object]]:
+    """产品切换列的展示数据（纯函数，便于单测，不依赖 Tkinter）。"""
+    active_id = active_product(config).id
+    items: list[dict[str, object]] = []
+    for product in config.products:
+        items.append(
+            {
+                "id": product.id,
+                "name": product.name,
+                "active": product.id == active_id,
+                "initial": product_initial(product.name),
+            }
+        )
+    return items
 T = TypeVar("T")
 LOGGER = logging.getLogger(__name__)
+
+
+def _attach_tooltip(widget: tk.Widget, text: str) -> None:
+    """给收起态的产品图标加悬浮提示，显示完整产品名（轻量实现，无第三方依赖）。"""
+    state: dict[str, tk.Toplevel | None] = {"win": None}
+
+    def show(_event: object = None) -> None:
+        if state["win"] is not None or not text:
+            return
+        x = widget.winfo_rootx() + widget.winfo_width() + 6
+        y = widget.winfo_rooty()
+        win = tk.Toplevel(widget)
+        win.wm_overrideredirect(True)
+        win.wm_geometry(f"+{x}+{y}")
+        tk.Label(win, text=text, bg=APP_COLORS["text"], fg="#ffffff", padx=6, pady=2).pack()
+        state["win"] = win
+
+    def hide(_event: object = None) -> None:
+        win = state["win"]
+        if win is not None:
+            win.destroy()
+            state["win"] = None
+
+    widget.bind("<Enter>", show)
+    widget.bind("<Leave>", hide)
+    widget.bind("<Destroy>", hide)
+
+
+def _enable_dark_titlebar(window: tk.Misc) -> None:
+    """Windows 10/11：把原生标题栏改成深色（DWM immersive dark mode）。非 Windows 或失败静默跳过。"""
+    try:
+        import ctypes
+
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1)
+        # DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 20H1+ / Win11）；旧版本用 19。
+        for attribute in (20, 19):
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+            ) == 0:
+                break
+        # 属性已设但标题栏需重绘才生效：SetWindowPos(FRAMECHANGED) 对已显示的复杂窗不一定触发，
+        # 再用 1px 几何微调兜底强制重绘（实测复杂对话框靠这个才真正变深）。
+        flags = 0x0001 | 0x0002 | 0x0004 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, flags)
+        window.update_idletasks()
+        w, h = window.winfo_width(), window.winfo_height()
+        if w > 1 and h > 1:
+            window.geometry(f"{w + 1}x{h}")
+            window.update_idletasks()
+            window.geometry(f"{w}x{h}")
+    except Exception:
+        pass
+
+
+class CtkMenu:
+    """自绘深色下拉菜单：overrideredirect Toplevel + CTk 行，替代原生 tk.Menu 的系统白边弹窗。
+
+    items：list[dict]，每项 {"label","command","enabled"=True} 或 {"type":"separator"}。
+    关闭时机：选中一项 / 失焦(FocusOut) / Esc。
+    """
+
+    def __init__(self, master: tk.Misc):
+        self._master = master
+        self._win: tk.Toplevel | None = None
+
+    def popup(self, x: int, y: int, items: list[dict]) -> None:
+        win = tk.Toplevel(self._master)
+        win.overrideredirect(True)  # 去系统边框 → 没有白边
+        win.attributes("-topmost", True)
+        # 圆角 CTkFrame 的四角缺口会露出 Toplevel 默认浅底（白角）→ 把底色也设成深色面板。
+        win.configure(bg=APP_COLORS["panel"])
+        outer = ctk.CTkFrame(
+            win,
+            corner_radius=8,
+            fg_color=APP_COLORS["panel"],
+            border_width=1,
+            border_color=APP_COLORS["border"],
+        )
+        outer.pack(fill="both", expand=True)
+        for item in items:
+            if item.get("type") == "separator":
+                ctk.CTkFrame(outer, height=1, fg_color=APP_COLORS["border"]).pack(fill="x", padx=10, pady=4)
+                continue
+            enabled = item.get("enabled", True)
+            ctk.CTkButton(
+                outer,
+                text=item["label"],
+                anchor="w",
+                height=30,
+                corner_radius=6,
+                fg_color="transparent",
+                hover_color=APP_COLORS["accent_soft"],
+                text_color=APP_COLORS["text"] if enabled else APP_COLORS["muted"],
+                state="normal" if enabled else "disabled",
+                command=(lambda c=item.get("command"): self._run(c)),
+            ).pack(fill="x", padx=4, pady=1)
+        win.update_idletasks()
+        win.geometry(f"+{int(x)}+{int(y)}")
+        win.bind("<Escape>", lambda _e: self.close())
+
+        def arm() -> None:
+            # 先抢焦点再绑 FocusOut，避免开窗瞬间的假失焦把自己关掉。
+            if self._win is None:
+                return
+            self._win.focus_force()
+            self._win.bind("<FocusOut>", lambda _e: self.close())
+
+        win.after(10, arm)
+        self._win = win
+
+    def _run(self, command) -> None:
+        self.close()
+        if command is not None:
+            command()
+
+    def close(self) -> None:
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except tk.TclError:
+                pass
+            self._win = None
 
 
 def ensure_services_api_import_path() -> Path:
@@ -126,7 +316,8 @@ def summarize_xlsx_batch_result(result: object) -> tuple[int, int, int, Path]:
 
 def show_xlsx_batch_import_summary(root: tk.Misc, result: object) -> None:
     total, success, manual, report_path = summarize_xlsx_batch_result(result)
-    dialog = tk.Toplevel(root)
+    dialog = ctk.CTkToplevel(root)
+    dialog.after(60, lambda: _enable_dark_titlebar(dialog))
     dialog.title("批量导入完成")
     dialog.resizable(False, False)
     dialog.transient(root)
@@ -516,6 +707,9 @@ class BirthFlowerApp:
         self.root.title("Birth Flower MVP")
         self.root.geometry("980x960")
         self.config = load_config()
+        # 方案2 产品切换列：收/展状态来自配置（默认收起），列容器在 _build_layout 创建。
+        self.products_collapsed = bool(self.config.products_panel_collapsed)
+        self.product_rail: ttk.Frame | None = None
 
         self.remark_var = tk.StringVar()
         self.name_var = tk.StringVar()
@@ -613,29 +807,30 @@ class BirthFlowerApp:
                 self.root.after(0, lambda warning=warning: messagebox.showwarning("字形配置", warning))
 
     def _build_menu(self) -> None:
-        menu_bar = tk.Menu(self.root)
-        file_menu = tk.Menu(menu_bar, tearoff=False)
-        import_menu = tk.Menu(file_menu, tearoff=False)
-        import_menu.add_command(label="导入备注...", command=self.import_remark_file)
-        import_menu.add_command(label="导入素材...", command=self.import_asset_file)
-        file_menu.add_cascade(label="导入", menu=import_menu)
-        file_menu.add_command(label="打开输出目录", command=self.open_output_dir)
-        file_menu.add_separator()
-        file_menu.add_command(label="设置...", accelerator="Ctrl+,", command=self.open_settings)
-        file_menu.add_separator()
-        file_menu.add_command(label="退出", command=self.root.destroy)
-        menu_bar.add_cascade(label="文件", menu=file_menu)
-        edit_menu = tk.Menu(menu_bar, tearoff=False)
-        edit_menu.add_command(label="布局设置...", command=self.open_layout_settings)
-        edit_menu.add_command(label="字形...", command=self.open_glyph_panel)
-        menu_bar.add_cascade(label="编辑", menu=edit_menu)
-        view_menu = tk.Menu(menu_bar, tearoff=False)
-        view_menu.add_command(label="刷新预览", command=self._redraw_preview)
-        menu_bar.add_cascade(label="查看", menu=view_menu)
-        help_menu = tk.Menu(menu_bar, tearoff=False)
-        help_menu.add_command(label="字形使用说明", command=self.show_glyph_help)
-        menu_bar.add_cascade(label="帮助", menu=help_menu)
-        self.root.config(menu=menu_bar)
+        # 菜单数据驱动，弹窗用自绘 CtkMenu（深色圆角、无系统白边）；不再用原生 tk.Menu / 菜单栏。
+        # 原「导入」子菜单拍平为顶层两项（CtkMenu 不做嵌套子菜单），用分隔线保留分组。
+        self._menus = [
+            ("文件", [
+                {"label": "导入备注...", "command": self.import_remark_file},
+                {"label": "导入素材...", "command": self.import_asset_file},
+                {"type": "separator"},
+                {"label": "打开输出目录", "command": self.open_output_dir},
+                {"type": "separator"},
+                {"label": "设置...", "command": self.open_settings},
+                {"type": "separator"},
+                {"label": "退出", "command": self.root.destroy},
+            ]),
+            ("编辑", [
+                {"label": "布局设置...", "command": self.open_layout_settings},
+                {"label": "字形...", "command": self.open_glyph_panel},
+            ]),
+            ("查看", [
+                {"label": "刷新预览", "command": self._redraw_preview},
+            ]),
+            ("帮助", [
+                {"label": "字形使用说明", "command": self.show_glyph_help},
+            ]),
+        ]
         self.root.bind("<Control-comma>", lambda _event: self.open_settings())
         self.root.bind("<Delete>", lambda _event: self._delete_selected_layer())
         self.root.bind("<BackSpace>", lambda _event: self._delete_selected_layer())
@@ -646,46 +841,171 @@ class BirthFlowerApp:
         self.root.bind("<Control-z>", lambda _event: self.status_var.set("撤销历史已预留，后续版本启用"))
         self.root.bind("<Control-y>", lambda _event: self.status_var.set("重做历史已预留，后续版本启用"))
 
-    def _add_row(self, parent: ttk.LabelFrame, row: int, label: str, widget: ttk.Widget) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
+    def _build_menubar(self, parent) -> ctk.CTkFrame:
+        """顶部深色菜单条：每个按钮弹出自绘 CtkMenu（深色圆角，无系统白边）。"""
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        for label, items in self._menus:
+            button = ctk.CTkButton(
+                bar,
+                text=label,
+                width=52,
+                height=28,
+                corner_radius=6,
+                fg_color="transparent",
+                hover_color=APP_COLORS["accent_soft"],
+                text_color=APP_COLORS["text"],
+            )
+            button.configure(command=lambda b=button, it=items: self._open_dropdown(b, it))
+            button.pack(side="left", padx=(0, 4))
+        return bar
+
+    def _open_dropdown(self, button: tk.Widget, items: list[dict]) -> None:
+        x = button.winfo_rootx()
+        y = button.winfo_rooty() + button.winfo_height() + 2
+        CtkMenu(self.root).popup(x, y, items)
+
+    def _themed_toplevel(self) -> ctk.CTkToplevel:
+        """建带深色标题栏的对话框：CTkToplevel 自带的深色标题栏不稳（实测仍白），用 DWM 兜底。"""
+        window = ctk.CTkToplevel(self.root)
+        # 复杂对话框 60ms 时常还没完成映射→DWM 设不上（实测仍白）；60ms 与 350ms 各补一次。
+        window.after(60, lambda: _enable_dark_titlebar(window))
+        window.after(350, lambda: _enable_dark_titlebar(window))
+        return window
+
+    def _add_row(self, parent, row: int, label: str, widget) -> None:
+        ctk.CTkLabel(parent, text=label, anchor="w").grid(row=row, column=0, sticky="w", pady=4, padx=(0, 8))
         widget.grid(row=row, column=1, sticky="ew", pady=4)
         parent.columnconfigure(1, weight=1)
 
-    def _add_path_row(self, parent: ttk.LabelFrame, row: int, label: str, var: tk.StringVar, command) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        row_frame = ttk.Frame(parent)
+    def _add_path_row(self, parent, row: int, label: str, var: tk.StringVar, command) -> None:
+        ctk.CTkLabel(parent, text=label, anchor="w").grid(row=row, column=0, sticky="w", pady=4, padx=(0, 8))
+        row_frame = ctk.CTkFrame(parent, fg_color="transparent")
         row_frame.grid(row=row, column=1, sticky="ew", pady=4)
         row_frame.columnconfigure(0, weight=1)
-        ttk.Entry(row_frame, textvariable=var).grid(row=0, column=0, sticky="ew")
-        ttk.Button(row_frame, text="选择", command=command).grid(row=0, column=1, padx=(8, 0))
+        ctk.CTkEntry(row_frame, textvariable=var).grid(row=0, column=0, sticky="ew")
+        self._btn(row_frame, "选择", command).grid(row=0, column=1, padx=(8, 0))
         parent.columnconfigure(1, weight=1)
 
     def _configure_styles(self) -> None:
-        """设置桌面生产工作台的基础 ttk 风格，不引入额外 UI 框架。"""
-        self.root.configure(bg=APP_COLORS["background"])
+        """深色工作台风格：CustomTkinter 负责新控件，ttk 经 clam 主题统一刷深色。"""
+        bg = APP_COLORS["background"]
+        panel = APP_COLORS["panel"]
+        text = APP_COLORS["text"]
+        field = APP_COLORS["input"]
+        border = APP_COLORS["border"]
+        accent = APP_COLORS["accent"]
+        self.root.configure(bg=bg)
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("App.TFrame", background=APP_COLORS["background"])
-        style.configure("Panel.TFrame", background=APP_COLORS["panel"])
-        style.configure("Panel.TLabelframe", background=APP_COLORS["panel"], bordercolor=APP_COLORS["border"])
-        style.configure("Panel.TLabelframe.Label", foreground=APP_COLORS["text"], background=APP_COLORS["background"])
-        style.configure("Status.TLabel", foreground=APP_COLORS["muted"], background=APP_COLORS["panel"])
-        style.configure("Warning.TLabel", foreground=APP_COLORS["warning"], background=APP_COLORS["panel"])
-        style.configure("Primary.TButton", foreground=APP_COLORS["text"])
+
+        style.configure(
+            ".",
+            background=panel,
+            foreground=text,
+            bordercolor=border,
+            fieldbackground=field,
+            lightcolor=panel,
+            darkcolor=panel,
+        )
+        style.configure("App.TFrame", background=bg)
+        style.configure("Panel.TFrame", background=panel)
+        style.configure("TFrame", background=panel)
+        style.configure("TLabel", background=panel, foreground=text)
+        style.configure("Panel.TLabelframe", background=panel, bordercolor=border, relief="solid")
+        style.configure("Panel.TLabelframe.Label", background=panel, foreground=text)
+        style.configure("TLabelframe", background=panel, bordercolor=border)
+        style.configure("TLabelframe.Label", background=panel, foreground=text)
+        style.configure("Status.TLabel", foreground=APP_COLORS["muted"], background=panel)
+        style.configure("Warning.TLabel", foreground=APP_COLORS["warning"], background=panel)
+
+        for entry_style in ("TEntry", "TSpinbox", "TCombobox"):
+            style.configure(
+                entry_style,
+                fieldbackground=field,
+                foreground=text,
+                background=field,
+                bordercolor=border,
+                arrowcolor=text,
+                insertcolor=text,
+            )
+            style.map(
+                entry_style,
+                fieldbackground=[("readonly", field), ("disabled", panel)],
+                foreground=[("disabled", APP_COLORS["muted"])],
+            )
+
+        style.configure("TButton", background=field, foreground=text, bordercolor=border, relief="flat", padding=6)
+        style.map("TButton", background=[("active", APP_COLORS["accent_soft"])])
+        style.configure("Primary.TButton", background=accent, foreground="#ffffff")
+        style.map("Primary.TButton", background=[("active", "#5b8def")])
+        style.configure("TCheckbutton", background=panel, foreground=text)
+        style.map("TCheckbutton", background=[("active", panel)])
+        style.configure("TScrollbar", background=field, troughcolor=bg, bordercolor=border, arrowcolor=text)
+        style.configure("TNotebook", background=panel, bordercolor=border)
+        style.configure("TNotebook.Tab", background=field, foreground=text, padding=(10, 4))
+        style.map("TNotebook.Tab", background=[("selected", panel)], foreground=[("selected", text)])
+
+        # ttk Combobox 下拉列表用经典 Listbox，需经 option database 刷深色。
+        self.root.option_add("*TCombobox*Listbox.background", field)
+        self.root.option_add("*TCombobox*Listbox.foreground", text)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", accent)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+
+    def _ctk_card(self, parent, title: str) -> tuple[ctk.CTkFrame, ctk.CTkFrame]:
+        """深色圆角卡片 + 顶部标题；返回 (card, body)，内容 grid 进 body（替代 ttk.LabelFrame）。"""
+        card = ctk.CTkFrame(
+            parent,
+            corner_radius=10,
+            fg_color=APP_COLORS["panel"],
+            border_width=1,
+            border_color=APP_COLORS["border"],
+        )
+        ctk.CTkLabel(
+            card, text=title, anchor="w", text_color=APP_COLORS["muted"], font=ctk.CTkFont(size=12)
+        ).pack(fill="x", padx=12, pady=(8, 0))
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=12, pady=(4, 10))
+        body.columnconfigure(0, weight=1)
+        return card, body
+
+    def _btn(self, parent, text: str, command, *, primary: bool = False, **kwargs) -> ctk.CTkButton:
+        """统一的 CTk 按钮：primary=蓝色主按钮，否则中性深色。"""
+        return ctk.CTkButton(
+            parent,
+            text=text,
+            command=command,
+            corner_radius=8,
+            height=30,
+            fg_color=APP_COLORS["accent"] if primary else APP_COLORS["input"],
+            hover_color=APP_COLORS["accent_soft"],
+            text_color="#ffffff" if primary else APP_COLORS["text"],
+            **kwargs,
+        )
 
     def _build_layout(self) -> None:
         self.root.geometry("1120x760")
-        self.root.minsize(760, 560)
+        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         self._configure_styles()
 
         frame = ttk.Frame(self.root, padding=8, style="App.TFrame")
         frame.pack(fill="both", expand=True)
 
+        menubar = self._build_menubar(frame)
+        menubar.pack(side="top", fill="x", pady=(0, 6))
+
         production_bar = self._build_production_bar(frame)
         production_bar.pack(side="bottom", fill="x", pady=(8, 0))
+
+        # 产品切换列：作为最左新增一列，原 body（预览 + 功能区）两栏布局保持不变。
+        self.product_rail = ctk.CTkFrame(
+            frame, width=PRODUCT_RAIL_COLLAPSED_WIDTH, corner_radius=0, fg_color=APP_COLORS["panel"]
+        )
+        self.product_rail.pack(side="left", fill="y", padx=(0, 8))
+        self.product_rail.pack_propagate(False)
+        self._render_product_rail()
 
         body = ttk.Frame(frame, style="App.TFrame")
         body.pack(fill="both", expand=True)
@@ -705,121 +1025,297 @@ class BirthFlowerApp:
             "function_panel": function_panel,
             "production_panel": production_panel,
             "production_bar": production_bar,
+            "product_rail": self.product_rail,
         }
         self._set_warnings(["等待解析；识别结果不会自动生成最终文件。"])
+        # ctk.CTk 根窗自带深色标题栏；仅当回退到 tk.Tk（测试/缺 ctk）时用 DWM 兜底。
+        if ctk is None or not isinstance(self.root, ctk.CTk):
+            _enable_dark_titlebar(self.root)
 
-    def _build_function_panel(self, parent: ttk.Frame) -> tuple[ttk.LabelFrame, ttk.LabelFrame, ttk.LabelFrame]:
-        panel = ttk.LabelFrame(parent, text="功能区", padding=6, style="Panel.TLabelframe")
-        panel.columnconfigure(0, weight=1)
-        panel.rowconfigure(0, weight=1)
-
-        scroll_canvas = tk.Canvas(
-            panel,
-            width=320,
-            highlightthickness=0,
-            bg=APP_COLORS["panel"],
+    def _render_product_rail(self) -> None:
+        """按收/展状态重建产品切换列内容（方案2，CustomTkinter 深色圆角风格）。"""
+        rail = self.product_rail
+        if rail is None:
+            return
+        for child in rail.winfo_children():
+            child.destroy()
+        collapsed = self.products_collapsed
+        rail.configure(
+            width=PRODUCT_RAIL_COLLAPSED_WIDTH if collapsed else PRODUCT_RAIL_EXPANDED_WIDTH
         )
-        scrollbar = ttk.Scrollbar(panel, orient="vertical", command=scroll_canvas.yview)
-        content = ttk.Frame(scroll_canvas, style="Panel.TFrame")
-        window_id = scroll_canvas.create_window((0, 0), window=content, anchor="nw")
-        scroll_canvas.configure(yscrollcommand=scrollbar.set)
-        scroll_canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
 
-        def sync_scroll_region(_event=None) -> None:
-            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+        header = ctk.CTkFrame(rail, fg_color="transparent")
+        header.pack(fill="x", padx=6, pady=(8, 6))
+        ctk.CTkButton(
+            header,
+            # 收起→指向外(«，下次点击展开)；展开→指向内(»，下次点击收起)。
+            text="«" if collapsed else "»",
+            width=28,
+            height=28,
+            command=self._toggle_product_rail,
+            fg_color="transparent",
+            hover_color=APP_COLORS["accent_soft"],
+            text_color=APP_COLORS["muted"],
+        ).pack(side="left")
+        if not collapsed:
+            ctk.CTkLabel(header, text="产品", text_color=APP_COLORS["text"]).pack(side="left", padx=(6, 0))
 
-        def sync_content_width(event) -> None:
-            scroll_canvas.itemconfigure(window_id, width=event.width)
+        # 新建按钮固定底部；产品列表从上往下填充。
+        ctk.CTkButton(
+            rail,
+            text="+" if collapsed else "+ 新建产品",
+            height=30,
+            command=self._open_new_product_dialog,
+            fg_color="transparent",
+            hover_color=APP_COLORS["accent_soft"],
+            text_color=APP_COLORS["accent"],
+            anchor="center" if collapsed else "w",
+        ).pack(side="bottom", fill="x", padx=6, pady=8)
 
-        content.bind("<Configure>", sync_scroll_region)
-        scroll_canvas.bind("<Configure>", sync_content_width)
+        for item in product_rail_items(self.config):
+            self._build_product_button(rail, item, collapsed)
 
-        order_panel = self._build_order_panel(content)
-        production_panel = self._build_production_panel(content)
+    def _build_product_button(self, rail: tk.Widget, item: dict[str, object], collapsed: bool) -> None:
+        active = bool(item["active"])
+        button = ctk.CTkButton(
+            rail,
+            text=str(item["initial"]) if collapsed else str(item["name"]),
+            command=lambda pid=str(item["id"]): self._switch_product(pid),
+            height=34,
+            corner_radius=8,
+            fg_color=APP_COLORS["accent"] if active else "transparent",
+            hover_color=APP_COLORS["accent_soft"],
+            text_color="#ffffff" if active else APP_COLORS["text"],
+            anchor="center" if collapsed else "w",
+        )
+        button.pack(fill="x", padx=6, pady=3)
+        if collapsed:
+            # 收起时只显示首字，用悬浮提示补全产品名。
+            _attach_tooltip(button, str(item["name"]))
+
+    def _toggle_product_rail(self) -> None:
+        """收/展产品列；窗口宽度同步增减，让列「往外推出」而非「往内挤占画板」。"""
+        delta = PRODUCT_RAIL_EXPANDED_WIDTH - PRODUCT_RAIL_COLLAPSED_WIDTH
+        expanding = self.products_collapsed  # 当前收起 → 即将展开
+        self.products_collapsed = not self.products_collapsed
+        self.config = dataclasses.replace(
+            self.config, products_panel_collapsed=self.products_collapsed
+        )
+        save_config(self.config)
+        self._render_product_rail()
+        # 窗口整体加宽/收窄 delta，使画板与功能区宽度保持不变（产品列向外扩，不吃画板）。
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        new_width = width + delta if expanding else max(MIN_WINDOW_WIDTH, width - delta)
+        self.root.geometry(f"{new_width}x{height}")
+
+    def _switch_product(self, product_id: str) -> None:
+        """切换激活产品：持久化 + 把该产品的素材/字体库灌进扫描入口并重扫。"""
+        if product_id == active_product(self.config).id:
+            return
+        self.config = dataclasses.replace(self.config, active_product_id=product_id)
+        save_config(self.config)
+        product = active_product(self.config)
+        # 切产品=切其素材/字体库目录；接进现有扫描入口（字段级联待 Phase 2）。
+        if product.image_library_dirs:
+            self.flower_dir_var.set(str(product.image_library_dirs[0]))
+        if product.font_library_dirs:
+            self.font_source_var.set(str(product.font_library_dirs[0]))
+        self._scan_assets(show_errors=False)
+        self._render_product_rail()
+        self.status_var.set(f"已切换产品：{product.name}")
+
+    def _open_new_product_dialog(self) -> None:
+        """新建产品：填名称/ID + 选图像库/字体库目录，创建后切过去。"""
+        window = self._themed_toplevel()
+        window.title("新建产品")
+        window.transient(self.root)
+        frame = ctk.CTkFrame(window, fg_color="transparent")
+        frame.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        frame.columnconfigure(1, weight=1)
+
+        name_var = tk.StringVar()
+        id_var = tk.StringVar()
+        image_dir_var = tk.StringVar()
+        font_dir_var = tk.StringVar()
+        existing_ids = [product.id for product in self.config.products]
+        auto_state = {"value": ""}
+
+        def on_name_changed(*_args: object) -> None:
+            # ID 默认跟随产品名自动生成；一旦用户手动改过 ID 就不再自动覆盖。
+            if id_var.get().strip() and id_var.get() != auto_state["value"]:
+                return
+            auto = unique_product_id(name_var.get(), existing_ids)
+            auto_state["value"] = auto
+            id_var.set(auto)
+
+        name_var.trace_add("write", on_name_changed)
+
+        ctk.CTkLabel(frame, text="产品名", anchor="w").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 8))
+        ctk.CTkEntry(frame, textvariable=name_var).grid(row=0, column=1, sticky="ew", pady=4)
+        ctk.CTkLabel(frame, text="产品 ID", anchor="w").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 8))
+        ctk.CTkEntry(frame, textvariable=id_var).grid(row=1, column=1, sticky="ew", pady=4)
+        self._add_path_row(frame, 2, "图像库目录", image_dir_var, lambda: self._choose_dir_into(image_dir_var))
+        self._add_path_row(frame, 3, "字体库目录", font_dir_var, lambda: self._choose_dir_into(font_dir_var))
+
+        button_row = ctk.CTkFrame(frame, fg_color="transparent")
+        button_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        self._btn(button_row, "取消", window.destroy).grid(row=0, column=0, padx=(0, 8))
+        self._btn(
+            button_row,
+            "创建",
+            lambda: self._create_product_from_dialog(
+                window, name_var, id_var, image_dir_var, font_dir_var
+            ),
+            primary=True,
+        ).grid(row=0, column=1)
+
+    def _choose_dir_into(self, var: tk.StringVar) -> None:
+        path = filedialog.askdirectory()
+        if path:
+            var.set(path)
+
+    def _create_product_from_dialog(
+        self,
+        window: tk.Toplevel,
+        name_var: tk.StringVar,
+        id_var: tk.StringVar,
+        image_dir_var: tk.StringVar,
+        font_dir_var: tk.StringVar,
+    ) -> None:
+        name = name_var.get().strip()
+        if not name:
+            messagebox.showwarning("新建产品", "请填写产品名。")
+            return
+        existing_ids = [product.id for product in self.config.products]
+        product_id = id_var.get().strip() or unique_product_id(name, existing_ids)
+        if product_id in existing_ids:
+            messagebox.showwarning("新建产品", f"产品 ID 已存在：{product_id}")
+            return
+        image_dirs = (Path(image_dir_var.get()),) if image_dir_var.get().strip() else ()
+        font_dirs = (Path(font_dir_var.get()),) if font_dir_var.get().strip() else ()
+        product = ProductConfig(
+            id=product_id,
+            name=name,
+            image_library_dirs=image_dirs,
+            font_library_dirs=font_dirs,
+            defaults=self.config.layout_defaults,
+        )
+        # 先追加（不激活）再走切换逻辑，复用切换里的重扫/重绘/持久化。
+        self.config = with_added_product(self.config, product, activate=False)
+        save_config(self.config)
+        window.destroy()
+        self._switch_product(product_id)
+
+    def _build_function_panel(self, parent):
+        # CTkScrollableFrame 自带滚动，替代原来手搓的 tk.Canvas + Scrollbar。
+        panel = ctk.CTkScrollableFrame(
+            parent,
+            width=320,
+            label_text="功能区",
+            corner_radius=10,
+            fg_color=APP_COLORS["panel"],
+            label_fg_color=APP_COLORS["panel"],
+        )
+        panel.columnconfigure(0, weight=1)
+
+        order_panel = self._build_order_panel(panel)
+        production_panel = self._build_production_panel(panel)
         order_panel.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         production_panel.grid(row=1, column=0, sticky="ew")
-        layers_panel = self._build_layers_panel(content)
+        layers_panel = self._build_layers_panel(panel)
         layers_panel.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        content.columnconfigure(0, weight=1)
         return panel, order_panel, production_panel
 
 
     def _build_layers_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
         """右下角图层面板：负责选择、显隐、锁定、删除和调整层级。"""
-        panel = ttk.LabelFrame(parent, text="图层", padding=10, style="Panel.TLabelframe")
-        panel.columnconfigure(0, weight=1)
-        self.layers_listbox = tk.Listbox(panel, height=7, exportselection=False)
+        panel, body = self._ctk_card(parent, "图层")
+        self.layers_listbox = tk.Listbox(
+            body,
+            height=7,
+            exportselection=False,
+            bg=APP_COLORS["input"],
+            fg=APP_COLORS["text"],
+            selectbackground=APP_COLORS["accent"],
+            selectforeground="#ffffff",
+            highlightthickness=1,
+            highlightbackground=APP_COLORS["border"],
+            relief="flat",
+            borderwidth=0,
+        )
         self.layers_listbox.grid(row=0, column=0, columnspan=5, sticky="ew")
         self.layers_listbox.bind("<<ListboxSelect>>", self._on_layer_list_select)
         self.layers_listbox.bind("<Double-Button-1>", self._on_layer_list_double_click)
         self.layers_listbox.bind("<Button-3>", self._show_layer_context_menu)
         self.layers_listbox.bind("<Button-2>", self._show_layer_context_menu)
-        ttk.Button(panel, text="显/隐", command=self._toggle_selected_layer_visible).grid(row=1, column=0, sticky="ew", pady=3)
-        ttk.Button(panel, text="锁/解", command=self._toggle_selected_layer_locked).grid(row=1, column=1, sticky="ew", pady=3)
-        ttk.Button(panel, text="删除", command=self._delete_selected_layer).grid(row=1, column=2, sticky="ew", pady=3)
-        ttk.Button(panel, text="上移", command=lambda: self._move_selected_layer("up")).grid(row=2, column=0, sticky="ew", pady=3)
-        ttk.Button(panel, text="下移", command=lambda: self._move_selected_layer("down")).grid(row=2, column=1, sticky="ew", pady=3)
-        ttk.Button(panel, text="置顶", command=lambda: self._move_selected_layer("top")).grid(row=2, column=2, sticky="ew", pady=3)
-        ttk.Button(panel, text="置底", command=lambda: self._move_selected_layer("bottom")).grid(row=2, column=3, sticky="ew", pady=3)
-        ttk.Label(panel, textvariable=self.layer_detail_var, style="Status.TLabel", wraplength=240).grid(row=3, column=0, columnspan=5, sticky="ew")
-        ttk.Label(panel, text="文本").grid(row=4, column=0, sticky="w", pady=(6, 2))
-        ttk.Entry(panel, textvariable=self.layer_text_var).grid(row=4, column=1, columnspan=4, sticky="ew", pady=(6, 2))
-        ttk.Label(panel, text="字号").grid(row=5, column=0, sticky="w", pady=2)
-        ttk.Entry(panel, textvariable=self.layer_font_size_var, width=8).grid(row=5, column=1, sticky="ew", pady=2)
-        ttk.Label(panel, text="颜色").grid(row=5, column=2, sticky="w", pady=2)
-        ttk.Entry(panel, textvariable=self.layer_color_var, width=10).grid(row=5, column=3, sticky="ew", pady=2)
-        ttk.Button(panel, text="应用文本属性", command=self._apply_text_layer_properties).grid(row=5, column=4, sticky="ew", pady=2)
+        self._btn(body, "显/隐", self._toggle_selected_layer_visible).grid(row=1, column=0, sticky="ew", pady=3, padx=2)
+        self._btn(body, "锁/解", self._toggle_selected_layer_locked).grid(row=1, column=1, sticky="ew", pady=3, padx=2)
+        self._btn(body, "删除", self._delete_selected_layer).grid(row=1, column=2, sticky="ew", pady=3, padx=2)
+        self._btn(body, "上移", lambda: self._move_selected_layer("up")).grid(row=2, column=0, sticky="ew", pady=3, padx=2)
+        self._btn(body, "下移", lambda: self._move_selected_layer("down")).grid(row=2, column=1, sticky="ew", pady=3, padx=2)
+        self._btn(body, "置顶", lambda: self._move_selected_layer("top")).grid(row=2, column=2, sticky="ew", pady=3, padx=2)
+        self._btn(body, "置底", lambda: self._move_selected_layer("bottom")).grid(row=2, column=3, sticky="ew", pady=3, padx=2)
+        ctk.CTkLabel(
+            body, textvariable=self.layer_detail_var, text_color=APP_COLORS["muted"],
+            wraplength=240, anchor="w", justify="left",
+        ).grid(row=3, column=0, columnspan=5, sticky="ew", pady=(4, 0))
+        ctk.CTkLabel(body, text="文本", anchor="w").grid(row=4, column=0, sticky="w", pady=(6, 2))
+        ctk.CTkEntry(body, textvariable=self.layer_text_var).grid(row=4, column=1, columnspan=4, sticky="ew", pady=(6, 2))
+        ctk.CTkLabel(body, text="字号", anchor="w").grid(row=5, column=0, sticky="w", pady=2)
+        ctk.CTkEntry(body, textvariable=self.layer_font_size_var, width=70).grid(row=5, column=1, sticky="ew", pady=2)
+        ctk.CTkLabel(body, text="颜色", anchor="w").grid(row=5, column=2, sticky="w", pady=2)
+        ctk.CTkEntry(body, textvariable=self.layer_color_var, width=90).grid(row=5, column=3, sticky="ew", pady=2)
+        self._btn(body, "应用文本属性", self._apply_text_layer_properties).grid(row=5, column=4, sticky="ew", pady=2, padx=2)
         return panel
 
     def _build_order_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        panel = ttk.LabelFrame(parent, text="订单与解析", padding=12, style="Panel.TLabelframe")
-        panel.columnconfigure(0, weight=1)
+        panel, body = self._ctk_card(parent, "订单与解析")
 
-        ttk.Label(panel, text="订单备注").grid(row=0, column=0, sticky="w")
-        self.remark_text = tk.Text(
-            panel,
-            height=4,
-            wrap="word",
-            bg=APP_COLORS["panel"],
-            fg=APP_COLORS["text"],
-            insertbackground=APP_COLORS["text"],
-            relief="solid",
-            borderwidth=1,
+        ctk.CTkLabel(body, text="订单备注", anchor="w").grid(row=0, column=0, sticky="w")
+        self.remark_text = ctk.CTkTextbox(
+            body,
+            height=90,
+            fg_color=APP_COLORS["input"],
+            text_color=APP_COLORS["text"],
+            border_width=1,
+            border_color=APP_COLORS["border"],
         )
         self.remark_text.grid(row=1, column=0, sticky="ew", pady=(4, 8))
         if self.remark_var.get():
             self.remark_text.insert("1.0", self.remark_var.get())
 
-        action_row = ttk.Frame(panel)
+        action_row = ctk.CTkFrame(body, fg_color="transparent")
         action_row.grid(row=2, column=0, sticky="ew", pady=(0, 12))
         action_row.columnconfigure(0, weight=1)
-        ttk.Button(action_row, text="导入", command=self.import_remark_file).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(action_row, text="解析", command=self.parse_remark).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(action_row, text="清空", command=self.clear_remark).grid(row=0, column=3)
+        self._btn(action_row, "导入", self.import_remark_file).grid(row=0, column=1, padx=(0, 8))
+        self._btn(action_row, "解析", self.parse_remark, primary=True).grid(row=0, column=2, padx=(0, 8))
+        self._btn(action_row, "清空", self.clear_remark).grid(row=0, column=3)
 
-        fields = ttk.LabelFrame(panel, text="人工确认字段", padding=10, style="Panel.TLabelframe")
+        fields, fbody = self._ctk_card(body, "人工确认字段")
         fields.grid(row=3, column=0, sticky="ew")
-        self._add_row(fields, 0, "内容", ttk.Entry(fields, textvariable=self.name_var))
-        self._add_row(fields, 1, "月份", ttk.Spinbox(fields, from_=1, to=12, textvariable=self.month_var, width=8))
-        ttk.Label(fields, text="大小写").grid(row=2, column=0, sticky="w", pady=(6, 2))
-        self.case_button = ttk.Button(
-            fields, text=TEXT_CASE_LABELS[self.text_case_var.get()], width=8,
-            command=self._cycle_text_case,
+        self._add_row(fbody, 0, "内容", ctk.CTkEntry(fbody, textvariable=self.name_var))
+        self._add_row(fbody, 1, "月份", ttk.Spinbox(fbody, from_=1, to=12, textvariable=self.month_var, width=8))
+        ctk.CTkLabel(fbody, text="大小写", anchor="w").grid(row=2, column=0, sticky="w", pady=(6, 2))
+        self.case_button = self._btn(
+            fbody, TEXT_CASE_LABELS[self.text_case_var.get()], self._cycle_text_case, width=90
         )
         self.case_button.grid(row=2, column=1, sticky="w", pady=(6, 2))
-        ttk.Label(fields, textvariable=self.warning_var, style="Warning.TLabel", wraplength=240).grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0)
-        )
+        ctk.CTkLabel(
+            fbody, textvariable=self.warning_var, text_color=APP_COLORS["warning"],
+            wraplength=240, anchor="w", justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         return panel
 
     def _build_preview_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        panel = ttk.LabelFrame(parent, text="实时画板", padding=6, style="Panel.TLabelframe")
-        panel.columnconfigure(0, weight=1)
-        panel.rowconfigure(0, weight=1)
+        panel, body = self._ctk_card(parent, "实时画板")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
 
+        # 画板保持白底：代表浅色木料，雕刻预览是深灰折线 + 黑墨字，翻黑会看不见。
         self.preview_canvas = tk.Canvas(
-            panel,
+            body,
             width=720,
             height=532,
             bg="white",
@@ -839,53 +1335,66 @@ class BirthFlowerApp:
         return panel
 
     def _build_production_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        panel = ttk.LabelFrame(parent, text="生产参数", padding=12, style="Panel.TLabelframe")
-        panel.columnconfigure(0, weight=1)
+        panel, body = self._ctk_card(parent, "生产参数")
 
-        asset_group = ttk.LabelFrame(panel, text="素材与字体", padding=10, style="Panel.TLabelframe")
+        asset_group, abody = self._ctk_card(body, "素材与字体")
         asset_group.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        asset_group.columnconfigure(1, weight=1)
-        self.flower_combo = ttk.Combobox(asset_group, textvariable=self.flower_asset_var, state="readonly")
-        self.flower_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_flower_combo_selected())
-        ttk.Label(asset_group, text="素材名").grid(row=0, column=0, sticky="w", pady=4)
+        abody.columnconfigure(1, weight=1)
+        # CTkOptionMenu = 只读下拉；选中走 command（取代 ttk 的 <<ComboboxSelected>>）。
+        self.flower_combo = ctk.CTkOptionMenu(
+            abody,
+            variable=self.flower_asset_var,
+            values=["（请扫描素材）"],
+            command=lambda _choice: self._on_flower_combo_selected(),
+            fg_color=APP_COLORS["input"],
+            button_color=APP_COLORS["accent"],
+            button_hover_color=APP_COLORS["accent_soft"],
+            text_color=APP_COLORS["text"],
+        )
+        ctk.CTkLabel(abody, text="素材名", anchor="w").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 8))
         self.flower_combo.grid(row=0, column=1, sticky="ew", pady=4)
-        self.font_combo = ttk.Combobox(asset_group, textvariable=self.font_asset_var, state="readonly")
-        self.font_combo.bind("<<ComboboxSelected>>", lambda _event: self._on_font_combo_selected())
-        ttk.Label(asset_group, text="字体类型").grid(row=1, column=0, sticky="w", pady=4)
+        self.font_combo = ctk.CTkOptionMenu(
+            abody,
+            variable=self.font_asset_var,
+            values=["（请扫描字体）"],
+            command=lambda _choice: self._on_font_combo_selected(),
+            fg_color=APP_COLORS["input"],
+            button_color=APP_COLORS["accent"],
+            button_hover_color=APP_COLORS["accent_soft"],
+            text_color=APP_COLORS["text"],
+        )
+        ctk.CTkLabel(abody, text="字体类型", anchor="w").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 8))
         self.font_combo.grid(row=1, column=1, sticky="ew", pady=4)
-        action_row = ttk.Frame(asset_group)
+        action_row = ctk.CTkFrame(abody, fg_color="transparent")
         action_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(action_row, text="添加素材", command=self._add_selected_flower_to_canvas).pack(side="left")
-        ttk.Button(action_row, text="添加文本", command=self._add_text_layer_from_fields).pack(side="left", padx=(8, 0))
+        self._btn(action_row, "添加素材", self._add_selected_flower_to_canvas).pack(side="left")
+        self._btn(action_row, "添加文本", self._add_text_layer_from_fields, primary=True).pack(side="left", padx=(8, 0))
 
-        ttk.Label(
-            panel,
-            text="布局默认值：编辑 → 布局设置",
-            style="Status.TLabel",
-            wraplength=260,
+        ctk.CTkLabel(
+            body, text="布局默认值：编辑 → 布局设置", anchor="w", justify="left",
+            text_color=APP_COLORS["muted"], wraplength=260,
         ).grid(row=1, column=0, sticky="ew")
         return panel
 
     def _build_production_bar(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        bar = ttk.LabelFrame(parent, text="生产输出", padding=10, style="Panel.TLabelframe")
-        bar.columnconfigure(2, weight=1)
-        ttk.Label(bar, text="格式").grid(row=0, column=0, sticky="w")
-        format_row = ttk.Frame(bar, style="Panel.TFrame")
+        bar, body = self._ctk_card(parent, "生产输出")
+        body.columnconfigure(2, weight=1)
+        ctk.CTkLabel(body, text="格式", anchor="w").grid(row=0, column=0, sticky="w")
+        format_row = ctk.CTkFrame(body, fg_color="transparent")
         format_row.grid(row=0, column=1, sticky="w", padx=(8, 12))
         for output_format, label in (("png", "PNG"), ("svg", "SVG"), ("dxf", "DXF")):
-            ttk.Checkbutton(format_row, text=label, variable=self.output_format_vars[output_format]).pack(
-                side="left", padx=(0, 6)
-            )
+            ctk.CTkCheckBox(
+                format_row, text=label, variable=self.output_format_vars[output_format],
+                onvalue=True, offvalue=False, checkbox_width=18, checkbox_height=18,
+                fg_color=APP_COLORS["accent"], hover_color=APP_COLORS["accent_soft"],
+            ).pack(side="left", padx=(0, 10))
         # 文字实心交由 Ezcad 自动导入项目在导入后用 EzCad 原生「填充」完成,这里不再放开关。
-        ttk.Entry(bar, textvariable=self.output_var, width=28).grid(row=0, column=2, sticky="ew")
-        ttk.Button(bar, text="选择", command=self.choose_output).grid(row=0, column=3, sticky="e", padx=(8, 0))
-        ttk.Label(bar, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=4, sticky="w", padx=(10, 0))
-        self.confirm_button = ttk.Button(
-            bar,
-            text="生成",
-            command=self.confirm_and_generate,
-            style="Primary.TButton",
+        ctk.CTkEntry(body, textvariable=self.output_var, width=240).grid(row=0, column=2, sticky="ew")
+        self._btn(body, "选择", self.choose_output).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        ctk.CTkLabel(body, textvariable=self.status_var, text_color=APP_COLORS["muted"], anchor="w").grid(
+            row=0, column=4, sticky="w", padx=(10, 0)
         )
+        self.confirm_button = self._btn(body, "生成", self.confirm_and_generate, primary=True, width=90)
         self.confirm_button.grid(row=0, column=5, sticky="e", padx=(10, 0))
         return bar
 
@@ -910,7 +1419,7 @@ class BirthFlowerApp:
         self._set_warnings(["等待解析；识别结果不会自动生成最终文件。"])
 
     def open_settings(self) -> None:
-        window = tk.Toplevel(self.root)
+        window = self._themed_toplevel()
         window.title("设置")
         window.transient(self.root)
         window.grab_set()
@@ -1026,7 +1535,9 @@ class BirthFlowerApp:
 
     def _save_settings_window(self, window: tk.Toplevel) -> None:
         profile = self._settings_ai_profile()
-        self.config = AppConfig(
+        # 用 replace 而非整体重建，避免清空 products / active_product_id / 产品列收展状态。
+        self.config = dataclasses.replace(
+            self.config,
             flower_dir=Path(self.flower_dir_var.get()),
             font_source=Path(self.font_source_var.get()),
             output_path=Path(self.output_var.get()),
@@ -1043,7 +1554,7 @@ class BirthFlowerApp:
 
     def open_layout_settings(self) -> None:
         """打开全局默认布局设置；这些值只用于之后新建图层，不回写已有图层。"""
-        window = tk.Toplevel(self.root)
+        window = self._themed_toplevel()
         window.title("布局设置")
         window.transient(self.root)
         frame = ttk.Frame(window, padding=12)
@@ -1747,15 +2258,17 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def show_glyph_help(self) -> None:
-        messagebox.showinfo(
-            "字形使用说明",
-            "Font 2 已内置 a-z 26 个结尾字形：a=U+E068，z=U+E081，中间按字母顺序连续递增。\n"
-            "默认模式 replace_last_letter 会用配置的 PUA 字形替换最后一个英文字母，例如 Jazmin -> Jazmi + n.005。\n"
-            "人工绑定：编辑 -> 管理字形绑定，选择 Font 2，筛选 PUA only；单个绑定时选择映射字母、输入 U+E068 这类 codepoint，再点绑定到映射字母。\n"
-            "批量绑定：按 a-z 顺序粘贴 26 个 PUA 字符，再点按 a-z 绑定。\n"
-            "按位置替换只影响当前订单；映射绑定会保存到 glyph_maps/glyph_maps.json。\n"
-            "SVG 和 DXF 当前仍依赖字体文件显示 PUA 字符，换环境可能显示异常。",
+        # 原来用原生 messagebox（白底无法染色）；改成深色 CTk 窗口。
+        window = self._themed_toplevel()
+        window.title("字形使用说明")
+        window.geometry("560x320")
+        box = ctk.CTkTextbox(
+            window, wrap="word", fg_color=APP_COLORS["input"], text_color=APP_COLORS["text"]
         )
+        box.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        box.insert("1.0", GLYPH_HELP_TEXT)
+        box.configure(state="disabled")
+        self._btn(window, "关闭", window.destroy).pack(pady=(0, 12))
 
     def _font_design_label(self) -> str:
         try:
@@ -2075,7 +2588,7 @@ class BirthFlowerApp:
             "lock_aspect_ratio": layer.lock_aspect_ratio,
         }
         ratio = (layer.width / layer.height) if layer.height else 1.0
-        window = tk.Toplevel(self.root)
+        window = self._themed_toplevel()
         window.title("编辑素材")
         window.transient(self.root)
         frame = ttk.Frame(window, padding=12)
@@ -2638,7 +3151,7 @@ class BirthFlowerApp:
         resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
         image.thumbnail((target_width, target_height), resampling)
         try:
-            photo = ImageTk.PhotoImage(image)
+            photo = ImageTk.PhotoImage(image, master=canvas)
         except Exception:
             return
         self.preview_text_images.append(photo)
@@ -2674,7 +3187,7 @@ class BirthFlowerApp:
             except Exception:
                 image = image.rotate(-layer.rotation, expand=True)
         try:
-            photo = ImageTk.PhotoImage(image)
+            photo = ImageTk.PhotoImage(image, master=canvas)
         except Exception:
             return
         self.preview_text_images.append(photo)
@@ -2725,7 +3238,7 @@ class BirthFlowerApp:
             x = offset_x + (origin_x * scale) + offset_left
             y = offset_y + (origin_y * scale) + offset_top
         try:
-            photo = ImageTk.PhotoImage(image)
+            photo = ImageTk.PhotoImage(image, master=canvas)
         except Exception:
             return False
         self.preview_text_images.append(photo)
@@ -2764,7 +3277,7 @@ class BirthFlowerApp:
         resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
         image.thumbnail((target_width, target_height), resampling)
         try:
-            photo = ImageTk.PhotoImage(image)
+            photo = ImageTk.PhotoImage(image, master=canvas)
         except Exception:
             return
         self.preview_text_images.append(photo)
@@ -3182,6 +3695,7 @@ def _reexec_with_complete_env() -> None:
         return
     try:
         import numpy  # noqa: F401  ezdxf 依赖;缺它代表当前解释器不完整
+        import customtkinter  # noqa: F401  UI 必需;引导解释器缺它也要切到 .venv-win
         return
     except ImportError:
         pass
@@ -3197,7 +3711,8 @@ def _reexec_with_complete_env() -> None:
 
 def main() -> None:
     _reexec_with_complete_env()
-    root = tk.Tk()
+    # ctk.CTk = CustomTkinter 托管窗口（深色标题栏，Ezcad 同款）；ctk 缺失时回退 tk.Tk。
+    root = ctk.CTk() if ctk is not None else tk.Tk()
     BirthFlowerApp(root)
     root.mainloop()
 
