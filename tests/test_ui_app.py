@@ -1283,3 +1283,75 @@ def test_global_layout_defaults_only_initialize_new_layers(monkeypatch, tmp_path
         assert second_layer.height == 100
     finally:
         root.destroy()
+
+
+def test_apply_layer_production_writes_geometry_and_override(tmp_path):
+    # 增量4：属性面板编辑几何 → 写回画布几何 + 记录 layer.production override。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        from production import ProductionParams
+
+        app = BirthFlowerApp(root)
+        layer = add_image_layer(app.document, tmp_path / "x.svg", name="x", x=10, y=10, width=50, height=50)
+        app.document.selected_layer_id = layer.id
+        app.layer_x_var.set("120")
+        app.layer_y_var.set("140")
+        app.layer_w_var.set("260")
+        app.layer_h_var.set("180")
+
+        app._apply_layer_production()
+
+        assert (layer.x, layer.y, layer.width, layer.height) == (120, 140, 260, 180)
+        assert isinstance(layer.production, ProductionParams)
+        assert layer.production.x == 120 and layer.production.width == 260
+    finally:
+        root.destroy()
+
+
+def test_apply_layer_production_rejects_nonpositive_size(tmp_path, monkeypatch):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        app = BirthFlowerApp(root)
+        layer = add_image_layer(app.document, tmp_path / "x.svg", name="x", x=10, y=10, width=50, height=50)
+        app.document.selected_layer_id = layer.id
+        app.layer_x_var.set("0")
+        app.layer_y_var.set("0")
+        app.layer_w_var.set("0")  # 非法宽
+        app.layer_h_var.set("100")
+        errors = []
+        monkeypatch.setattr(ui_app_module.messagebox, "showerror", lambda *a, **k: errors.append(a))
+
+        app._apply_layer_production()
+
+        assert errors  # 弹了错误
+        assert layer.production is None  # 未写入 override
+        assert (layer.x, layer.y, layer.width, layer.height) == (10, 10, 50, 50)  # 几何不变
+    finally:
+        root.destroy()
+
+
+def test_layer_effective_production_resolves_override_over_slot(tmp_path):
+    # 增量4：resolve_chain 回落——override 字段生效，未覆盖字段回落槽位默认。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        from production import ProductionParams
+
+        app = BirthFlowerApp(root)
+        layer = add_image_layer(app.document, tmp_path / "x.svg", name="x")
+        layer.production = ProductionParams(x=333, width=99)  # 仅覆盖 x/width
+        effective = app._layer_effective_production(layer)
+        slot = app._slot_defaults(layer)
+        assert effective.x == 333
+        assert effective.width == 99
+        assert effective.y == slot.y  # 未 override → 回落槽位默认
+    finally:
+        root.destroy()
