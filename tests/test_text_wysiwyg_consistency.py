@@ -114,3 +114,26 @@ def test_letter_spacing_name_stays_centered_in_both(tmp_path):
     dxf_cx, dxf_cy = _dxf_geom_center(ezdxf, doc, tmp_path)
     # 字间距补偿后矢量也居中：与预览一致（若不补偿会右偏约 (n-1)*spacing/2 ≈ 30px）。
     assert abs(dxf_cx - png_cx) < 12
+
+
+def test_long_name_auto_wraps_and_is_bigger_than_single_line():
+    # 图1 升级：长名自动断成 2 行，字号比强制单行更大，仍装得下框。
+    _require_assets()
+    from text_layout import fit_text_box, _fit_name_font_size
+
+    name = "Melanie Helen Margaret"
+    w, h = 520, 420  # 偏窄偏高：单行明显受宽度压制，断行收益大
+    fit = fit_text_box(name, w, h, FONT, personalization_type="name")
+    single_size = _fit_name_font_size(name, w, h, FONT)
+    assert len(fit.lines) == 2
+    assert fit.font_size > single_size
+    assert fit.did_fit
+
+
+def test_short_single_name_stays_one_line():
+    # 短名/单词不无谓换行。
+    _require_assets()
+    from text_layout import fit_text_box
+
+    fit = fit_text_box("Emma", 520, 420, FONT, personalization_type="name")
+    assert len(fit.lines) == 1

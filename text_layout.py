@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import itertools
 import math
 import re
 import unicodedata
@@ -54,6 +55,11 @@ LINE_HEIGHT_RATIO = 1.18
 NAME_HEIGHT_RATIO = 0.62
 # 量字基准字号：在该字号下测墨迹，再线性换算到目标字号，避免反复栅格化。
 _REF_FONT_SIZE = 200
+# 名字自动断行（图1 升级）：长名按词均衡断成多行，让字号放大、居中、不贴边。
+NAME_MAX_LINES = 2  # 名字最多自动断 2 行（再多影响雕刻可读性）
+NAME_WRAP_GAIN = 0.08  # 多一行至少要让字号大 8% 才换行（短名不无谓换行）
+NAME_BLOCK_HEIGHT_RATIO = 0.86  # 多行名字墨迹块占框高比例（比单行 0.62 更满）
+NAME_SIDE_PAD_RATIO = 0.04  # 名字两侧安全边距占框宽比例（不贴边）
 
 
 def layout_personalization_text(
@@ -112,8 +118,7 @@ def fit_text_box(
     if ptype == "message":
         font_size, lines = _fit_message_box(raw, box_w, box_h, font_path, font_size_cap)
     else:
-        font_size = _fit_name_font_size(raw, box_w, box_h, font_path, font_size_cap)
-        lines = [raw]
+        font_size, lines = _fit_name_layout(raw, box_w, box_h, font_path, font_size_cap)
     origins, ink_union = _placement_origins_ls(
         lines, font_size, box_w, box_h, font_path,
         align=align, vertical_align=vertical_align, line_spacing=line_spacing,
@@ -164,6 +169,85 @@ def _fit_name_font_size(
         if size <= 1:
             break
     return max(1, size)
+
+
+def _balanced_wrap(words: list[str], line_count: int, font_path: Path | str | None) -> list[str]:
+    """把词切成 line_count 行（单词不拆），最小化最宽行的墨迹宽度（行更均衡，字号能更大）。"""
+    n = len(words)
+    line_count = max(1, min(line_count, n))
+    if line_count == 1:
+        return [" ".join(words)]
+
+    def line_width(start: int, end: int) -> float:
+        return measure_text_ink_bbox(" ".join(words[start:end]), _REF_FONT_SIZE, font_path).width
+
+    best_cuts: tuple[int, ...] = tuple(range(1, line_count))  # 兜底：每行至少一词
+    best_max = float("inf")
+    for cuts in itertools.combinations(range(1, n), line_count - 1):
+        bounds = (0, *cuts, n)
+        widest = max(line_width(bounds[i], bounds[i + 1]) for i in range(line_count))
+        if widest < best_max:
+            best_max, best_cuts = widest, cuts
+    bounds = (0, *best_cuts, n)
+    return [" ".join(words[bounds[i]:bounds[i + 1]]) for i in range(line_count)]
+
+
+def _fit_lines_name_size(
+    lines: list[str], box_w: float, box_h: float, font_path: Path | str | None, cap: float | None = None
+) -> int:
+    """多行名字的等比字号：最宽行装进框宽，墨迹块高占框高 NAME_BLOCK_HEIGHT_RATIO。"""
+    box_w = max(1.0, float(box_w))
+    box_h = max(1.0, float(box_h))
+    measured = [measure_text_ink_bbox(line, _REF_FONT_SIZE, font_path) for line in lines]
+    widths = [m.width for m in measured if m.width > 0]
+    heights = [m.height for m in measured if m.height > 0]
+    if not widths or not heights:
+        return _fit_name_font_size(" ".join(lines), box_w, box_h, font_path, cap)
+    line_count = len(lines)
+    block_h_ref = (line_count - 1) * _REF_FONT_SIZE * LINE_HEIGHT_RATIO + max(heights)
+    fit_by_width = _REF_FONT_SIZE * box_w / max(widths)
+    fit_by_height = _REF_FONT_SIZE * (box_h * NAME_BLOCK_HEIGHT_RATIO) / block_h_ref
+    size = min(fit_by_width, fit_by_height)
+    if cap and cap > 0:
+        size = min(size, float(cap))
+    return max(1, int(size))
+
+
+def _fit_name_layout(
+    text: str, box_w: float, box_h: float, font_path: Path | str | None, cap: float | None = None
+) -> tuple[int, list[str]]:
+    """名字排版（图1 升级）：在 1..NAME_MAX_LINES 行里挑能放最大字号的均衡断行方案。
+
+    单词/空名只能单行；多行仅当字号比上一方案大 NAME_WRAP_GAIN 才采用（短名不无谓换行）。
+    宽度留 NAME_SIDE_PAD_RATIO 安全边距；最终按真实墨迹 clamp 到全框，绝不溢出。
+    """
+    box_w = max(1.0, float(box_w))
+    box_h = max(1.0, float(box_h))
+    raw = str(text)
+    words = raw.split()
+    usable_w = max(1.0, box_w * (1.0 - 2 * NAME_SIDE_PAD_RATIO))
+    if len(words) <= 1:
+        return _fit_name_font_size(raw, usable_w, box_h, font_path, cap), [raw]
+
+    best_size = -1.0
+    best_lines: list[str] = [raw]
+    for line_count in range(1, min(NAME_MAX_LINES, len(words)) + 1):
+        if line_count == 1:
+            lines = [raw]
+            size = float(_fit_name_font_size(raw, usable_w, box_h, font_path, cap))
+        else:
+            lines = _balanced_wrap(words, line_count, font_path)
+            size = float(_fit_lines_name_size(lines, usable_w, box_h, font_path, cap))
+        # 从单行起步，多一行需比当前最优大 NAME_WRAP_GAIN 才采用（短名不乱换行）。
+        if size > best_size * (1.0 + NAME_WRAP_GAIN):
+            best_size, best_lines = size, lines
+
+    # 最终按真实全框（不含边距）clamp，宁可略小绝不溢出。
+    slot = Bounds(0.0, 0.0, box_w, box_h)
+    size_int = max(1, int(best_size))
+    while size_int > 1 and not _lines_fit(best_lines, size_int, slot, font_path):
+        size_int -= 1
+    return size_int, best_lines
 
 
 def _fit_message_box(
