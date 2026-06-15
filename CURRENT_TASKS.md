@@ -1,12 +1,12 @@
 # CURRENT_TASKS — flower
 
 > 配 `PROJECT_INDEX.md` 一起读。导出/EzCad 细节看 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
-> 更新：2026-06-14。
+> 更新：2026-06-15。
 
 ## 测试基线
 
 `PYTHONPATH=".;services\api" .\.venv-win\Scripts\python.exe -m pytest tests services/api/tests -q`
-→ **341 passed, 0 failed**（2026-06-14 Phase 4 产品切换器后 = 332 后端基线 `62556c0` + 9 个 `tests/test_product_switcher.py`）。ruff clean。
+→ **358 passed, 0 failed**（2026-06-15 Phase 2 增量 1-5 全部完成后）。ruff clean。
 
 ## 本轮（2026-06-14）已完成：Phase 4 产品切换器（方案2 可收/展）
 
@@ -74,10 +74,13 @@
 - 一句话：Product→素材库→素材(key/别名/标签/默认生产参数)→图层(可挂不同库+生产参数随图层 override)；月份字段→「素材库+素材」选择器；订单解析把库 catalog 注入 GPT、动态枚举校验 material_key（本地零硬编码）。演进兼容 birth-flower（month/flower 降为标签，金标/批量字节不破）；后期左侧产品切换器。
 - **Task 1（Phase 1 后端）✅ 完成**：新增 `production.py`(ProductionParams+回落链)、`material_library.py`(文件夹/library.json 清单/catalog)；`models.py` 图层加 `library_id/material_key/font_library_id/font_key/production`+迁移；`config_store.py` 加 `ProductConfig`+`products`+零感知迁移「产品0」。全量 317 passed, ruff clean，**未碰 `ui_app.py`**。
 - **Task 3（Phase 3 解析对接）✅ 完成**：新增 `order_catalog.py`（`LibraryBundle`/`build_prompt_catalog`/动态枚举 `build_order_remark_schema`/`parse_catalog_payload`/`enrich_parse_result`/`parse_order_remark_with_gpt_catalog`）；`models.ParseResult` 加 `material_library_id/material_key/font_library_id/font_key`；`parse_pipeline` 加可选 `bundle` 富化。**演进兼容：`gpt_parser.py`/`local_order_parser.py`/`orders.py`/`ui_app.py` 全未改**，靠 enrich 桥接旧 month/flower。全量 329 passed, ruff clean。把订单文本→具体 material_key/素材路径的能力做成纯后端可测，GPT 真实接入留待配 key。
-- **Task 2（UI，改 `ui_app.py`）进行中：地基(增量1-2)已落地，按用户决定停在此处**。接线契约见 ExecPlan Task 2 顶部「🔌 后端接线契约」。当前在分支 `claude/phase4-product-switcher`、叠在 UI 基线 `0840631` 之上、**已于 2026-06-15 提交 `b5a939c`**，全量 **348 passed, ruff clean**：
-  - **增量1（解析对接）✅**：`material_library.from_folder` 兼容单字体文件；`ui_app` 加 `self.active_bundle`（`_scan_assets` 用当前产品库目录 `LibraryBundle.from_dirs` 建，切产品自动跟随）；`parse_remark` 传 `bundle=self.active_bundle` → 解析结果经 enrich 落到 `material_key`/素材路径（对旧 month/flower 流零行为变化）。
-  - **增量2（每图层挂库）✅**：`_add_selected_flower_to_canvas` 写 `library_id/material_key`；`_add_text_layer_from_fields` 写 `font_library_id/font_key`（从 active_bundle 反查）。护栏 `tests/test_ui_app.py::test_add_flower_writes_layer_library_and_material_key`。
-  - **未做（增量3-5，按 ROI 暂停，等真有第二个素材库/产品再做）**：③人工确认「月份+花朵」→「素材库+素材」选择器（与 `flower_label_map`/month/flower 深度交织，高风险，当前单库视觉≈现状）；④属性面板生产参数随图层（`resolve_chain`，需 library.json 默认才有可见效果）；⑤设置窗口管库目录。
+- **Task 2（UI，改 `ui_app.py`）✅ 增量 1-5 全部完成**（2026-06-15，用户拍板「完成 345」并选「完整重构」）。分支 `claude/phase4-product-switcher`，全量 **358 passed, ruff clean**。接线契约见 ExecPlan Task 2「🔌 后端接线契约」。
+  - **增量1（解析对接）✅ `b5a939c`**：`self.active_bundle`（`_scan_assets` 建，切产品跟随）+ `parse_remark(bundle=)` → enrich 落 material_key。
+  - **增量2（每图层挂库）✅ `b5a939c`**：加素材/文本写 `library_id/material_key/font_*`。
+  - **增量4（属性面板生产参数随图层）✅ `e723e82`**：图层面板加 X/Y/宽/高 编辑；`_apply_layer_production` 写回画布几何（不旁路 `_apply_canvas_fit`）+ 记 `layer.production`；`_layer_effective_production`=§5 resolve_chain。
+  - **增量5（设置管库）✅ `72ea927`**：`config_store.with_product_library_dirs`（纯函数）+ 设置素材库/字体库 tab 目录列表编辑器；`_scan_assets` 主库(单目录入口)+附加库→多库 bundle。**顺手修潜伏 BUG**：`_save_current_config` 整体重建 AppConfig 会清空 products，改 `dataclasses.replace`。
+  - **增量3（人工确认面板重构，完整版）✅ `4ff0706`**：去手填月份 Spinbox→只读月份 chip；生产区加 素材库/字体库 选择器（数据驱动 active_bundle，选库过滤候选）；附加库 entries 并入候选（单库空操作）。**安全红线**：`month_var/flower_var/font_var` 保留内部派生态（随选中素材/字体程序化设置）→ 导出/金标/批量/导入零行为变化，仅 UI 不再手填。
+  - ⚠️ **真机手测仍待用户做**：本轮只过了自动化测试 + 真 Tk root 构造冒烟，没在真实窗口里点完整链路（选库切换、调几何、加不同库素材、导一单核 ezdxf 实体类型不变）。**改完务必完全关掉 App 重开再测。**
 - §10 开放项已按用户「按默认走」拍板（库挂产品下 / 字体同期泛化 / per-素材默认写库清单）。
 
 ### 0b. 订单截图视觉解析（screenshot_parser，后端已做，UI 未接，待验证）
