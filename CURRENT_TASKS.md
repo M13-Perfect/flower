@@ -88,6 +88,12 @@
 - **可行性未验证**：没用真图+真 key 跑过；视觉模型必须支持视觉（默认 `gpt-4o-mini`，别用 `gpt-5-nano`）。用户测法见该文档末尾 snippet。**准了再给「导入」按钮接识图（小改 ui_app）；不准就删 `screenshot_parser.py` 零成本**。
 - GPT 文本接入本身**已能生效**（设置填 provider/key + 勾「AI 优先」保存；「测试连接」验 key；注意解析失败会静默回退本地）。
 
+### 0c. 图层系统重做成 PS 风格（2026-06-15 用户需求；Stage 1 模型已落地，UI 待续）
+- 用户拍板：**7 个按钮全删走纯 PS 风 / 完整嵌套图组 / 一次性全做**。详见 `AGENTS.md` 顶部「进行中」段。
+- **Stage 1 ✅ `51bd8cf`**：`models.GroupLayer` 嵌套图组 + `Document` 递归化 + `group_layers`/`ungroup_layer`；渲染/导出改走 `flat_render_layers()`，无图组时字节零变化（370 passed）。护栏 `tests/test_layer_groups.py`。
+- **Stage 2/3 ⏳（下一轮专注做，UI 大）**：`ui_app._build_layers_panel` 由 `tk.Listbox`+7 按钮 → `ttk.Treeview`（嵌套+逐层眼睛/锁图标+拖动排序+多选）；右键图层菜单（置顶/置底/编辑/组合/解组/删除）+ 右键空白菜单（添加图层/全选/展开折叠）；空白图层工作流（删生产参数区「添加素材/添加文本」按钮 →「添加图层」建空白叶子层，选中再选素材/字体填充）；组合/解组接 Stage 1 的 `group_layers/ungroup_layer`。**需真机测**（Tkinter 拖放/图标命中无法纯自动化）。
+- **`&` 符号 bug 待用户复现**：4 字体都含 `&` glyph，预览 + SVG/DXF 导出在复现里都正常；待用户指明坏在哪一步（预览/生成文件/EzCad）+ 发文件。`♡`=Font 4 自动结尾爱心字形（非 bug）。
+
 
 ### A. EzCad 端闭环（最高优先,核心生产链路）—— 在**独立的 Ezcad 自动导入项目**做（不是本仓库）
 - 见记忆 `[[ezcad-runtime-and-p0p1]]`，活跃分支 `claude/p0-p1`。模拟鼠标键盘把 DXF 导入 EzCad。
