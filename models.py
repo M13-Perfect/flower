@@ -242,6 +242,20 @@ class GlyphLayer(Layer):
 
 
 @dataclass
+class GroupLayer(Layer):
+    """PS 风格图组：容器图层，``children`` 是嵌套子图层（可再含图组）。
+
+    组的 ``visible`` / ``locked`` 向下级联——隐藏组=整组不渲染，锁定组=子层不可编辑/命中。
+    渲染/导出始终经 ``Document.flat_render_layers()`` 摊平成叶子图层；**无图组时摊平结果与
+    旧 ``sorted_layers()`` 完全一致，金标/批量字节不变**。
+    """
+
+    type: str = "group"
+    children: list[Layer] = field(default_factory=list)
+    collapsed: bool = False
+
+
+@dataclass
 class Document:
     """多图层文档，替代旧版单素材 current_asset 工作流。"""
 
@@ -251,14 +265,66 @@ class Document:
     selected_layer_id: str | None = None
 
     def sorted_layers(self) -> list[Layer]:
-        """按 z_index 和列表顺序得到真实渲染顺序，低层先画，高层后画。"""
+        """按 z_index 和列表顺序得到顶层渲染顺序，低层先画，高层后画（仅顶层，不摊平图组）。"""
         indexed_layers = sorted(enumerate(self.layers), key=lambda item: (item[1].z_index, item[0]))
         return [layer for _, layer in indexed_layers]
 
+    def iter_all_layers(self):
+        """深度优先遍历所有图层（含图组及其子层），用于查找/统计。"""
+        def walk(layers: list[Layer]):
+            for layer in layers:
+                yield layer
+                if isinstance(layer, GroupLayer):
+                    yield from walk(layer.children)
+        yield from walk(self.layers)
+
+    def _flat_leaves(self) -> list[tuple[Layer, bool]]:
+        """摊平成 (叶子图层, 有效锁定)，按渲染顺序；只含「祖先组都可见」的叶子。
+
+        无图组时与 ``sorted_layers()`` 顺序、对象完全一致——是导出/金标字节不变的关键。
+        """
+        result: list[tuple[Layer, bool]] = []
+
+        def walk(layers: list[Layer], ancestors_visible: bool, ancestors_locked: bool) -> None:
+            ordered = [layer for _, layer in sorted(enumerate(layers), key=lambda it: (it[1].z_index, it[0]))]
+            for layer in ordered:
+                if isinstance(layer, GroupLayer):
+                    walk(layer.children, ancestors_visible and layer.visible, ancestors_locked or layer.locked)
+                elif ancestors_visible:
+                    result.append((layer, ancestors_locked or layer.locked))
+
+        walk(self.layers, True, False)
+        return result
+
+    def flat_render_layers(self) -> list[Layer]:
+        """渲染/导出统一入口：摊平成叶子图层（隐藏图组整组跳过）。无图组时等于 sorted_layers()。"""
+        return [layer for layer, _locked in self._flat_leaves()]
+
+    def container_of(self, layer_id: str | None) -> tuple[list[Layer] | None, Layer | None]:
+        """返回直接包含该图层的列表（顶层或某图组的 children）+ 图层；找不到返回 (None, None)。"""
+        if layer_id is None:
+            return None, None
+
+        def walk(layers: list[Layer]) -> tuple[list[Layer] | None, Layer | None]:
+            for layer in layers:
+                if layer.id == layer_id:
+                    return layers, layer
+                if isinstance(layer, GroupLayer):
+                    found_container, found_layer = walk(layer.children)
+                    if found_container is not None:
+                        return found_container, found_layer
+            return None, None
+
+        return walk(self.layers)
+
     def normalize_z_indexes(self) -> None:
-        """图层重排后同步 z_index，避免渲染顺序和面板顺序不一致。"""
-        for index, layer in enumerate(self.layers):
-            layer.z_index = index
+        """图层重排后递归同步各层级 z_index，避免渲染顺序和面板顺序不一致。"""
+        def walk(layers: list[Layer]) -> None:
+            for index, layer in enumerate(layers):
+                layer.z_index = index
+                if isinstance(layer, GroupLayer):
+                    walk(layer.children)
+        walk(self.layers)
 
     def selected_layer(self) -> Layer | None:
         return self.layer_by_id(self.selected_layer_id)
@@ -266,7 +332,7 @@ class Document:
     def layer_by_id(self, layer_id: str | None) -> Layer | None:
         if layer_id is None:
             return None
-        return next((layer for layer in self.layers if layer.id == layer_id), None)
+        return next((layer for layer in self.iter_all_layers() if layer.id == layer_id), None)
 
 
 @dataclass
@@ -366,51 +432,93 @@ def add_text_layer(
 
 
 def delete_layer(document: Document, layer_id: str | None) -> Layer | None:
-    """删除图层并修复 selected_layer_id；锁定图层不可删除。"""
-    layer = document.layer_by_id(layer_id)
-    if layer is None or layer.locked:
+    """删除图层（在其所属容器内）并修复 selected_layer_id；锁定图层不可删除。"""
+    container, layer = document.container_of(layer_id)
+    if container is None or layer is None or layer.locked:
         return None
-    index = document.layers.index(layer)
-    removed = document.layers.pop(index)
+    index = container.index(layer)
+    removed = container.pop(index)
     document.normalize_z_indexes()
     if document.layers:
-        next_index = min(index, len(document.layers) - 1)
-        document.selected_layer_id = document.layers[next_index].id
+        sibling = container or document.layers
+        if sibling:
+            next_index = min(index, len(sibling) - 1)
+            document.selected_layer_id = sibling[next_index].id
+        else:
+            document.selected_layer_id = document.layers[-1].id
     else:
         document.selected_layer_id = None
     return removed
 
 
 def move_layer(document: Document, layer_id: str | None, action: str) -> bool:
-    """支持上移、下移、置顶、置底；面板变化后渲染顺序随 z_index 更新。"""
-    layer = document.layer_by_id(layer_id)
-    if layer is None:
+    """在图层所属容器内上移/下移/置顶/置底；渲染顺序随 z_index 更新（图组内也适用）。"""
+    container, layer = document.container_of(layer_id)
+    if container is None or layer is None:
         return False
-    old_index = document.layers.index(layer)
+    old_index = container.index(layer)
     new_index = old_index
     if action == "up":
-        new_index = min(len(document.layers) - 1, old_index + 1)
+        new_index = min(len(container) - 1, old_index + 1)
     elif action == "down":
         new_index = max(0, old_index - 1)
     elif action == "top":
-        new_index = len(document.layers) - 1
+        new_index = len(container) - 1
     elif action == "bottom":
         new_index = 0
     else:
         return False
     if new_index == old_index:
         return False
-    document.layers.pop(old_index)
-    document.layers.insert(new_index, layer)
+    container.pop(old_index)
+    container.insert(new_index, layer)
     document.normalize_z_indexes()
     document.selected_layer_id = layer.id
     return True
 
 
+def group_layers(document: Document, layer_ids: list[str], *, name: str = "图组") -> "GroupLayer | None":
+    """把指定（同一容器内的）图层包成 GroupLayer，插到原最上面成员的位置。返回新组或 None。"""
+    ids = [lid for lid in layer_ids if lid]
+    if not ids:
+        return None
+    container, _first = document.container_of(ids[0])
+    if container is None:
+        return None
+    id_set = set(ids)
+    members = [layer for layer in container if layer.id in id_set]
+    if not members:
+        return None
+    insert_at = min(container.index(member) for member in members)
+    for member in members:
+        container.remove(member)
+    group = GroupLayer(name=name, children=members)
+    container.insert(insert_at, group)
+    document.normalize_z_indexes()
+    document.selected_layer_id = group.id
+    return group
+
+
+def ungroup_layer(document: Document, group_id: str | None) -> list[Layer]:
+    """解散图组，把子层按原顺序放回原位置；返回被放回的子层列表。"""
+    container, group = document.container_of(group_id)
+    if container is None or not isinstance(group, GroupLayer):
+        return []
+    at = container.index(group)
+    container.remove(group)
+    children = list(group.children)
+    for offset, child in enumerate(children):
+        container.insert(at + offset, child)
+    document.normalize_z_indexes()
+    if children:
+        document.selected_layer_id = children[0].id
+    return children
+
+
 def hit_test(document: Document, x: float, y: float) -> Layer | None:
-    """从顶层向底层命中测试，只选择可见且未锁定的基础包围盒。"""
-    for layer in reversed(document.sorted_layers()):
-        if not layer.visible or layer.locked:
+    """从顶层向底层命中测试，只选可见且未锁定（含图组级联锁定）的叶子图层包围盒。"""
+    for layer, effective_locked in reversed(document._flat_leaves()):
+        if not layer.visible or effective_locked:
             continue
         left, top, right, bottom = layer.bounds
         if left <= x <= right and top <= y <= bottom:

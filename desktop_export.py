@@ -100,7 +100,7 @@ def _document_to_layer_document(
     width_mm = float(physical_width_mm) if physical_width_mm and physical_width_mm > 0 else DEFAULT_PHYSICAL_WIDTH_MM
     fill_mode = "outline" if str(text_fill).lower() == "outline" else "solid"
     layers: list[dict[str, Any]] = []
-    for layer in document.sorted_layers():
+    for layer in document.flat_render_layers():
         if not getattr(layer, "visible", True):
             continue
         if isinstance(layer, ImageLayer):
