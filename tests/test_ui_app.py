@@ -1336,6 +1336,38 @@ def test_apply_layer_production_rejects_nonpositive_size(tmp_path, monkeypatch):
         root.destroy()
 
 
+def test_parse_missing_field_hints_flags_only_none_fields():
+    # 图2 弹窗：只把 None/空 的字段列为「需人工确认」。
+    from ui_app import parse_missing_field_hints
+
+    result = SimpleNamespace(text="", month=None, font=2, flower=None)
+    fields = [field for field, _hint in parse_missing_field_hints(result)]
+    assert fields == ["内容", "月份", "花材"]  # font 有值 → 不列入
+
+
+def test_parse_missing_field_hints_empty_when_all_present():
+    from ui_app import parse_missing_field_hints
+
+    result = SimpleNamespace(text="Lacey", month=9, font=3, flower=1)
+    assert parse_missing_field_hints(result) == []
+
+
+def test_show_parse_warning_dialog_builds_without_error():
+    # 图2 弹窗：主题化弹窗能构造（取代原生 messagebox），不抛异常。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        app = BirthFlowerApp(root)
+        before = len(root.winfo_children())
+        result = SimpleNamespace(text="", month=None, font=None, flower=None, warnings=["GPT: x", "本地: y"])
+        app._show_parse_warning_dialog(result)
+        assert len(root.winfo_children()) > before  # 作为 Toplevel 子窗创建成功
+    finally:
+        root.destroy()
+
+
 def test_month_chip_reflects_selected_flower_asset(tmp_path):
     # 增量3：月份不再手填，chip 反映选中素材的月份/花朵。
     try:

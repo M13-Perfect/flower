@@ -126,6 +126,23 @@ def _coerce_int(value: object, default: int) -> int:
     return result or default
 
 
+def parse_missing_field_hints(result) -> list[tuple[str, str]]:
+    """从解析结果推断「需人工确认」的字段 + 操作提示（解析失败弹窗用，纯函数可测）。
+
+    判据=该字段为 None/空（自动识别没确定）；返回 (字段名, 一句话操作提示) 列表。
+    """
+    hints: list[tuple[str, str]] = []
+    if not str(getattr(result, "text", "") or "").strip():
+        hints.append(("内容", "未识别刻字内容 → 手填内容"))
+    if getattr(result, "month", None) is None:
+        hints.append(("月份", "未识别出生花月份 → 手选素材月份"))
+    if getattr(result, "font", None) is None:
+        hints.append(("字体", "未识别字体编号 → 手选字体"))
+    if getattr(result, "flower", None) is None:
+        hints.append(("花材", "未识别花材序号 → 手选素材"))
+    return hints
+
+
 def product_rail_items(config: "AppConfig") -> list[dict[str, object]]:
     """产品切换列的展示数据（纯函数，便于单测，不依赖 Tkinter）。"""
     active_id = active_product(config).id
@@ -2061,8 +2078,69 @@ class BirthFlowerApp:
         self._select_font_by_current_field()
         self._replace_layers_from_parse_result(result)
         if result.warnings:
-            messagebox.showwarning("无法解析", "\n".join(result.warnings))
+            self._show_parse_warning_dialog(result)
         self._redraw_preview()
+
+    def _show_parse_warning_dialog(self, result) -> None:
+        """主题化「需人工确认」弹窗（取代原生 messagebox）：醒目列缺失字段 + 折叠 AI/本地原文。"""
+        warnings = [str(w) for w in (getattr(result, "warnings", []) or [])]
+        hints = parse_missing_field_hints(result)
+        window = self._themed_toplevel()
+        window.title("需人工确认")
+        window.transient(self.root)
+        window.geometry("470x460")
+        try:
+            window.grab_set()
+        except tk.TclError:
+            pass
+
+        header = ctk.CTkFrame(window, fg_color=APP_COLORS["accent_soft"], corner_radius=0)
+        header.pack(fill="x")
+        title = f"需人工确认 {len(hints)} 个字段" if hints else "解析提醒"
+        ctk.CTkLabel(
+            header, text=title, anchor="w", text_color=APP_COLORS["warning"],
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).pack(fill="x", padx=16, pady=(12, 2))
+        ctk.CTkLabel(
+            header, text="自动识别没能确定下列字段，选好后再点生成", anchor="w",
+            text_color=APP_COLORS["muted"],
+        ).pack(fill="x", padx=16, pady=(0, 12))
+
+        if hints:
+            cards = ctk.CTkFrame(window, fg_color="transparent")
+            cards.pack(fill="x", padx=16, pady=(12, 6))
+            for field, hint in hints:
+                row = ctk.CTkFrame(cards, fg_color="transparent")
+                row.pack(fill="x", pady=4)
+                ctk.CTkLabel(
+                    row, text=field, width=52, corner_radius=6,
+                    fg_color=APP_COLORS["accent_soft"], text_color=APP_COLORS["warning"],
+                ).pack(side="left")
+                ctk.CTkLabel(
+                    row, text=hint, anchor="w", justify="left",
+                    text_color=APP_COLORS["text"], wraplength=350,
+                ).pack(side="left", padx=(10, 0))
+
+        ctk.CTkLabel(
+            window, text="识别详情（AI / 本地原文）", anchor="w", text_color=APP_COLORS["muted"],
+        ).pack(fill="x", padx=16, pady=(10, 2))
+        detail = ctk.CTkTextbox(
+            window, height=120, fg_color=APP_COLORS["input"], text_color=APP_COLORS["muted"],
+            border_width=1, border_color=APP_COLORS["border"], wrap="word",
+        )
+        detail.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        detail.insert("1.0", "\n".join(warnings) if warnings else "（无）")
+        detail.configure(state="disabled")
+
+        def copy_raw() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(warnings))
+            self.status_var.set("已复制识别详情")
+
+        btns = ctk.CTkFrame(window, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=(0, 12))
+        self._btn(btns, "知道了，去确认", window.destroy, primary=True).pack(side="right")
+        self._btn(btns, "复制原文", copy_raw).pack(side="right", padx=(0, 8))
 
     def _replace_layers_from_parse_result(self, result) -> None:
         if not self._parse_result_can_create_layers(result):
