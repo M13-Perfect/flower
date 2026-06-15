@@ -74,8 +74,16 @@
 - 一句话：Product→素材库→素材(key/别名/标签/默认生产参数)→图层(可挂不同库+生产参数随图层 override)；月份字段→「素材库+素材」选择器；订单解析把库 catalog 注入 GPT、动态枚举校验 material_key（本地零硬编码）。演进兼容 birth-flower（month/flower 降为标签，金标/批量字节不破）；后期左侧产品切换器。
 - **Task 1（Phase 1 后端）✅ 完成**：新增 `production.py`(ProductionParams+回落链)、`material_library.py`(文件夹/library.json 清单/catalog)；`models.py` 图层加 `library_id/material_key/font_library_id/font_key/production`+迁移；`config_store.py` 加 `ProductConfig`+`products`+零感知迁移「产品0」。全量 317 passed, ruff clean，**未碰 `ui_app.py`**。
 - **Task 3（Phase 3 解析对接）✅ 完成**：新增 `order_catalog.py`（`LibraryBundle`/`build_prompt_catalog`/动态枚举 `build_order_remark_schema`/`parse_catalog_payload`/`enrich_parse_result`/`parse_order_remark_with_gpt_catalog`）；`models.ParseResult` 加 `material_library_id/material_key/font_library_id/font_key`；`parse_pipeline` 加可选 `bundle` 富化。**演进兼容：`gpt_parser.py`/`local_order_parser.py`/`orders.py`/`ui_app.py` 全未改**，靠 enrich 桥接旧 month/flower。全量 329 passed, ruff clean。把订单文本→具体 material_key/素材路径的能力做成纯后端可测，GPT 真实接入留待配 key。
-- **Task 2（UI，改 `ui_app.py`）未开始——建议直接交给正在改 UI 的那条对话接手（ROI 最高，它独占 ui_app.py = 零冲突，后端已在同工作区可直接 import）**。后端胶水 + **接线契约**已就绪：见 ExecPlan Task 2 顶部「🔌 后端接线契约」（6 个缝：建 bundle / 素材库·素材选择器 / `add_image_layer`·`add_text_layer` 新字段 / 属性面板 `resolve_chain` / `parse_order_remark_auto(bundle=)` 落图层 / 设置窗口管库）。`models.add_image_layer/add_text_layer` 已支持 `library_id/material_key/font_*/production`；`LibraryBundle.from_dirs(image_dirs, font_dirs)` 一行建库。全量 332 passed。Phase 3 Step 4（ParseResult→Document）并入此处第 5 缝。
+- **Task 2（UI，改 `ui_app.py`）进行中：地基(增量1-2)已落地，按用户决定停在此处**。接线契约见 ExecPlan Task 2 顶部「🔌 后端接线契约」。当前在分支 `claude/phase4-product-switcher`、叠在 UI 基线 `0840631` 之上、**已于 2026-06-15 提交 `b5a939c`**，全量 **348 passed, ruff clean**：
+  - **增量1（解析对接）✅**：`material_library.from_folder` 兼容单字体文件；`ui_app` 加 `self.active_bundle`（`_scan_assets` 用当前产品库目录 `LibraryBundle.from_dirs` 建，切产品自动跟随）；`parse_remark` 传 `bundle=self.active_bundle` → 解析结果经 enrich 落到 `material_key`/素材路径（对旧 month/flower 流零行为变化）。
+  - **增量2（每图层挂库）✅**：`_add_selected_flower_to_canvas` 写 `library_id/material_key`；`_add_text_layer_from_fields` 写 `font_library_id/font_key`（从 active_bundle 反查）。护栏 `tests/test_ui_app.py::test_add_flower_writes_layer_library_and_material_key`。
+  - **未做（增量3-5，按 ROI 暂停，等真有第二个素材库/产品再做）**：③人工确认「月份+花朵」→「素材库+素材」选择器（与 `flower_label_map`/month/flower 深度交织，高风险，当前单库视觉≈现状）；④属性面板生产参数随图层（`resolve_chain`，需 library.json 默认才有可见效果）；⑤设置窗口管库目录。
 - §10 开放项已按用户「按默认走」拍板（库挂产品下 / 字体同期泛化 / per-素材默认写库清单）。
+
+### 0b. 订单截图视觉解析（screenshot_parser，后端已做，UI 未接，待验证）
+- **新增 `screenshot_parser.py`**（已于 2026-06-15 提交 `89763cb`）+ `tests/test_screenshot_parser.py`(5 passed) + 接线契约 `docs/superpowers/plans/2026-06-14-screenshot-vision-parse.md`。把订单截图→视觉模型→ParseResult（不传 bundle 走旧 schema、传 bundle 走 catalog）。复用 gpt_parser 辅助，**未改 gpt_parser/ui_app**。
+- **可行性未验证**：没用真图+真 key 跑过；视觉模型必须支持视觉（默认 `gpt-4o-mini`，别用 `gpt-5-nano`）。用户测法见该文档末尾 snippet。**准了再给「导入」按钮接识图（小改 ui_app）；不准就删 `screenshot_parser.py` 零成本**。
+- GPT 文本接入本身**已能生效**（设置填 provider/key + 勾「AI 优先」保存；「测试连接」验 key；注意解析失败会静默回退本地）。
 
 
 ### A. EzCad 端闭环（最高优先,核心生产链路）—— 在**独立的 Ezcad 自动导入项目**做（不是本仓库）

@@ -25,6 +25,21 @@
 6. 桌面文本输入框加**右键复制/粘贴**菜单。
 > **2026-06-14 新需求（已出 ExecPlan，待实现）**：把「单产品 + 全局单素材库 + month/flower 定位 + 全局生产参数」演进为 **Product → 素材库 → 素材(key/别名/标签/默认参数) → 图层(可挂库+生产参数 override)**。素材/字体不再单一；月份字段→「素材库+素材」选择器；订单解析改为把库 catalog 注入 GPT、动态枚举校验 material_key（本地不写死）。演进兼容（birth-flower=产品0，month/flower 降为标签，金标/批量不破）；后期左侧加产品切换器（每窗口=一个产品）。**设计与分阶段计划见 `docs/superpowers/plans/2026-06-14-layer-material-library-system.md`**。本轮只出文档未改代码。
 
+## 本会话改动（2026-06-15 · 审查并提交本线两提交）
+
+- **审查 + 选择性提交本线工作**（用户拍板"审查+提交本线"）。先全量复跑 **348 passed / 19.46s**、ruff clean，再按概念分两提交（显式 path 暂存，**Electron 改动/dev-*.log/tmp_out/.claude 全排除在外**）：
+  - `b5a939c` feat(ui): Phase 2 增量1-2 图层素材库接线（material_library.py + ui_app.py + 两测 + ExecPlan 进度）。
+  - `89763cb` feat(parser): 订单截图视觉解析后端（screenshot_parser.py + test + 计划文档）。
+- **仍未提交在工作区**：仅 `apps/desktop/**` Electron 前端（非本线，D 项暂缓）+ `packages/design-core`/部分 TS 改动 + 噪音文件（dev-*.log、tmp_out/、.claude/）。下次若要清，建议把噪音加进 `.gitignore`。
+
+## 本会话改动（2026-06-14 · Phase 2 增量1-2 + 截图后端 → 已于 2026-06-15 提交）
+
+承接「图层素材库系统」（顶部新需求）。详见 `CURRENT_TASKS.md` 待办 0 / 0b 与 ExecPlan。
+- **四条提交已 commit**（分支 `claude/phase4-product-switcher`）：`62556c0` 后端基线（Phase 1+3）、`0840631` UI 基线（Phase 4+CTk 换肤）、`b5a939c` Phase 2 增量1-2、`89763cb` 截图后端。
+- **Phase 2 增量1-2（改 `ui_app.py`，已提交 `b5a939c`，348 passed）**：①`active_bundle`（产品库目录建，切产品跟随）+ `parse_remark(bundle=)`→解析落 material_key；②「添加素材/文本」给图层写 `library_id/material_key/font_*`。**增量3-5（素材库选择器/属性面板生产参数/设置管库）按 ROI 暂停**——单产品单库时视觉≈现状、且与现有 month/flower 选择逻辑深度交织高风险，等真加第二个素材库/产品再做。
+- **截图视觉解析（`screenshot_parser.py`，已提交 `89763cb`，未接 UI）**：订单截图→视觉模型→ParseResult。**可行性未用真图+真 key 验过**；准了再给「导入」按钮接识图，不准就删。GPT 文本接入已能生效。
+- **GPT 接入无 bug**：设置填 provider/key+勾「AI 优先」保存，「测试连接」验 key（解析失败静默回退本地）。
+
 ## 本会话改动（2026-06-14 · Phase 4）：产品切换器（方案2 可收/展）
 
 分支 `claude/phase4-product-switcher`（基于后端基线 `62556c0`，**未提交，待 review**）。全量 **341 passed**，ruff clean。
