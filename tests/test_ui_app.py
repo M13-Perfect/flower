@@ -1336,6 +1336,83 @@ def test_apply_layer_production_rejects_nonpositive_size(tmp_path, monkeypatch):
         root.destroy()
 
 
+def test_month_chip_reflects_selected_flower_asset(tmp_path):
+    # 增量3：月份不再手填，chip 反映选中素材的月份/花朵。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        app = BirthFlowerApp(root)
+        path = tmp_path / "March_Daffodil.svg"
+        path.write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"/>', encoding="utf-8")
+        asset = FlowerAsset(name="Daffodil", month=3, flower=2, path=path, asset_key="march-daffodil", display_name="Daffodil")
+        label = app._flower_label(asset)
+        app.flower_label_map = {label: asset}
+        app._set_pending_flower_asset(label, sync_fields=True)
+        assert "3" in app.month_chip_var.get()
+        assert "2" in app.month_chip_var.get()
+    finally:
+        root.destroy()
+
+
+def test_refresh_library_choices_lists_image_libraries(tmp_path):
+    # 增量3：素材库下拉数据驱动自 active_bundle。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        from config_store import with_product_library_dirs
+
+        app = BirthFlowerApp(root)
+        lib_a = tmp_path / "liba"
+        lib_b = tmp_path / "libb"
+        lib_a.mkdir()
+        lib_b.mkdir()
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 0h10v10H0z"/></svg>'
+        (lib_a / "March_Daffodil.svg").write_text(svg, encoding="utf-8")
+        (lib_b / "April_Daisy.svg").write_text(svg, encoding="utf-8")
+        app.config = with_product_library_dirs(app.config, [lib_a, lib_b], [])
+        app.flower_dir_var.set(str(lib_a))
+        app._scan_assets(show_errors=False)
+        assert len(app._image_lib_by_label) == 2
+
+
+    finally:
+        root.destroy()
+
+
+def test_image_library_filter_narrows_flower_candidates(tmp_path):
+    # 增量3：选中某素材库 → 素材候选只剩该库的素材。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        from config_store import with_product_library_dirs
+
+        app = BirthFlowerApp(root)
+        lib_a = tmp_path / "liba"
+        lib_b = tmp_path / "libb"
+        lib_a.mkdir()
+        lib_b.mkdir()
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 0h10v10H0z"/></svg>'
+        (lib_a / "March_Daffodil.svg").write_text(svg, encoding="utf-8")
+        (lib_b / "April_Daisy.svg").write_text(svg, encoding="utf-8")
+        app.config = with_product_library_dirs(app.config, [lib_a, lib_b], [])
+        app.flower_dir_var.set(str(lib_a))
+        app._scan_assets(show_errors=False)
+
+        # 选第二个库（libb）→ 候选只含 daisy
+        label_b = next(lbl for lbl, lib in app._image_lib_by_label.items() if lib.root.name == "libb")
+        app.image_library_var.set(label_b)
+        names = {asset.path.name for asset in app._assets_for_selected_image_library()}
+        assert names == {"April_Daisy.svg"}
+    finally:
+        root.destroy()
+
+
 def test_scan_assets_builds_multi_library_bundle(tmp_path):
     # 增量5：产品配了第二个素材库目录后，active_bundle 应含 2 个 image 库。
     try:

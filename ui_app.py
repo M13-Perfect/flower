@@ -117,6 +117,15 @@ def product_initial(name: str) -> str:
     return text[0].upper() if text else "?"
 
 
+def _coerce_int(value: object, default: int) -> int:
+    """把库标签里的 month/flower/index 容错转 int；缺失或非法回落 default。"""
+    try:
+        result = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return result or default
+
+
 def product_rail_items(config: "AppConfig") -> list[dict[str, object]]:
     """产品切换列的展示数据（纯函数，便于单测，不依赖 Tkinter）。"""
     active_id = active_product(config).id
@@ -728,6 +737,15 @@ class BirthFlowerApp:
         self.font_source_var = tk.StringVar(value=str(self.config.font_source or DEFAULT_FONT_SOURCE))
         self.flower_asset_var = tk.StringVar()
         self.font_asset_var = tk.StringVar()
+        # 增量3：人工确认面板改为「素材库 + 素材 / 字体库 + 字体」选择器；月份降为只读 chip。
+        # month_var/flower_var/font_var 保留为内部派生态（随选中素材/字体设置），导出/金标/批量零变化。
+        self.image_library_var = tk.StringVar()
+        self.font_library_var = tk.StringVar()
+        self.month_chip_var = tk.StringVar(value="—")
+        self._image_lib_by_label: dict[str, object] = {}
+        self._font_lib_by_label: dict[str, object] = {}
+        self.image_library_combo = None
+        self.font_library_combo = None
         self.warning_var = tk.StringVar(value="等待解析")
         self.status_var = tk.StringVar(value="等待解析")
         self.output_format_vars = {
@@ -1319,7 +1337,11 @@ class BirthFlowerApp:
         fields, fbody = self._ctk_card(body, "人工确认字段")
         fields.grid(row=3, column=0, sticky="ew")
         self._add_row(fbody, 0, "内容", ctk.CTkEntry(fbody, textvariable=self.name_var))
-        self._add_row(fbody, 1, "月份", ttk.Spinbox(fbody, from_=1, to=12, textvariable=self.month_var, width=8))
+        # 增量3：月份不再手填——改为只读 chip，反映当前选中素材的月份/花朵（素材在生产参数区选）。
+        ctk.CTkLabel(fbody, text="素材月份", anchor="w").grid(row=1, column=0, sticky="w", pady=(6, 2))
+        ctk.CTkLabel(
+            fbody, textvariable=self.month_chip_var, anchor="w", text_color=APP_COLORS["muted"]
+        ).grid(row=1, column=1, sticky="w", pady=(6, 2))
         ctk.CTkLabel(fbody, text="大小写", anchor="w").grid(row=2, column=0, sticky="w", pady=(6, 2))
         self.case_button = self._btn(
             fbody, TEXT_CASE_LABELS[self.text_case_var.get()], self._cycle_text_case, width=90
@@ -1364,6 +1386,19 @@ class BirthFlowerApp:
         asset_group.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         abody.columnconfigure(1, weight=1)
         # CTkOptionMenu = 只读下拉；选中走 command（取代 ttk 的 <<ComboboxSelected>>）。
+        # 增量3：素材库/字体库选择器（数据驱动自 active_bundle）；选库 → 过滤下方素材/字体候选。
+        self.image_library_combo = ctk.CTkOptionMenu(
+            abody,
+            variable=self.image_library_var,
+            values=["（无素材库）"],
+            command=lambda _choice: self._on_image_library_selected(),
+            fg_color=APP_COLORS["input"],
+            button_color=APP_COLORS["accent"],
+            button_hover_color=APP_COLORS["accent_soft"],
+            text_color=APP_COLORS["text"],
+        )
+        ctk.CTkLabel(abody, text="素材库", anchor="w").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 8))
+        self.image_library_combo.grid(row=0, column=1, sticky="ew", pady=4)
         self.flower_combo = ctk.CTkOptionMenu(
             abody,
             variable=self.flower_asset_var,
@@ -1374,8 +1409,20 @@ class BirthFlowerApp:
             button_hover_color=APP_COLORS["accent_soft"],
             text_color=APP_COLORS["text"],
         )
-        ctk.CTkLabel(abody, text="素材名", anchor="w").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 8))
-        self.flower_combo.grid(row=0, column=1, sticky="ew", pady=4)
+        ctk.CTkLabel(abody, text="素材名", anchor="w").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 8))
+        self.flower_combo.grid(row=1, column=1, sticky="ew", pady=4)
+        self.font_library_combo = ctk.CTkOptionMenu(
+            abody,
+            variable=self.font_library_var,
+            values=["（无字体库）"],
+            command=lambda _choice: self._on_font_library_selected(),
+            fg_color=APP_COLORS["input"],
+            button_color=APP_COLORS["accent"],
+            button_hover_color=APP_COLORS["accent_soft"],
+            text_color=APP_COLORS["text"],
+        )
+        ctk.CTkLabel(abody, text="字体库", anchor="w").grid(row=2, column=0, sticky="w", pady=4, padx=(0, 8))
+        self.font_library_combo.grid(row=2, column=1, sticky="ew", pady=4)
         self.font_combo = ctk.CTkOptionMenu(
             abody,
             variable=self.font_asset_var,
@@ -1386,10 +1433,10 @@ class BirthFlowerApp:
             button_hover_color=APP_COLORS["accent_soft"],
             text_color=APP_COLORS["text"],
         )
-        ctk.CTkLabel(abody, text="字体类型", anchor="w").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 8))
-        self.font_combo.grid(row=1, column=1, sticky="ew", pady=4)
+        ctk.CTkLabel(abody, text="字体类型", anchor="w").grid(row=3, column=0, sticky="w", pady=4, padx=(0, 8))
+        self.font_combo.grid(row=3, column=1, sticky="ew", pady=4)
         action_row = ctk.CTkFrame(abody, fg_color="transparent")
-        action_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        action_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self._btn(action_row, "添加素材", self._add_selected_flower_to_canvas).pack(side="left")
         self._btn(action_row, "添加文本", self._add_text_layer_from_fields, primary=True).pack(side="left", padx=(8, 0))
 
@@ -2937,7 +2984,10 @@ class BirthFlowerApp:
         image_dirs = [Path(self.flower_dir_var.get()), *product.image_library_dirs[1:]]
         font_dirs = [Path(self.font_source_var.get()), *product.font_library_dirs[1:]]
         self.active_bundle = LibraryBundle.from_dirs(image_dirs, font_dirs)
+        # 增量3：把「附加库」（首库之外）的素材/字体并入候选，使素材库选择器能切到它们（单库时空操作）。
+        self._merge_additional_library_assets()
         self.preview_cache.clear()
+        self._refresh_library_choices()
         self._refresh_flower_choices()
         self._refresh_font_choices()
 
@@ -2956,15 +3006,104 @@ class BirthFlowerApp:
 
     def _refresh_flower_choices(self) -> None:
         # 刷新素材列表属于程序化 UI 更新，只能同步下拉框与 pending 素材，不能创建新图层。
-        self.flower_label_map = {self._flower_label(asset): asset for asset in self.flower_assets}
-        self._with_programmatic_update(lambda: self.flower_combo.configure(values=list(self.flower_label_map)))
+        # 增量3：候选按当前选中的素材库过滤（单库时即全部）。
+        assets = self._assets_for_selected_image_library()
+        self.flower_label_map = {self._flower_label(asset): asset for asset in assets}
+        values = list(self.flower_label_map) or ["（请扫描素材）"]
+        self._with_programmatic_update(lambda: self.flower_combo.configure(values=values))
         self._select_flower_by_current_fields()
+        self._update_month_chip()
         self._redraw_preview()
 
     def _refresh_font_choices(self) -> None:
-        self.font_label_map = {self._font_label(asset): asset for asset in self.font_assets}
-        self.font_combo.configure(values=list(self.font_label_map))
+        # 增量3：候选按当前选中的字体库过滤（单库时即全部）。
+        assets = self._assets_for_selected_font_library()
+        self.font_label_map = {self._font_label(asset): asset for asset in assets}
+        self.font_combo.configure(values=list(self.font_label_map) or ["（请扫描字体）"])
         self._select_font_by_current_field()
+
+    def _merge_additional_library_assets(self) -> None:
+        """单库时空操作；多库时把「首库之外」的 image/font 库 entries 转成资产并入候选。"""
+        existing = {asset.path.name for asset in self.flower_assets}
+        for library in self.active_bundle.image_libraries[1:]:
+            for entry in library.entries:
+                if entry.path.name not in existing:
+                    self.flower_assets.append(self._entry_to_flower_asset(entry))
+                    existing.add(entry.path.name)
+        existing_fonts = {asset.path.name for asset in self.font_assets}
+        for library in self.active_bundle.font_libraries[1:]:
+            for entry in library.entries:
+                if entry.path.name not in existing_fonts:
+                    self.font_assets.append(self._entry_to_font_asset(entry))
+                    existing_fonts.add(entry.path.name)
+
+    def _entry_to_flower_asset(self, entry) -> FlowerAsset:
+        return FlowerAsset(
+            name=entry.name,
+            month=_coerce_int(entry.tags.get("month"), 1),
+            flower=_coerce_int(entry.tags.get("flower"), 1),
+            path=entry.path,
+            asset_key=entry.key,
+            display_name=entry.name,
+            is_vector_safe=entry.is_vector_safe,
+        )
+
+    def _entry_to_font_asset(self, entry) -> FontAsset:
+        return FontAsset(
+            name=entry.name,
+            index=_coerce_int(entry.tags.get("index"), 0),
+            path=entry.path,
+            font_design=entry.name,
+        )
+
+    def _library_label(self, library) -> str:
+        return library.name or library.id
+
+    def _refresh_library_choices(self) -> None:
+        """增量3：用 active_bundle 刷新素材库/字体库下拉候选（数据驱动）。"""
+        self._image_lib_by_label = {self._library_label(lib): lib for lib in self.active_bundle.image_libraries}
+        self._font_lib_by_label = {self._library_label(lib): lib for lib in self.active_bundle.font_libraries}
+        self._configure_library_combo(self.image_library_combo, self.image_library_var, self._image_lib_by_label, "（无素材库）")
+        self._configure_library_combo(self.font_library_combo, self.font_library_var, self._font_lib_by_label, "（无字体库）")
+
+    def _configure_library_combo(self, combo, var: tk.StringVar, label_map: dict, empty_text: str) -> None:
+        if combo is None:
+            return
+        labels = list(label_map) or [empty_text]
+        self._with_programmatic_update(lambda: combo.configure(values=labels))
+        if var.get() not in label_map:
+            self._with_programmatic_update(lambda: var.set(labels[0]))
+
+    def _assets_for_selected_image_library(self) -> list:
+        library = self._image_lib_by_label.get(self.image_library_var.get())
+        if library is None:
+            return self.flower_assets
+        names = {entry.path.name for entry in library.entries}
+        filtered = [asset for asset in self.flower_assets if asset.path.name in names]
+        return filtered or self.flower_assets  # 库无匹配（如导入临时素材）→ 回落全部，避免清空
+
+    def _assets_for_selected_font_library(self) -> list:
+        library = self._font_lib_by_label.get(self.font_library_var.get())
+        if library is None:
+            return self.font_assets
+        names = {entry.path.name for entry in library.entries}
+        filtered = [asset for asset in self.font_assets if asset.path.name in names]
+        return filtered or self.font_assets
+
+    def _update_month_chip(self) -> None:
+        """月份 chip 反映当前选中素材的月份/花朵（取代手填月份字段）。"""
+        asset = self.flower_label_map.get(self.flower_asset_var.get())
+        self.month_chip_var.set(f"{asset.month} 月 · 花 {asset.flower}" if asset is not None else "—")
+
+    def _on_image_library_selected(self) -> None:
+        if self._is_loading or self._is_programmatic_update:
+            return
+        self._refresh_flower_choices()
+
+    def _on_font_library_selected(self) -> None:
+        if self._is_loading or self._is_programmatic_update:
+            return
+        self._refresh_font_choices()
 
     def _on_flower_combo_selected(self) -> None:
         self._on_flower_selection_changed(self.flower_asset_var.get())
@@ -2997,6 +3136,7 @@ class BirthFlowerApp:
                 self.flower_var.set(str(asset.flower))
 
         self._with_programmatic_update(update_fields)
+        self._update_month_chip()  # 增量3：选中素材后刷新只读月份 chip
 
     def _replace_selected_image_layer(self, asset: FlowerAsset) -> None:
         """替换当前选中素材图层的图片资源；保持图层尺寸和层级不变。"""
