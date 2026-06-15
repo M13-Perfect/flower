@@ -25,6 +25,13 @@
 6. 桌面文本输入框加**右键复制/粘贴**菜单。
 > **2026-06-14 新需求（已出 ExecPlan，待实现）**：把「单产品 + 全局单素材库 + month/flower 定位 + 全局生产参数」演进为 **Product → 素材库 → 素材(key/别名/标签/默认参数) → 图层(可挂库+生产参数 override)**。素材/字体不再单一；月份字段→「素材库+素材」选择器；订单解析改为把库 catalog 注入 GPT、动态枚举校验 material_key（本地不写死）。演进兼容（birth-flower=产品0，month/flower 降为标签，金标/批量不破）；后期左侧加产品切换器（每窗口=一个产品）。**设计与分阶段计划见 `docs/superpowers/plans/2026-06-14-layer-material-library-system.md`**。本轮只出文档未改代码。
 
+## 进行中（2026-06-15 · 图层系统重做成 PS 风格 —— Stage 1 已落地，UI 待续）
+
+用户要求把图层系统重做成 PS 同款（**已拍板：7 个按钮全删走纯 PS 风、完整嵌套图组、一次性全做**）。因体量大 + 改动生产导出链路，按内部 Stage 安全推进、逐 Stage 提交。
+- **Stage 1 ✅ 模型基础层（导出安全）** `51bd8cf`（`models.py`/`renderer.py`/`desktop_export.py`）：新增 `GroupLayer(children/collapsed)`；`Document` 加 `iter_all_layers`/`flat_render_layers`/`_flat_leaves`/`container_of`；`normalize_z_indexes`/`layer_by_id`/`delete_layer`/`move_layer`/`hit_test` 全改图组递归·容器感知；新增 `group_layers`/`ungroup_layer`。**渲染/导出统一改走 `flat_render_layers()`（3 处调用点）；关键不变量=无图组时 flat==sorted_layers() 对象顺序一致 → 金标/批量/WYSIWYG 字节零变化（370 passed 验证）**。图组 visible/locked 向下级联。护栏 `tests/test_layer_groups.py`(7)。
+- **Stage 2/3 ⏳ 未做（UI 面板重写，`ui_app.py`，大）**：当前 `_build_layers_panel` 是 `tk.Listbox`+7 按钮——需重写为支持「嵌套图组 + 逐层眼睛/锁图标 + 拖动排序 + 多选」的控件（`ttk.Treeview` 最合适：原生层级/折叠/多选，按 `identify_region/column` 做图标点击与右键命中）。要做：① 删 7 个按钮（显隐/锁→逐层图标，排序→拖动，其余→右键）；② 右键图层菜单（置顶/置底/编辑素材·字体/组合为图组(多选)/解组/删除）+ 右键空白菜单（添加图层/全选/展开折叠）；③ 空白图层工作流（删生产参数区「添加素材/添加文本」按钮 → 「添加图层」建空白叶子层，选中后再选素材/字体填充）；④ 组合/解组接 `group_layers/ungroup_layer`。**UI 需用户真机测**（Tkinter 拖放/图标命中无法纯自动化验）。
+- ⚠️ **`&` 符号 bug 未复现**：4 个字体都含 `&` glyph，复现里预览 + SVG/DXF 导出都正常显示 `&`（截图似乎也显示了）。已请用户指明到底哪一步坏（预览/生成文件/EzCad）+ 发文件，否则无从定位。`♡` 是 Font 4(AdoraBella) 自动「ending heart」字形规则（`apply_automatic_glyph_rules`），非 bug。
+
 ## 本会话改动（2026-06-15 · 两个 UX 升级：文字排版 + 解析失败弹窗）
 
 承接 Phase 2 收尾后，用户反馈两点（均看 mockup 定方案后实现）：
