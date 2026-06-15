@@ -15,6 +15,7 @@ from config_store import (
     save_config,
     unique_product_id,
     with_added_product,
+    with_product_library_dirs,
 )
 from ui_app import product_initial, product_rail_items
 
@@ -92,3 +93,43 @@ def test_product_initial_handles_blank() -> None:
     assert product_initial("") == "?"
     assert product_initial("  ") == "?"
     assert product_initial("apple") == "A"
+
+
+def test_with_product_library_dirs_updates_active_product_only() -> None:
+    # 增量5：只改激活产品的库目录列表，其余产品原样保留；首目录回写顶层迁移入口。
+    config = with_product_library_dirs(
+        _two_product_config(),
+        [Path("libs/a"), Path("libs/b")],
+        [Path("fonts/x")],
+    )
+    active = active_product(config)
+    assert active.id == "wood-sign"
+    assert active.image_library_dirs == (Path("libs/a"), Path("libs/b"))
+    assert active.font_library_dirs == (Path("fonts/x"),)
+    # 另一个产品没被动
+    other = next(p for p in config.products if p.id == "birth-flower-card")
+    assert other.image_library_dirs == ()
+    # 首目录回写顶层 flower_dir/font_source（迁移兼容入口）
+    assert config.flower_dir == Path("libs/a")
+    assert config.font_source == Path("fonts/x")
+
+
+def test_with_product_library_dirs_empty_keeps_top_level() -> None:
+    # 空列表不覆盖顶层 flower_dir/font_source
+    base = dataclasses.replace(_two_product_config(), flower_dir=Path("keep"), font_source=Path("keep.ttf"))
+    config = with_product_library_dirs(base, [], [])
+    assert config.flower_dir == Path("keep")
+    assert config.font_source == Path("keep.ttf")
+    assert active_product(config).image_library_dirs == ()
+
+
+def test_with_product_library_dirs_round_trips_through_save(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.json"
+    config = with_product_library_dirs(
+        _two_product_config(), [Path("libs/a"), Path("libs/b")], [Path("fonts/x")]
+    )
+    save_config(config, cfg)
+    reloaded = load_config(cfg)
+    active = active_product(reloaded)
+    assert active.image_library_dirs == (Path("libs/a"), Path("libs/b"))
+    assert active.font_library_dirs == (Path("fonts/x"),)

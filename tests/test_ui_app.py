@@ -1336,6 +1336,35 @@ def test_apply_layer_production_rejects_nonpositive_size(tmp_path, monkeypatch):
         root.destroy()
 
 
+def test_scan_assets_builds_multi_library_bundle(tmp_path):
+    # 增量5：产品配了第二个素材库目录后，active_bundle 应含 2 个 image 库。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        from config_store import with_product_library_dirs
+
+        app = BirthFlowerApp(root)
+        lib_a = tmp_path / "liba"
+        lib_b = tmp_path / "libb"
+        lib_a.mkdir()
+        lib_b.mkdir()
+        svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 0h10v10H0z"/></svg>'
+        (lib_a / "March_Daffodil.svg").write_text(svg, encoding="utf-8")
+        (lib_b / "April_Daisy.svg").write_text(svg, encoding="utf-8")
+        app.config = with_product_library_dirs(app.config, [lib_a, lib_b], [])
+        app.flower_dir_var.set(str(lib_a))  # 主库目录入口与首库一致
+
+        app._scan_assets(show_errors=False)
+
+        assert len(app.active_bundle.image_libraries) == 2
+        total_entries = sum(len(lib.entries) for lib in app.active_bundle.image_libraries)
+        assert total_entries >= 2
+    finally:
+        root.destroy()
+
+
 def test_layer_effective_production_resolves_override_over_slot(tmp_path):
     # 增量4：resolve_chain 回落——override 字段生效，未覆盖字段回落槽位默认。
     try:
