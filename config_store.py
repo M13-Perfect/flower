@@ -229,6 +229,32 @@ def with_added_product(
     return replace(config, products=products, active_product_id=active)
 
 
+def with_product_library_dirs(
+    config: AppConfig,
+    image_dirs: Iterable[Path | str],
+    font_dirs: Iterable[Path | str],
+    *,
+    product_id: str | None = None,
+) -> AppConfig:
+    """更新指定产品（默认当前激活产品）的素材库/字体库目录列表，返回新配置（不可变）。
+
+    同时把首个库目录回写顶层 ``flower_dir``/``font_source``，作为旧单目录链路的迁移兼容入口；
+    目录列表为空时保留原顶层值。其余产品原样保留。
+    """
+    target_id = product_id or config.active_product_id
+    image_tuple = tuple(Path(path) for path in image_dirs)
+    font_tuple = tuple(Path(path) for path in font_dirs)
+    products = tuple(
+        replace(product, image_library_dirs=image_tuple, font_library_dirs=font_tuple)
+        if product.id == target_id
+        else product
+        for product in config.products
+    )
+    flower_dir = image_tuple[0] if image_tuple else config.flower_dir
+    font_source = font_tuple[0] if font_tuple else config.font_source
+    return replace(config, products=products, flower_dir=flower_dir, font_source=font_source)
+
+
 def _bool_value(payload: dict[str, Any], key: str, default: bool) -> bool:
     value = payload.get(key, default)
     return value if isinstance(value, bool) else default

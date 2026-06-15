@@ -32,6 +32,7 @@ from config_store import (
     save_config,
     unique_product_id,
     with_added_product,
+    with_product_library_dirs,
 )
 from generation_readiness import GenerationReadiness, build_generation_readiness
 from glyph_service import (
@@ -751,6 +752,9 @@ class BirthFlowerApp:
         self.document = Document(default_layout.canvas_width, default_layout.canvas_height)
         self.history_manager = None  # 预留 Ctrl+Z/Ctrl+Y 历史管理入口。
         self.layers_listbox: tk.Listbox | None = None
+        # 增量5：设置窗口里「产品素材库/字体库目录列表」编辑器（打开设置时建，保存时读回）。
+        self.settings_image_listbox: tk.Listbox | None = None
+        self.settings_font_listbox: tk.Listbox | None = None
         self.layer_detail_var = tk.StringVar(value="未选择图层")
         self.layer_text_var = tk.StringVar()
         self.layer_font_size_var = tk.StringVar(value=str(default_layout.text_size))
@@ -1456,20 +1460,77 @@ class BirthFlowerApp:
     def _build_asset_settings_tab(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=12)
         notebook.add(frame, text="素材库")
+        frame.columnconfigure(1, weight=1)
+        # 旧单目录入口（迁移兼容，作主库目录；单目录选择器即时生效）。
         self._add_path_row(frame, 0, "素材目录", self.flower_dir_var, self.choose_flower_dir)
-        ttk.Button(frame, text="重新扫描", command=lambda: self._scan_assets(show_errors=True)).grid(row=1, column=1, sticky="e", pady=8)
+        # 增量5：当前产品的素材库目录列表（多库），与上面主目录一起进 bundle。
+        ttk.Label(frame, text="产品素材库目录（多库）").grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 2))
+        self.settings_image_listbox = self._build_library_dirs_editor(
+            frame, 2, active_product(self.config).image_library_dirs, image=True
+        )
+        ttk.Button(frame, text="重新扫描", command=lambda: self._scan_assets(show_errors=True)).grid(
+            row=4, column=1, sticky="e", pady=8
+        )
 
     def _build_font_settings_tab(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=12)
         notebook.add(frame, text="字体库")
+        frame.columnconfigure(1, weight=1)
         ttk.Label(frame, text="字体文件/目录").grid(row=0, column=0, sticky="w", pady=4)
         row_frame = ttk.Frame(frame)
         row_frame.grid(row=0, column=1, sticky="ew", pady=4)
         row_frame.columnconfigure(0, weight=1)
         ttk.Entry(row_frame, textvariable=self.font_source_var).grid(row=0, column=0, sticky="ew")
         ttk.Button(row_frame, text="选择字体", command=self.choose_font_source).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(frame, text="重新扫描", command=lambda: self._scan_assets(show_errors=True)).grid(row=1, column=1, sticky="e", pady=8)
-        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="产品字体库目录（多库）").grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 2))
+        self.settings_font_listbox = self._build_library_dirs_editor(
+            frame, 2, active_product(self.config).font_library_dirs, image=False
+        )
+        ttk.Button(frame, text="重新扫描", command=lambda: self._scan_assets(show_errors=True)).grid(
+            row=4, column=1, sticky="e", pady=8
+        )
+
+    def _build_library_dirs_editor(self, parent, start_row: int, dirs, *, image: bool) -> tk.Listbox:
+        """增量5：库目录列表编辑器（Listbox + 添加/删除）；返回 Listbox 供保存时读回。"""
+        listbox = tk.Listbox(
+            parent,
+            height=4,
+            exportselection=False,
+            bg=APP_COLORS["input"],
+            fg=APP_COLORS["text"],
+            selectbackground=APP_COLORS["accent"],
+            selectforeground="#ffffff",
+            highlightthickness=1,
+            highlightbackground=APP_COLORS["border"],
+            relief="flat",
+            borderwidth=0,
+        )
+        listbox.grid(row=start_row, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        for path in dirs:
+            listbox.insert("end", str(path))
+        btn_row = ttk.Frame(parent)
+        btn_row.grid(row=start_row + 1, column=0, columnspan=2, sticky="w")
+        ttk.Button(btn_row, text="添加目录", command=lambda: self._add_library_dir(listbox, image=image)).pack(side="left")
+        ttk.Button(btn_row, text="删除选中", command=lambda: self._remove_library_dir(listbox)).pack(
+            side="left", padx=(8, 0)
+        )
+        return listbox
+
+    def _add_library_dir(self, listbox: tk.Listbox, *, image: bool) -> None:
+        path = filedialog.askdirectory(title="选择素材库目录" if image else "选择字体库目录")
+        if path and path not in listbox.get(0, "end"):
+            listbox.insert("end", path)
+
+    def _remove_library_dir(self, listbox: tk.Listbox) -> None:
+        for index in reversed(listbox.curselection()):
+            listbox.delete(index)
+
+    def _library_listbox_dirs(self, listbox: tk.Listbox | None, fallback_var: tk.StringVar) -> list[Path]:
+        """读列表框里的库目录；为空则回落到单目录入口。"""
+        if listbox is None:
+            return [Path(fallback_var.get())]
+        dirs = [Path(value) for value in listbox.get(0, "end") if value]
+        return dirs or [Path(fallback_var.get())]
 
     def _build_ai_settings_tab(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=12)
@@ -1565,6 +1626,13 @@ class BirthFlowerApp:
             active_ai_profile=profile.name,
             layout_defaults=layout_from_values(self.layout_vars),
         )
+        # 增量5：把设置窗口里编辑的产品库目录列表写回当前产品（列表为空则回落单目录入口）。
+        image_dirs = self._library_listbox_dirs(self.settings_image_listbox, self.flower_dir_var)
+        font_dirs = self._library_listbox_dirs(self.settings_font_listbox, self.font_source_var)
+        self.config = with_product_library_dirs(self.config, image_dirs, font_dirs)
+        # 单目录入口与首库目录对齐（_scan_assets / 旧链路读它）。
+        self.flower_dir_var.set(str(image_dirs[0]))
+        self.font_source_var.set(str(font_dirs[0]))
         save_config(self.config)
         self._scan_assets(show_errors=True)
         self.status_var.set("设置已保存")
@@ -2863,10 +2931,12 @@ class BirthFlowerApp:
     def _scan_assets(self, show_errors: bool) -> None:
         self.flower_assets = scan_flower_assets(Path(self.flower_dir_var.get()))
         self.font_assets = scan_font_assets(Path(self.font_source_var.get()))
-        # 用与扫描相同的目录建 LibraryBundle，解析时传给后端把订单落到具体素材/字体 key。
-        self.active_bundle = LibraryBundle.from_dirs(
-            [Path(self.flower_dir_var.get())], [Path(self.font_source_var.get())]
-        )
+        # 增量5：主库目录仍以单目录入口（flower_dir_var/font_source_var）为准——保证单目录选择器
+        # 即时生效；产品配置里「首个之外」的目录作为附加库一起进 bundle（多库）。
+        product = active_product(self.config)
+        image_dirs = [Path(self.flower_dir_var.get()), *product.image_library_dirs[1:]]
+        font_dirs = [Path(self.font_source_var.get()), *product.font_library_dirs[1:]]
+        self.active_bundle = LibraryBundle.from_dirs(image_dirs, font_dirs)
         self.preview_cache.clear()
         self._refresh_flower_choices()
         self._refresh_font_choices()
@@ -3109,13 +3179,14 @@ class BirthFlowerApp:
         return format_font_asset_label(asset)
 
     def _save_current_config(self) -> None:
-        self.config = AppConfig(
+        # 用 replace 而非整体重建 AppConfig，否则会清空 products/active_product_id/收展态
+        # （与 _save_settings_window 同一坑：__post_init__ 只在 products 空时才合成产品0）。
+        self.config = dataclasses.replace(
+            self.config,
             flower_dir=Path(self.flower_dir_var.get()),
             font_source=Path(self.font_source_var.get()),
             output_path=Path(self.output_var.get()),
             output_formats=self._selected_output_formats_or_default(),
-            ai_profiles=self.config.ai_profiles,
-            active_ai_profile=self.config.active_ai_profile,
             layout_defaults=layout_from_values(self.layout_vars),
         )
         save_config(self.config)
