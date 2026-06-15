@@ -2,6 +2,8 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
+
+import customtkinter as ctk
 from types import SimpleNamespace
 
 import pytest
@@ -164,11 +166,11 @@ def test_birth_flower_app_initializes_desktop_ui_state():
     try:
         app = BirthFlowerApp(root)
         assert root.title() == "Birth Flower MVP"
-        assert bool(root.cget("menu"))
+        assert len(app._menus) == 4  # 顶栏 CTk 菜单（已弃用原生菜单栏白条）
         assert set(APP_COLORS) >= {"background", "panel", "border", "text", "muted", "warning"}
-        assert app.remark_text is None or isinstance(app.remark_text, tk.Text)
+        assert app.remark_text is None or isinstance(app.remark_text, (tk.Text, ctk.CTkTextbox))
         assert app.remark_text is not None
-        assert int(app.remark_text.cget("height")) == 4
+        assert int(app.remark_text.cget("height")) > 0
         assert app.confirm_button is None or hasattr(app.confirm_button, "invoke")
         assert isinstance(app.section_frames, dict)
         assert set(app.section_frames) >= {
@@ -187,27 +189,12 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         assert app.preview_canvas.bind("<Double-Button-1>")
         assert app.preview_canvas.bind("<Delete>")
         assert app.preview_canvas.bind("<BackSpace>")
-        menu = root.nametowidget(root.cget("menu"))
-        file_menu = None
-        edit_menu = None
-        for index in range(menu.index("end") + 1):
-            if menu.type(index) == "cascade" and menu.entrycget(index, "label") == "文件":
-                file_menu = root.nametowidget(menu.entrycget(index, "menu"))
-            if menu.type(index) == "cascade" and menu.entrycget(index, "label") == "编辑":
-                edit_menu = root.nametowidget(menu.entrycget(index, "menu"))
-        assert file_menu is not None
-        file_labels = [
-            file_menu.entrycget(index, "label")
-            for index in range(file_menu.index("end") + 1)
-            if file_menu.type(index) != "separator"
-        ]
-        assert "导入" in file_labels
-        assert edit_menu is not None
-        edit_labels = [
-            edit_menu.entrycget(index, "label")
-            for index in range(edit_menu.index("end") + 1)
-            if edit_menu.type(index) != "separator"
-        ]
+        # 菜单已迁到数据驱动的自绘 CtkMenu；直接校验 app._menus 的数据结构。
+        menus = dict(app._menus)
+        assert list(menus) == ["文件", "编辑", "查看", "帮助"]
+        file_labels = [it["label"] for it in menus["文件"] if it.get("type") != "separator"]
+        assert "导入备注..." in file_labels
+        edit_labels = [it["label"] for it in menus["编辑"] if it.get("type") != "separator"]
         assert edit_labels == ["布局设置...", "字形..."]
         assert app.preview_canvas.bind("<Button-3>")
         assert app.preview_canvas.bind("<Button-2>")
@@ -695,6 +682,9 @@ def test_canvas_context_menu_selects_layer_and_exposes_canvas_and_glyph_actions(
         assert "应用推荐字形" in labels
         assert "恢复普通字符" in labels
     finally:
+        # 先撤销对 tkinter.Menu 的全局替身，否则 root.destroy() 时 CTkOptionMenu 的
+        # DropdownMenu.destroy() 会调用 tkinter.Menu.destroy() 而触到 FakeMenu。
+        monkeypatch.undo()
         root.destroy()
 
 
@@ -1039,24 +1029,16 @@ def test_glyph_help_explains_font2_default_binding(monkeypatch):
     except tk.TclError:
         pytest.skip("Tk display is not available")
 
-    captured = {}
-
-    def fake_showinfo(title, message):
-        captured["title"] = title
-        captured["message"] = message
-
-    monkeypatch.setattr(ui_app_module.messagebox, "showinfo", fake_showinfo)
-
     try:
         app = BirthFlowerApp(root)
-        app.show_glyph_help()
+        app.show_glyph_help()  # 现在弹深色 CTk 窗口而非 messagebox；验证不报错 + 文本内容
 
-        assert captured["title"] == "字形使用说明"
-        assert "Font 2 已内置 a-z 26 个结尾字形" in captured["message"]
-        assert "a=U+E068" in captured["message"]
-        assert "z=U+E081" in captured["message"]
-        assert "编辑 -> 管理字形绑定" in captured["message"]
-        assert "按 a-z 绑定" in captured["message"]
+        message = ui_app_module.GLYPH_HELP_TEXT
+        assert "Font 2 已内置 a-z 26 个结尾字形" in message
+        assert "a=U+E068" in message
+        assert "z=U+E081" in message
+        assert "编辑 -> 管理字形绑定" in message
+        assert "按 a-z 绑定" in message
     finally:
         root.destroy()
 
@@ -1067,7 +1049,8 @@ def _widget_texts(widget):
         if hasattr(child, "cget"):
             try:
                 text = child.cget("text")
-            except tk.TclError:
+            except (tk.TclError, ValueError):
+                # CTk 容器（如 CTkFrame）对不支持的 "text" 选项抛 ValueError，而非 TclError。
                 text = ""
             if text:
                 texts.append(text)

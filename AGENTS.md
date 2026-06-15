@@ -25,6 +25,38 @@
 6. 桌面文本输入框加**右键复制/粘贴**菜单。
 > **2026-06-14 新需求（已出 ExecPlan，待实现）**：把「单产品 + 全局单素材库 + month/flower 定位 + 全局生产参数」演进为 **Product → 素材库 → 素材(key/别名/标签/默认参数) → 图层(可挂库+生产参数 override)**。素材/字体不再单一；月份字段→「素材库+素材」选择器；订单解析改为把库 catalog 注入 GPT、动态枚举校验 material_key（本地不写死）。演进兼容（birth-flower=产品0，month/flower 降为标签，金标/批量不破）；后期左侧加产品切换器（每窗口=一个产品）。**设计与分阶段计划见 `docs/superpowers/plans/2026-06-14-layer-material-library-system.md`**。本轮只出文档未改代码。
 
+## 本会话改动（2026-06-14 · Phase 4）：产品切换器（方案2 可收/展）
+
+分支 `claude/phase4-product-switcher`（基于后端基线 `62556c0`，**未提交，待 review**）。全量 **341 passed**，ruff clean。
+- `ui_app.py`：最左新增可收/展产品列（`_render_product_rail`/`_build_product_button`/`_toggle_product_rail`/`_switch_product`/`_open_new_product_dialog`/`_create_product_from_dialog`）；模块级纯函数 `product_initial`/`product_rail_items` + 轻量 `_attach_tooltip`。原「预览 + 功能区」两栏布局**未动**（产品列是 pack `side="left"` 的新增列）。
+- `config_store.py`：`AppConfig` 加 `products_panel_collapsed`（默认收起，持久化）；新增纯函数 `unique_product_id`/`with_added_product`/`_slugify`。
+- 顺手修 BUG：`_save_settings_window` 改用 `dataclasses.replace`，否则保存设置会清空 `products`/`active_product_id`/收展态。
+- `tests/test_product_switcher.py`(9) 纯逻辑单测；withdrawn-root 运行态冒烟过。
+- ⚠️ **未完**（见 ExecPlan Task 4）：切产品不联动人工确认面板字段（属 Task 2/Phase 2）；多产品端到端未验证（生产仍单产品）。
+
+## 本会话改动（2026-06-14 · UI 换肤）：CustomTkinter 深色迁移（阶段 1-3 完成）
+
+依赖：`customtkinter>=5.2`（已装进 `.venv-win`，登记进 `requirements.txt`）。全量 **341 passed**，ruff clean。运行截图存 `tmp_out/stage*.png`。
+- **阶段1 全局深色**：模块级 `ctk.set_appearance_mode("dark")`；`APP_COLORS` 翻深色 + `_configure_styles` 把 ttk(clam) 全控件（含 Notebook、Combobox 下拉）刷深色；产品列改 CTk 圆角。
+- **阶段2 主窗口面板**：功能区改 `CTkScrollableFrame`（删手搓 canvas 滚动）；订单/生产/图层/预览/生产输出五块改 `_ctk_card` 圆角卡片；按钮→CTkButton(`_btn`)、输入→CTkEntry、备注→CTkTextbox、勾选→CTkCheckBox、素材/字体下拉→**CTkOptionMenu**（`<<ComboboxSelected>>` 改 `command=`）；`_add_row`/`_add_path_row` 也改 CTk。
+- **阶段3 弹窗**：所有对话框 `tk.Toplevel`→`ctk.CTkToplevel`（深色）；新建产品对话框全 CTk。设置/布局/素材编辑弹窗内部沿用 ttk-dark（Notebook 等已刷深色），未逐控件 CTk 化（小尾巴）。
+- **画板保持浅色**：`preview_canvas` 仍白底（代表浅色木料；预览是深灰折线+黑墨字，翻黑会看不见，要黑画板需反转 `renderer` 预览色，独立任务）。
+- **修的坑**：① 预览 `ImageTk.PhotoImage(..., master=canvas)` 绑定到画板解释器（多 root 测试下原报 image doesn't exist，单 root 也更正确）；② 新增 `tests/conftest.py` autouse fixture 清 CTk 全局 tracker；③ `_widget_texts` 容错 `ValueError`；④ context-menu 测试先 `monkeypatch.undo()` 再 `root.destroy()`（CTkOptionMenu 的 DropdownMenu.destroy 会调 tkinter.Menu.destroy）。
+- **⚠️ 启动崩溃回归（已修）**：`import customtkinter` 原是 `ui_app.py` 顶层硬依赖，用非 `.venv-win` 解释器（如 MSYS `.venv`）启动会在 `birth_flower_mvp.py:3 from ui_app import main` 处直接 `ModuleNotFoundError: customtkinter` 崩溃，早于 `_reexec_with_complete_env` 切换 → 窗口闪退。修法：顶层 `try/except ImportError: ctk=None` 容忍 + 模块级 `set_appearance` 加 `if ctk is not None` + `_reexec` 的依赖自检同时 `import customtkinter`（缺它也切 `.venv-win`）。验证：`.venv/bin/python.exe birth_flower_mvp.py` 现可正常 re-exec 到 `.venv-win` 运行。**教训：ui_app 顶层别加只装在 `.venv-win` 的硬依赖，否则破坏引导解释器 re-exec。**
+
+## 本会话改动（2026-06-14 · UI 换肤续）：Ezcad 同款顶部 + 产品列外推
+
+参考用户指定的 `C:\Users\Administrator\Documents\Ezcad2.7.6`（其做法 = `ctk.CTk()` 根窗 + 无原生菜单栏 + CTk 卡片 `corner_radius`，**并非**无边框/外框圆角）。据此改 flower（全量 341 passed，ruff clean）：
+- **根窗** `main()` `tk.Tk()`→`ctk.CTk()`（自带深色标题栏；探针实测 ctk.CTk 的 configure/menu/geometry/bind 全可用）。
+- **去原生菜单栏**（系统菜单条无法染色=白条，已实测）：菜单迁到 `_build_menubar` 顶栏 CTk 按钮 + `_popup_menu` 用 `tk_popup` 弹出原菜单（深色，菜单存 `self._menus`）。
+- **`_enable_dark_titlebar`(DWM)** 仅当回退 `tk.Tk`（测试/缺 ctk）时兜底；`ctk.CTk` 自带不再调。
+- **产品列展开 = 窗口加宽**（`_toggle_product_rail` 按 `delta=120` 改 geometry），实测画板宽度 694→694 不变（往外推、不挤画板）。
+- **未做**：外框圆角（Win10 直角，Ezcad 也无；真圆角需 `overrideredirect` 自绘，用户暂未选）。
+- 测试：`test_birth_flower_app_initializes` 的菜单断言改读 `app._menus`（不再有原生 menubar）。截图 `tmp_out/ui_ctk_top.png`、`ui_expanded.png`。
+- **收尾修复（按用户反馈）**：① 收/展箭头方向纠正——收起 `«`(外，下次展开)、展开 `»`(内，下次收起)；② `glyph_panel.py` 也换 `ctk.CTkToplevel` + 玻璃网格 `tk.Canvas` 加 `bg="#242424"`（原是唯一没改的白窗）；③ 菜单 `tk.Menu` 加 `relief="flat"/activeborderwidth=0` 去弹窗白边；④ **`ctk.CTk` 致命坑**：`root.minsize()` 无参 getter 在 CTk 上抛 `TypeError`（`int < None`），`_toggle_product_rail` 原用它读回最小宽 → 真机点收/展即崩（tk.Tk 测试不报）。改用常量 `MIN_WINDOW_WIDTH/HEIGHT`。**教训：ctk.CTk 上别调无参 minsize/maxsize getter；ctk.CTk 专属 bug 用 tk.Tk 测试抓不到，须用 ctk.CTk 冒烟。**
+- **对话框白标题栏修复（设置/布局/字形/字形说明）**：`CTkToplevel` 自带深色标题栏**实测不稳**（标题栏仍白；像素采样 (255,255,255)）。统一走 `BirthFlowerApp._themed_toplevel()`：建 CTkToplevel 后 `after(60)+after(350)` 调 `_enable_dark_titlebar`（DWM 设属性 + **1px 几何微调强制重绘**——光 DwmSetWindowAttribute rc=0 也不会重绘标题栏，复杂对话框靠几何微调才变深）。`glyph_panel.py` 同法。`show_glyph_help` 由原生 `messagebox`（白底不可染）改成 CTk 窗口，文案抽到 `GLYPH_HELP_TEXT` 常量（测试断言改读它）。**验证：4 个对话框标题栏像素采样全 (0,0,0)。** 教训：DWM 深色属性设上后必须触发重绘（几何微调）才生效。
+- **下拉菜单改自绘 `CtkMenu`**（替代原生 `tk.Menu` 白边弹窗）：模块级 `CtkMenu` = overrideredirect Toplevel + CTk 行；菜单改**数据驱动** `self._menus`（list[(label, items)]，item={label,command} 或 {type:separator}），`_build_menubar` 点按钮→`_open_dropdown`→`CtkMenu.popup`。「导入」子菜单拍平为顶层两项（CtkMenu 不做嵌套）。**白角坑**：圆角 CTkFrame 四角露出 Toplevel 默认浅底→给 Toplevel `configure(bg=panel)` 兜底（角像素 (240)→(36)）。关闭：选中/FocusOut/Esc。`test_birth_flower_app_initializes` 菜单断言改读数据结构。**右键上下文菜单仍是 tk.Menu（未改，如需也可同法改 CtkMenu）**。
+
 ## 本会话改动（2026-06-14）：文字自动排版引擎统一
 
 详见记忆 `flower-text-layout-unified.md`。一句话：文字排版改为**算一次、等比不拉伸、预览==导出**。

@@ -4,6 +4,11 @@ import logging
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+try:
+    import customtkinter as ctk
+except ImportError:  # 引导解释器无 ctk 时退化（本面板实际只在 .venv-win 打开）
+    ctk = None
+
 from glyph_service import (
     GlyphCandidate,
     GlyphVariant,
@@ -42,7 +47,13 @@ def _current_selected_char(app) -> str:
 
 
 def open_glyph_panel(app, mapping_only: bool = False) -> tk.Toplevel:
-    window = tk.Toplevel(app.root)
+    window = ctk.CTkToplevel(app.root) if ctk is not None else tk.Toplevel(app.root)
+    if ctk is not None:
+        # CTkToplevel 自带深色标题栏不稳（实测仍白），用 ui_app 的 DWM 兜底。
+        from ui_app import _enable_dark_titlebar
+
+        window.after(60, lambda: _enable_dark_titlebar(window))
+        window.after(350, lambda: _enable_dark_titlebar(window))
     window.title("字形")
     window.transient(app.root)
     window.geometry("920x760")
@@ -288,7 +299,7 @@ def _build_glyph_grid(
     pager = ttk.Frame(group)
     pager.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
-    canvas = tk.Canvas(group, height=330, highlightthickness=0)
+    canvas = tk.Canvas(group, height=330, highlightthickness=0, bg="#242424")
     scrollbar = ttk.Scrollbar(group, orient="vertical", command=canvas.yview)
     grid = ttk.Frame(canvas)
     grid.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
