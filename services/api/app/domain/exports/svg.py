@@ -241,6 +241,11 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
                     details={"layerId": layer.get("id"), "codepoint": f"U+{codepoint:04X}"},
                     recoverable=True,
                 )
+            # 一个字形的所有 contour 合并进**同一个 <path>**（多子路径 M..Z M..Z）：
+            # 这样默认 nonzero 缠绕规则让内层 counter（如字母 o/a 的孔、草书 A 的环）成为
+            # 镂空孔，而非各自单独填成实心块（与 Pillow 预览一致）。逐 contour 单独成 path
+            # 会把孔填实——这正是草书大写字母被填成黑团的根因。
+            glyph_subpaths: list[str] = []
             for shape in _glyph_shapes(
                 glyph_set[glyph_name],
                 glyph_name,
@@ -251,10 +256,11 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
                 str(layer.get("id", "text")),
             ):
                 path_data = _shape_path_data(shape.points, shape.closed)
-                if not path_data:
-                    continue
+                if path_data:
+                    glyph_subpaths.append(path_data)
+            if glyph_subpaths:
                 attrs = [
-                    f'd="{_attr(path_data)}"',
+                    f'd="{_attr(" ".join(glyph_subpaths))}"',
                     f'fill="{_attr(fill)}"',
                     f'data-layer-id="{_attr(str(layer.get("id") or ""))}"',
                 ]
