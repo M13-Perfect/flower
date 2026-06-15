@@ -53,6 +53,7 @@ from glyph_service import (
 from models import AIParseConfig, BirthFlowerDesign, Document, EngravingLayout, FlowerAsset, FontAsset, ImageLayer, TextLayer, ParseResult, add_image_layer, add_text_layer, delete_layer, hit_test, move_layer
 from order_importer import load_order_remark_from_file
 from parse_pipeline import parse_order_remark_auto
+from order_catalog import LibraryBundle
 from gpt_parser import DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, parse_order_remark_with_gpt
 from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_document_png, render_dxf, render_png, render_svg
 from desktop_export import render_document_dxf, render_document_vector_svg
@@ -737,6 +738,8 @@ class BirthFlowerApp:
         self.font_assets: list[FontAsset] = []
         self.flower_label_map: dict[str, FlowerAsset] = {}
         self.font_label_map: dict[str, FontAsset] = {}
+        # 当前产品的素材库/字体库集合，供解析把订单落到具体 material_key（见 order_catalog）。
+        self.active_bundle: LibraryBundle = LibraryBundle()
         self.preview_font_family_cache: dict[Path, str] = {}
         self.preview_loaded_fonts: set[Path] = set()
         self.preview_cache = PreviewCache()
@@ -1893,7 +1896,7 @@ class BirthFlowerApp:
 
         run_background(
             self.root,
-            lambda: parse_order_remark_auto(remark, ai_config=ai_config),
+            lambda: parse_order_remark_auto(remark, ai_config=ai_config, bundle=self.active_bundle),
             self._apply_parse_result,
             on_error,
         )
@@ -2772,6 +2775,10 @@ class BirthFlowerApp:
     def _scan_assets(self, show_errors: bool) -> None:
         self.flower_assets = scan_flower_assets(Path(self.flower_dir_var.get()))
         self.font_assets = scan_font_assets(Path(self.font_source_var.get()))
+        # 用与扫描相同的目录建 LibraryBundle，解析时传给后端把订单落到具体素材/字体 key。
+        self.active_bundle = LibraryBundle.from_dirs(
+            [Path(self.flower_dir_var.get())], [Path(self.font_source_var.get())]
+        )
         self.preview_cache.clear()
         self._refresh_flower_choices()
         self._refresh_font_choices()
@@ -2860,6 +2867,8 @@ class BirthFlowerApp:
         except ValueError:
             layout = EngravingLayout()
         # 添加素材必须追加 ImageLayer，不能覆盖已存在的素材图层。
+        material_key = asset.asset_key or asset.path.stem
+        found = self.active_bundle.resolve_material(material_key)  # 反查该素材属于哪个库
         layer = add_image_layer(
             self.document,
             asset.path,
@@ -2868,8 +2877,10 @@ class BirthFlowerApp:
             y=layout.flower_y,
             width=layout.flower_width,
             height=layout.flower_height,
-            material_id=asset.asset_key or asset.path.stem,
+            material_id=material_key,
             material_name=asset.display_name or asset.name,
+            library_id=found[0] if found else "",
+            material_key=material_key,
         )
         self.selected_preview_item = layer.id
         self._refresh_layers_panel()
@@ -2903,6 +2914,10 @@ class BirthFlowerApp:
         except ValueError:
             layout = EngravingLayout()
         text = self._content_text_for_render().strip() or "Name"
+        font_asset = self.font_label_map.get(self.font_asset_var.get())
+        font_found = (
+            self.active_bundle.resolve_font_by_tags(index=font_asset.index) if font_asset is not None else None
+        )
         layer = add_text_layer(
             self.document,
             text,
@@ -2912,6 +2927,8 @@ class BirthFlowerApp:
             width=layout.text_width,
             height=layout.text_height,
             font_size=layout.text_size,
+            font_library_id=font_found[0] if font_found else "",
+            font_key=font_found[1].key if font_found else "",
         )
         self._apply_auto_glyph_rules_to_layer(layer)
         self.selected_preview_item = layer.id

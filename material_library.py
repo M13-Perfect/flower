@@ -129,7 +129,18 @@ class MaterialLibrary:
         fallback_id = library_id or _slug(root_path.name) or "library"
         fallback_name = name or root_path.name or fallback_id
 
-        if not root_path.exists() or not root_path.is_dir():
+        if not root_path.exists():
+            return cls(id=fallback_id, name=fallback_name, kind=kind, root=root_path, entries=())
+        # 字体源兼容「单个字体文件」（旧 font_source = Birthmonth_font.ttf）：直接扫该文件成库。
+        if root_path.is_file():
+            if kind == "font":
+                return cls(
+                    id=fallback_id,
+                    name=fallback_name,
+                    kind="font",
+                    root=root_path.parent,
+                    entries=_scan_font_entries(root_path),
+                )
             return cls(id=fallback_id, name=fallback_name, kind=kind, root=root_path, entries=())
 
         manifest_path = root_path / MANIFEST_NAME

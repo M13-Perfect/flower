@@ -120,3 +120,13 @@ def test_missing_folder_returns_empty_library(tmp_path: Path):
     assert library.id == "ghost"
     assert library.entries == ()
     assert library.catalog().keys() == set()
+
+
+def test_font_source_can_be_single_file(tmp_path: Path):
+    # 兼容旧 font_source = 单个 .ttf 文件（非目录）
+    font = tmp_path / "MalovelyScript.ttf"
+    font.write_bytes(b"fake-font")
+    library = MaterialLibrary.from_folder(font, kind="font")
+    assert library.kind == "font"
+    assert library.entries  # 单文件也成库
+    assert library.entries[0].tags.get("index") == 1

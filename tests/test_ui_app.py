@@ -841,9 +841,11 @@ def test_parse_remark_reads_current_text_widget_content(monkeypatch):
         app.remark_text.delete("1.0", "end")
         app.remark_text.insert("1.0", note)
         calls = []
+        received_bundle = []
 
-        def fake_parser(remark, ai_config=None):
+        def fake_parser(remark, ai_config=None, bundle=None):
             calls.append(remark)
+            received_bundle.append(bundle)
             return SimpleNamespace(text="Lacey", month=9, font=3, flower=1, warnings=[])
 
         def run_immediately(_root, work, on_success, on_error):
@@ -862,11 +864,48 @@ def test_parse_remark_reads_current_text_widget_content(monkeypatch):
         app.parse_remark()
 
         assert calls == [note]
+        assert received_bundle == [app.active_bundle]  # 增量：解析时把当前产品库 bundle 传给后端
         assert app.remark_var.get() == note
         assert app.name_var.get() == "Lacey"
         assert app.month_var.get() == "9"
         assert app.font_var.get() == "3"
         assert app.flower_var.get() == "1"
+    finally:
+        root.destroy()
+
+
+def test_add_flower_writes_layer_library_and_material_key(tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        from asset_resolver import scan_flower_assets
+        from models import ImageLayer
+        from order_catalog import LibraryBundle
+
+        app = BirthFlowerApp(root)
+        flowers = tmp_path / "flowers"
+        flowers.mkdir()
+        (flowers / "March_Daffodil.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 0h10v10H0z"/></svg>',
+            encoding="utf-8",
+        )
+        assets = scan_flower_assets(flowers)
+        assert assets
+        asset = assets[0]
+        label = app._flower_label(asset)
+        app.flower_label_map = {label: asset}
+        app.flower_asset_var.set(label)
+        app.active_bundle = LibraryBundle.from_dirs([flowers], [])
+
+        app._add_selected_flower_to_canvas()
+
+        images = [layer for layer in app.document.layers if isinstance(layer, ImageLayer)]
+        assert images
+        new_layer = images[-1]
+        assert new_layer.material_key == asset.asset_key  # 图层记录引用的素材 key
+        assert new_layer.library_id == app.active_bundle.image_libraries[0].id  # 以及所属库
     finally:
         root.destroy()
 
