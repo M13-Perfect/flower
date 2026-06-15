@@ -229,6 +229,11 @@ layer.production（图层 override）
 ### Task 2：生产参数随图层 + 人工确认字段重构（Phase 2，UI）
 **Files:** 改 `ui_app.py`；改/加 `tests/test_ui_app.py`。**只动 `ui_app.py` + 其测试，后端不用再改**（Phase 1/3 已铺好，接口缝已做成一行调用）。
 
+**进度（2026-06-14，分支 `claude/phase4-product-switcher`，未提交，全量 348 passed）**：
+- ✅ **增量1（解析对接，第5缝部分）**：`ui_app.active_bundle`（`_scan_assets` 用产品库目录建，切产品跟随）+ `parse_remark(bundle=)` → 解析经 enrich 落 material_key。`material_library.from_folder` 兼容单字体文件。
+- ✅ **增量2（第3缝的图层身份部分）**：`_add_selected_flower_to_canvas` 写 `library_id/material_key`；`_add_text_layer_from_fields` 写 `font_library_id/font_key`。护栏 `test_ui_app.py::test_add_flower_writes_layer_library_and_material_key`。
+- ⏸ **暂停（按用户 ROI 决定，等真有第二个素材库/产品再做）**：第1-2缝「素材库+素材」选择器（高风险，与 flower_label_map/month/flower 交织，单库视觉≈现状）、第4缝属性面板 resolve_chain、第6缝设置管库。
+
 #### 🔌 后端接线契约（给接手 Phase 2 的 UI 对话，照此调用即可，勿重造）
 后端能力已落地并测好（Phase 1/3，全量 332 passed）。Phase 2 = 把下面 6 个缝接进 `ui_app.py`：
 
