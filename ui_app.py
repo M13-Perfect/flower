@@ -54,6 +54,7 @@ from models import AIParseConfig, BirthFlowerDesign, Document, EngravingLayout, 
 from order_importer import load_order_remark_from_file
 from parse_pipeline import parse_order_remark_auto
 from order_catalog import LibraryBundle
+from production import ProductionParams, resolve_chain
 from gpt_parser import DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, parse_order_remark_with_gpt
 from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_document_png, render_dxf, render_png, render_svg
 from desktop_export import render_document_dxf, render_document_vector_svg
@@ -754,6 +755,11 @@ class BirthFlowerApp:
         self.layer_text_var = tk.StringVar()
         self.layer_font_size_var = tk.StringVar(value=str(default_layout.text_size))
         self.layer_color_var = tk.StringVar(value="#111111")
+        # 增量4：图层级生产参数（几何）编辑——选中图层时显示有效值，应用时写回 layer.production。
+        self.layer_x_var = tk.StringVar()
+        self.layer_y_var = tk.StringVar()
+        self.layer_w_var = tk.StringVar()
+        self.layer_h_var = tk.StringVar()
         self.layout_vars = {
             "canvas_width": tk.StringVar(value=str(default_layout.canvas_width)),
             "canvas_height": tk.StringVar(value=str(default_layout.canvas_height)),
@@ -1271,6 +1277,16 @@ class BirthFlowerApp:
         ctk.CTkLabel(body, text="颜色", anchor="w").grid(row=5, column=2, sticky="w", pady=2)
         ctk.CTkEntry(body, textvariable=self.layer_color_var, width=90).grid(row=5, column=3, sticky="ew", pady=2)
         self._btn(body, "应用文本属性", self._apply_text_layer_properties).grid(row=5, column=4, sticky="ew", pady=2, padx=2)
+        # 增量4：图层级生产参数（几何）——任意图层可编辑位置/尺寸，应用写回 layer.production 并落到画布几何。
+        ctk.CTkLabel(body, text="位置X", anchor="w").grid(row=6, column=0, sticky="w", pady=2)
+        ctk.CTkEntry(body, textvariable=self.layer_x_var, width=70).grid(row=6, column=1, sticky="ew", pady=2)
+        ctk.CTkLabel(body, text="Y", anchor="w").grid(row=6, column=2, sticky="w", pady=2)
+        ctk.CTkEntry(body, textvariable=self.layer_y_var, width=70).grid(row=6, column=3, sticky="ew", pady=2)
+        ctk.CTkLabel(body, text="宽", anchor="w").grid(row=7, column=0, sticky="w", pady=2)
+        ctk.CTkEntry(body, textvariable=self.layer_w_var, width=70).grid(row=7, column=1, sticky="ew", pady=2)
+        ctk.CTkLabel(body, text="高", anchor="w").grid(row=7, column=2, sticky="w", pady=2)
+        ctk.CTkEntry(body, textvariable=self.layer_h_var, width=70).grid(row=7, column=3, sticky="ew", pady=2)
+        self._btn(body, "应用生产参数", self._apply_layer_production).grid(row=7, column=4, sticky="ew", pady=2, padx=2)
         return panel
 
     def _build_order_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -2700,6 +2716,78 @@ class BirthFlowerApp:
             self.layer_color_var.set(layer.fill_color or layer.color)
         else:
             self.layer_text_var.set("")
+        # 增量4：几何字段显示该图层当前有效几何（live = 用户在画布上看到的位置/尺寸）。
+        self.layer_x_var.set(f"{layer.x:g}")
+        self.layer_y_var.set(f"{layer.y:g}")
+        self.layer_w_var.set(f"{layer.width:g}")
+        self.layer_h_var.set(f"{layer.height:g}")
+
+    def _slot_defaults(self, layer) -> ProductionParams:
+        """图层「槽位」的产品级生产默认，取自当前布局默认 EngravingLayout（回落链最低层）。"""
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = self.config.layout_defaults
+        if isinstance(layer, TextLayer):
+            return ProductionParams(
+                x=layout.text_x, y=layout.text_y, width=layout.text_width,
+                height=layout.text_height, font_size=layout.text_size,
+            )
+        return ProductionParams(
+            x=layout.flower_x, y=layout.flower_y,
+            width=layout.flower_width, height=layout.flower_height,
+        )
+
+    def _layer_library_entry_defaults(self, layer) -> tuple[ProductionParams | None, ProductionParams | None]:
+        """按图层挂的库/素材 key 反查（库默认, 素材默认）生产参数；查不到返回 (None, None)。"""
+        if isinstance(layer, TextLayer):
+            libraries = self.active_bundle.font_libraries
+            library_id, key = layer.font_library_id, layer.font_key
+        else:
+            libraries = self.active_bundle.image_libraries
+            library_id, key = layer.library_id, layer.material_key
+        library = next((lib for lib in libraries if lib.id == library_id), None)
+        if library is None:
+            return None, None
+        entry = library.by_key(key) if key else None
+        return library.defaults, (entry.defaults if entry is not None else None)
+
+    def _layer_effective_production(self, layer) -> ProductionParams:
+        """§5 回落链：产品默认 → 库默认 → 素材默认 → 图层 override（低→高优先级）。"""
+        library_defaults, entry_defaults = self._layer_library_entry_defaults(layer)
+        return resolve_chain(self._slot_defaults(layer), library_defaults, entry_defaults, layer.production)
+
+    def _apply_layer_production(self) -> None:
+        layer = self.document.selected_layer()
+        if layer is None:
+            self.status_var.set("未选择有效图层")
+            return
+        try:
+            x = float(self.layer_x_var.get())
+            y = float(self.layer_y_var.get())
+            width = float(self.layer_w_var.get())
+            height = float(self.layer_h_var.get())
+        except ValueError:
+            messagebox.showerror("生产参数", "位置/尺寸必须是数字")
+            return
+        if width <= 0 or height <= 0:
+            messagebox.showerror("生产参数", "宽和高必须大于 0")
+            return
+        # 写回画布几何（与拖拽同一路径，仍经导出 _apply_canvas_fit，不旁路 WYSIWYG）。
+        layer.x, layer.y, layer.width, layer.height = x, y, width, height
+        font_size: int | None = None
+        if isinstance(layer, TextLayer):
+            try:
+                font_size = max(1, int(self.layer_font_size_var.get()))
+            except ValueError:
+                font_size = None
+            if font_size is not None:
+                layer.font_size = font_size
+        # 记录为图层级生产参数 override（随图层走，供再次 seed / 导出元数据；只填用户给的字段）。
+        layer.production = ProductionParams(x=x, y=y, width=width, height=height, font_size=font_size)
+        self.status_var.set("生产参数已应用")
+        self._refresh_layers_panel()
+        self._redraw_preview()
 
     def _toggle_selected_layer_visible(self) -> None:
         layer = self.document.selected_layer()
