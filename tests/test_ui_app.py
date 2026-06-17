@@ -11,7 +11,7 @@ import pytest
 from config_store import AIProfile
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult, GlyphVariant
-from models import FlowerAsset, FontAsset, ImageLayer, TextLayer, add_image_layer, add_text_layer
+from models import EngravingLayout, FlowerAsset, FontAsset, ImageLayer, TextLayer, add_image_layer, add_text_layer
 import ui_app as ui_app_module
 from ui_app import (
     APP_COLORS,
@@ -41,6 +41,39 @@ class FakeRoot:
 
     def after(self, delay, callback):
         self.callbacks.append((delay, callback))
+
+
+def test_preview_ruler_major_step_keeps_labels_readable():
+    assert BirthFlowerApp._ruler_major_step_mm(60) == 1
+    assert BirthFlowerApp._ruler_major_step_mm(12) == 5
+    assert BirthFlowerApp._ruler_major_step_mm(2.5) == 20
+    assert BirthFlowerApp._ruler_major_step_mm(0.1) == 200
+
+
+def test_preview_physical_size_uses_template_size(monkeypatch):
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    monkeypatch.setattr(
+        ui_app_module,
+        "load_template_physical_size",
+        lambda: SimpleNamespace(width_mm=120, height_mm=80),
+    )
+
+    assert app._preview_physical_size_mm(
+        EngravingLayout(canvas_width=3000, canvas_height=2000)
+    ) == (120.0, 80.0)
+
+
+def test_preview_physical_size_falls_back_to_80mm_width(monkeypatch):
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+
+    def raise_missing_template():
+        raise RuntimeError("missing template")
+
+    monkeypatch.setattr(ui_app_module, "load_template_physical_size", raise_missing_template)
+
+    assert app._preview_physical_size_mm(
+        EngravingLayout(canvas_width=2000, canvas_height=1000)
+    ) == (80.0, 40.0)
 
 
 def test_build_design_from_manual_values_accepts_user_edits():
