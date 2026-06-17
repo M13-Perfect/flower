@@ -11,7 +11,7 @@ import pytest
 from config_store import AIProfile
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult, GlyphVariant
-from models import FlowerAsset, FontAsset, ImageLayer, TextLayer, add_image_layer, add_text_layer
+from models import Document, FlowerAsset, FontAsset, ImageLayer, TextLayer, add_image_layer, add_text_layer
 import ui_app as ui_app_module
 from ui_app import (
     APP_COLORS,
@@ -184,8 +184,13 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         assert app.preview_canvas is not None
         assert app.preview_canvas.bind("<Button-1>")
         assert app.preview_canvas.bind("<B1-Motion>")
+        assert app.preview_canvas.bind("<B2-Motion>")
         assert app.preview_canvas.bind("<ButtonRelease-1>")
+        assert app.preview_canvas.bind("<ButtonRelease-2>")
         assert app.preview_canvas.bind("<Double-Button-1>")
+        assert app.preview_canvas.bind("<MouseWheel>")
+        assert app.preview_canvas.bind("<Button-4>")
+        assert app.preview_canvas.bind("<Button-5>")
         assert app.preview_canvas.bind("<Delete>")
         assert app.preview_canvas.bind("<BackSpace>")
         # 菜单已迁到数据驱动的自绘 CtkMenu；直接校验 app._menus 的数据结构。
@@ -209,12 +214,344 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         assert "重新扫描" not in visible_texts
         assert "显示辅助框" not in visible_texts
         assert "适配窗口" not in visible_texts
-        assert "100%" not in visible_texts
+        assert "100%" in visible_texts
         assert "重置布局" not in visible_texts
         assert "字形详情" not in visible_texts
     finally:
         root.destroy()
 
+
+def test_preview_mousewheel_zoom_keeps_mouse_anchor():
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        assert app.preview_canvas is not None
+        app.preview_canvas.update_idletasks()
+        layout = layout_from_values(app.layout_vars)
+        mouse_x = 360
+        mouse_y = 260
+        old_scale, old_offset_x, old_offset_y = app._preview_transform(layout)
+        anchored_doc_x = (mouse_x - old_offset_x) / old_scale
+        anchored_doc_y = (mouse_y - old_offset_y) / old_scale
+
+        result = app._on_canvas_mousewheel(SimpleNamespace(x=mouse_x, y=mouse_y, delta=120))
+
+        new_scale, new_offset_x, new_offset_y = app._preview_transform(layout)
+        assert result == "break"
+        assert app.preview_zoom > 1.0
+        assert new_scale > old_scale
+        assert new_offset_x + anchored_doc_x * new_scale == pytest.approx(mouse_x)
+        assert new_offset_y + anchored_doc_y * new_scale == pytest.approx(mouse_y)
+    finally:
+        root.destroy()
+
+
+def test_preview_zoom_status_text_updates_without_display():
+    class FakeVar:
+        def __init__(self):
+            self.value = ""
+
+        def set(self, value):
+            self.value = value
+
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.preview_zoom = 2.5
+    app.preview_zoom_status_var = FakeVar()
+
+    assert app._preview_zoom_percent_text() == "250%"
+
+    app._update_preview_zoom_status()
+
+    assert app.preview_zoom_status_var.value == "250%"
+
+
+def test_preview_mousewheel_zoom_status_reaches_125_percent_without_display(monkeypatch):
+    class FakeCanvas:
+        def __getitem__(self, key):
+            return "720" if key == "width" else "532"
+
+        def winfo_width(self):
+            return 720
+
+        def winfo_height(self):
+            return 532
+
+        def focus_set(self):
+            pass
+
+    class FakeVar:
+        def __init__(self):
+            self.value = "100%"
+
+        def set(self, value):
+            self.value = value
+
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.preview_canvas = FakeCanvas()
+    app.inline_text_entry = None
+    app.preview_zoom = 1.0
+    app.preview_pan_x = 0.0
+    app.preview_pan_y = 0.0
+    app.preview_zoom_status_var = FakeVar()
+    app.layout_vars = {}
+    app._redraw_preview = lambda: None
+    layout = ui_app_module.EngravingLayout(canvas_width=1000, canvas_height=500)
+    monkeypatch.setattr(ui_app_module, "layout_from_values", lambda _vars: layout)
+
+    assert app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=120, state=0)) == "break"
+
+    assert app.preview_zoom == pytest.approx(1.25)
+    assert app.preview_zoom_status_var.value == "125%"
+
+
+def test_preview_mousewheel_zoom_logic_without_display(monkeypatch):
+    class FakeCanvas:
+        def __init__(self):
+            self.focused = False
+
+        def __getitem__(self, key):
+            if key == "width":
+                return "720"
+            if key == "height":
+                return "532"
+            raise KeyError(key)
+
+        def winfo_width(self):
+            return 720
+
+        def winfo_height(self):
+            return 532
+
+        def focus_set(self):
+            self.focused = True
+
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.preview_canvas = FakeCanvas()
+    app.inline_text_entry = None
+    app.preview_zoom = 1.0
+    app.preview_pan_x = 0.0
+    app.preview_pan_y = 0.0
+    redraw_calls = []
+    app._redraw_preview = lambda: redraw_calls.append("redraw")
+    layout = ui_app_module.EngravingLayout(canvas_width=1000, canvas_height=500)
+    monkeypatch.setattr(ui_app_module, "layout_from_values", lambda _vars: layout)
+    app.layout_vars = {}
+
+    mouse_x = 300
+    mouse_y = 220
+    old_scale, old_offset_x, old_offset_y = app._preview_transform(layout)
+    anchored_doc_x = (mouse_x - old_offset_x) / old_scale
+    anchored_doc_y = (mouse_y - old_offset_y) / old_scale
+
+    assert app._on_canvas_mousewheel(SimpleNamespace(x=mouse_x, y=mouse_y, delta=120)) == "break"
+
+    new_scale, new_offset_x, new_offset_y = app._preview_transform(layout)
+    assert app.preview_zoom > 1.0
+    assert new_scale > old_scale
+    assert new_offset_x + anchored_doc_x * new_scale == pytest.approx(mouse_x)
+    assert new_offset_y + anchored_doc_y * new_scale == pytest.approx(mouse_y)
+    assert app.preview_canvas.focused is True
+    assert redraw_calls == ["redraw"]
+
+
+def test_preview_mousewheel_zoom_out_logic_without_display(monkeypatch):
+    class FakeCanvas:
+        def __getitem__(self, key):
+            return "720" if key == "width" else "532"
+
+        def winfo_width(self):
+            return 720
+
+        def winfo_height(self):
+            return 532
+
+        def focus_set(self):
+            pass
+
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.preview_canvas = FakeCanvas()
+    app.inline_text_entry = None
+    app.preview_zoom = 2.0
+    app.preview_pan_x = -120.0
+    app.preview_pan_y = -60.0
+    app._redraw_preview = lambda: None
+    layout = ui_app_module.EngravingLayout(canvas_width=1000, canvas_height=500)
+    monkeypatch.setattr(ui_app_module, "layout_from_values", lambda _vars: layout)
+    app.layout_vars = {}
+
+    old_scale, _old_offset_x, _old_offset_y = app._preview_transform(layout)
+
+    assert app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=-120)) == "break"
+
+    new_scale, _new_offset_x, _new_offset_y = app._preview_transform(layout)
+    assert app.preview_zoom < 2.0
+    assert new_scale < old_scale
+
+    # Linux/X11 Button-5 is also zoom-out and should keep moving toward the lower bound.
+    previous_zoom = app.preview_zoom
+    assert app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=0, num=5)) == "break"
+    assert app.preview_zoom < previous_zoom
+
+
+def test_preview_shift_and_alt_mousewheel_pan_horizontally_without_display(monkeypatch):
+    class FakeCanvas:
+        def __getitem__(self, key):
+            return "720" if key == "width" else "532"
+
+        def winfo_width(self):
+            return 720
+
+        def winfo_height(self):
+            return 532
+
+        def focus_set(self):
+            pass
+
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.preview_canvas = FakeCanvas()
+    app.inline_text_entry = None
+    app.preview_zoom = 1.5
+    app.preview_pan_x = 10.0
+    app.preview_pan_y = 20.0
+    redraw_calls = []
+    app._redraw_preview = lambda: redraw_calls.append("redraw")
+    layout = ui_app_module.EngravingLayout(canvas_width=1000, canvas_height=500)
+    monkeypatch.setattr(ui_app_module, "layout_from_values", lambda _vars: layout)
+    app.layout_vars = {}
+
+    assert app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=120, state=0x0001)) == "break"
+
+    assert app.preview_zoom == pytest.approx(1.5)
+    assert app.preview_pan_x == pytest.approx(10.0 + ui_app_module.PREVIEW_WHEEL_PAN_STEP)
+    assert app.preview_pan_y == pytest.approx(20.0)
+
+    assert app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=-120, state=0x0008)) == "break"
+
+    assert app.preview_zoom == pytest.approx(1.5)
+    assert app.preview_pan_x == pytest.approx(10.0)
+    assert app.preview_pan_y == pytest.approx(20.0)
+    assert redraw_calls == ["redraw", "redraw"]
+
+
+def test_preview_middle_press_starts_pan_mode_without_display():
+    class FakeCanvas:
+        def __init__(self):
+            self.cursor = ""
+            self.focused = False
+
+        def focus_set(self):
+            self.focused = True
+
+        def configure(self, **kwargs):
+            if "cursor" in kwargs:
+                self.cursor = kwargs["cursor"]
+
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.preview_canvas = FakeCanvas()
+    app.inline_text_entry = None
+    app.document = SimpleNamespace(selected_layer_id="old")
+    app.selected_preview_item = "old"
+    app._drag_target = "old-layer"
+    app._drag_mode = "move"
+    app._drag_start = None
+
+    assert app._on_canvas_pan_press(SimpleNamespace(x=200, y=160)) == "break"
+
+    assert app._drag_mode == "pan"
+    assert app._drag_target is None
+    assert app._drag_start == (200, 160)
+    assert app.document.selected_layer_id == "old"
+    assert app.selected_preview_item == "old"
+    assert app.preview_canvas.cursor == "fleur"
+    assert app.preview_canvas.focused is True
+
+
+def test_preview_middle_drag_pan_moves_viewport_without_display():
+    class FakeCanvas:
+        def __init__(self):
+            self.cursor = "fleur"
+
+        def configure(self, **kwargs):
+            if "cursor" in kwargs:
+                self.cursor = kwargs["cursor"]
+
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.preview_canvas = FakeCanvas()
+    app.preview_pan_x = 15.0
+    app.preview_pan_y = -5.0
+    app._drag_mode = "pan"
+    app._drag_target = None
+    app._drag_start = (100, 80)
+    redraw_calls = []
+    app._redraw_preview = lambda: redraw_calls.append("redraw")
+
+    app._on_canvas_drag(SimpleNamespace(x=145, y=110))
+
+    assert app.preview_pan_x == pytest.approx(60.0)
+    assert app.preview_pan_y == pytest.approx(25.0)
+    assert app._drag_start == (145, 110)
+    assert redraw_calls == ["redraw"]
+
+    app._on_canvas_release(SimpleNamespace())
+
+    assert app._drag_mode == "move"
+    assert app._drag_target is None
+    assert app._drag_start is None
+    assert app.preview_canvas.cursor == ""
+
+
+def test_preview_zoom_and_pan_do_not_mutate_document_or_layer_geometry(monkeypatch):
+    class FakeCanvas:
+        def __init__(self):
+            self.cursor = ""
+
+        def __getitem__(self, key):
+            return "720" if key == "width" else "532"
+
+        def winfo_width(self):
+            return 720
+
+        def winfo_height(self):
+            return 532
+
+        def focus_set(self):
+            pass
+
+        def configure(self, **kwargs):
+            if "cursor" in kwargs:
+                self.cursor = kwargs["cursor"]
+
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.preview_canvas = FakeCanvas()
+    app.inline_text_entry = None
+    app.preview_zoom = 1.0
+    app.preview_pan_x = 0.0
+    app.preview_pan_y = 0.0
+    app.preview_zoom_status_var = None
+    app.layout_vars = {}
+    app.document = Document(1000, 500)
+    layer = add_text_layer(app.document, "Export Safe", x=123, y=45, width=300, height=80, font_size=42)
+    app._redraw_preview = lambda: None
+    layout = ui_app_module.EngravingLayout(canvas_width=1000, canvas_height=500)
+    monkeypatch.setattr(ui_app_module, "layout_from_values", lambda _vars: layout)
+    before_document = (app.document.canvas_width, app.document.canvas_height, app.document.selected_layer_id)
+    before_layer = (layer.x, layer.y, layer.width, layer.height, layer.scale_x, layer.scale_y, layer.font_size, layer.text)
+
+    app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=120, state=0))
+    app._on_canvas_pan_press(SimpleNamespace(x=320, y=180))
+    app._on_canvas_drag(SimpleNamespace(x=370, y=210))
+    app._on_canvas_release(SimpleNamespace())
+
+    after_document = (app.document.canvas_width, app.document.canvas_height, app.document.selected_layer_id)
+    after_layer = (layer.x, layer.y, layer.width, layer.height, layer.scale_x, layer.scale_y, layer.font_size, layer.text)
+    assert app.preview_zoom != 1.0
+    assert (app.preview_pan_x, app.preview_pan_y) != (0.0, 0.0)
+    assert after_document == before_document
+    assert after_layer == before_layer
 
 def test_import_asset_dispatches_font_and_flower_paths(monkeypatch, tmp_path):
     try:
