@@ -60,6 +60,14 @@ class EngravingLayout:
     text_width: int = 804
     text_height: int = 260
     text_size: int = 190
+    # 全局默认字体样式（新增）：每个文本图层可覆盖（TextLayer.bold/.. = None 时继承这里）。
+    # 加粗对脚本字体无真粗体字重，用「轮廓外扩」实现；bold_strength = 外扩量占字号的比例，
+    # 预览端 stroke_width_px=round(strength*font_size)、矢量端 offset=strength*font_size，单位一致。
+    bold: bool = False
+    underline: bool = False
+    italic: bool = False
+    bold_strength: float = 0.016  # 经预览实测：≈stroke 2px@104，清晰可读且字怀不糊（0.028 起糊）
+    letter_spacing: float = 0.0  # 字间距全局默认（已有 per-layer 全链路；建层时烘进图层）
 
 
 @dataclass(frozen=True)
@@ -189,6 +197,12 @@ class TextLayer(Layer):
     font_library_id: str = ""
     font_key: str = ""
     production: ProductionParams | None = None
+    # 字体样式 override（新增）：None=继承全局 EngravingLayout 默认；非 None=本图层显式取值。
+    # 用 resolve_text_style(layer, layout) 解析最终样式，预览/导出共用同一结果。
+    bold: bool | None = None
+    underline: bool | None = None
+    italic: bool | None = None
+    bold_strength: float | None = None
 
     def __post_init__(self) -> None:
         """兼容旧 TextLayer：旧数据只有 text 时，迁移出 original_text/render_text。"""
@@ -230,6 +244,54 @@ class TextLayer(Layer):
     def display_text(self) -> str:
         """UI 可读文本：避免直接展示 PUA 乱码。"""
         return f"{self.original_text}（已应用特殊字形）" if self.glyph_overrides else self.original_text
+
+
+@dataclass(frozen=True)
+class ResolvedTextStyle:
+    """文本图层解析后的最终字体样式（已合并全局默认 + 图层 override）。预览/导出共用。"""
+
+    bold: bool = False
+    underline: bool = False
+    italic: bool = False
+    bold_strength: float = 0.0  # 已解析：bold=False 时恒为 0，下游无需再判 bold
+
+
+def resolve_text_style(layer: "TextLayer", layout: EngravingLayout) -> ResolvedTextStyle:
+    """解析文本图层最终字体样式：图层字段非 None 时优先，否则继承全局 EngravingLayout 默认。
+
+    加粗强度(bold_strength，占字号比例)仅在最终 bold=True 时有效，否则归零——让 svg/dxf/预览
+    下游只看 ResolvedTextStyle 即可，不必各自再判断 bold 与回落链。
+    """
+
+    def pick(name: str) -> Any:
+        override = getattr(layer, name, None)
+        return getattr(layout, name) if override is None else override
+
+    bold = bool(pick("bold"))
+    underline = bool(pick("underline"))
+    italic = bool(pick("italic"))
+    try:
+        strength = float(pick("bold_strength"))
+    except (TypeError, ValueError):
+        strength = float(layout.bold_strength)
+    return ResolvedTextStyle(bold=bold, underline=underline, italic=italic, bold_strength=strength if bold else 0.0)
+
+
+DEFAULT_BOLD_STRENGTH = 0.016
+
+
+def layer_text_style(layer: "TextLayer") -> ResolvedTextStyle:
+    """从图层自身读已解析样式（None→关；强度缺省 DEFAULT_BOLD_STRENGTH）。预览(text_renderer)与
+    矢量端(desktop_export)共用此读法，保证两端一致。全局默认在建层时由 resolve_text_style 烘进图层。"""
+    bold = bool(getattr(layer, "bold", None) or False)
+    underline = bool(getattr(layer, "underline", None) or False)
+    italic = bool(getattr(layer, "italic", None) or False)
+    raw = getattr(layer, "bold_strength", None)
+    try:
+        strength = DEFAULT_BOLD_STRENGTH if raw is None else float(raw)
+    except (TypeError, ValueError):
+        strength = DEFAULT_BOLD_STRENGTH
+    return ResolvedTextStyle(bold=bold, underline=underline, italic=italic, bold_strength=strength if bold else 0.0)
 
 
 @dataclass

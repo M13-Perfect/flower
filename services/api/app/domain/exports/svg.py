@@ -183,11 +183,14 @@ def _render_layer(layer: dict[str, Any]) -> str:
 
 def _render_text_layer(layer: dict[str, Any]) -> str:
     from app.domain.exports.dxf import (
+        _UNDERLINE_GAP_RATIO,
+        _UNDERLINE_THICKNESS_RATIO,
         ExportContext,
         Matrix,
         _glyph_shapes,
         _resolve_font_path,
         _resolve_text_line_specs,
+        offset_glyph_polygons,
     )
 
     try:
@@ -225,12 +228,17 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
     fill = str(style.get("fill") or "#000000")
     stroke = str(style.get("stroke") or "")
     stroke_width = float(style.get("strokeWidth") or 0)
+    # 字体样式（加粗/下划线，来自 desktop_export 烘入的 style）。
+    bold = bool(style.get("bold"))
+    bold_strength = float(style.get("boldStrength") or 0)
+    underline = bool(style.get("underline"))
     line_specs = _resolve_text_line_specs(
         layer, style, cmap, hmtx, units_per_em, font_size_value, line_height, letter_spacing
     )
     paths: list[str] = []
 
     for line, cursor, baseline_y in line_specs:
+        line_start_x = cursor
         for char in line:
             codepoint = ord(char)
             glyph_name = cmap.get(codepoint)
@@ -245,8 +253,7 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
             # 这样默认 nonzero 缠绕规则让内层 counter（如字母 o/a 的孔、草书 A 的环）成为
             # 镂空孔，而非各自单独填成实心块（与 Pillow 预览一致）。逐 contour 单独成 path
             # 会把孔填实——这正是草书大写字母被填成黑团的根因。
-            glyph_subpaths: list[str] = []
-            for shape in _glyph_shapes(
+            shapes = _glyph_shapes(
                 glyph_set[glyph_name],
                 glyph_name,
                 cursor,
@@ -254,10 +261,22 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
                 font_size_value / units_per_em,
                 Matrix(),
                 str(layer.get("id", "text")),
-            ):
-                path_data = _shape_path_data(shape.points, shape.closed)
-                if path_data:
-                    glyph_subpaths.append(path_data)
+            )
+            glyph_subpaths: list[str] = []
+            if bold and bold_strength > 0:
+                # 加粗=把该字形所有 contour 整组轮廓外扩（外圈扩、内孔缩），再发同一 <path>。
+                polygons = offset_glyph_polygons(
+                    [list(shape.points) for shape in shapes], bold_strength * font_size_value
+                )
+                for polygon in polygons:
+                    path_data = _shape_path_data(polygon, True)
+                    if path_data:
+                        glyph_subpaths.append(path_data)
+            else:
+                for shape in shapes:
+                    path_data = _shape_path_data(shape.points, shape.closed)
+                    if path_data:
+                        glyph_subpaths.append(path_data)
             if glyph_subpaths:
                 attrs = [
                     f'd="{_attr(" ".join(glyph_subpaths))}"',
@@ -270,6 +289,18 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
                 paths.append(f'<path {" ".join(attrs)}/>')
             advance = float((hmtx.get(glyph_name) or (units_per_em, 0))[0])
             cursor += advance * font_size_value / units_per_em + letter_spacing
+        if underline and cursor > line_start_x:
+            # 下划线=基线下方一条闭合矩形（EzCad 填充成实条），宽度=该行墨迹推进宽。
+            th = max(1.0, _UNDERLINE_THICKNESS_RATIO * font_size_value)
+            y0 = baseline_y + _UNDERLINE_GAP_RATIO * font_size_value
+            y1 = y0 + th
+            rect = (
+                f"M {_number(line_start_x)} {_number(y0)} L {_number(cursor)} {_number(y0)} "
+                f"L {_number(cursor)} {_number(y1)} L {_number(line_start_x)} {_number(y1)} Z"
+            )
+            paths.append(
+                f'<path d="{_attr(rect)}" fill="{_attr(fill)}" data-layer-id="{_attr(str(layer.get("id") or ""))}"/>'
+            )
     return "\n".join(paths)
 
 

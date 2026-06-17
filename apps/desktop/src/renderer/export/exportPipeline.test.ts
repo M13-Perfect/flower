@@ -44,6 +44,17 @@ describe("export pipeline", () => {
     expect(exported.content).not.toContain("#ff00ff");
   });
 
+  it("embeds project font-face rules for asset fonts so PUA glyphs can render", () => {
+    const exported = createSvgExport(createDocument(), {
+      exportedAt: EXPORTED_AT,
+      fontFaceUrlForAsset: (assetId) => `http://127.0.0.1:8765/fonts/${assetId}/file`,
+    });
+
+    expect(exported.content).toContain("@font-face");
+    expect(exported.content).toContain("font-family: 'Specimen Script'");
+    expect(exported.content).toContain("http://127.0.0.1:8765/fonts/specimen-script/file");
+  });
+
   it("omits the canvas background when transparent export is requested", () => {
     const exported = createSvgExport(createDocument(), {
       background: "transparent",
@@ -105,6 +116,27 @@ describe("export pipeline", () => {
       JSON.stringify(exported.metadata),
     );
   });
+
+  it("rasterizes PNG with an explicit output width while preserving canvas aspect ratio", async () => {
+    const calls: PngRasterizeInput[] = [];
+
+    const exported = await createPngExport(createDocument(), {
+      exportedAt: EXPORTED_AT,
+      outputWidth: 900,
+      rasterize: async (input) => {
+        calls.push(input);
+        return TINY_PNG;
+      },
+    });
+
+    expect(calls[0]).toMatchObject({
+      height: 600,
+      scale: 3,
+      width: 900,
+    });
+    expect(exported.width).toBe(900);
+    expect(exported.height).toBe(600);
+  });
 });
 
 function createDocument(): LayerDocument {
@@ -164,8 +196,9 @@ function createDocument(): LayerDocument {
         tags: ["customer-text"],
         text: "Avery",
         fontRef: {
-          family: "Georgia",
-          source: "system",
+          family: "Specimen Script",
+          source: "asset",
+          assetId: "specimen-script",
         },
         style: {
           fontSize: 32,

@@ -1,8 +1,16 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+ipcMain.handle("flower:choose-directory", async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ["openDirectory", "createDirectory"],
+  });
+
+  return result.canceled ? null : (result.filePaths[0] ?? null);
+});
 
 function createMainWindow() {
   const window = new BrowserWindow({

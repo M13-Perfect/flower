@@ -54,6 +54,21 @@ def test_text_layer_can_change_text_and_render_again(tmp_path):
     assert document.layers[0].text == "After"
 
 
+def test_render_document_png_background_option(tmp_path):
+    from PIL import Image
+
+    document = Document(canvas_width=80, canvas_height=40)
+    add_text_layer(document, "Hi", x=10, y=10, width=40, height=20, font_size=12)
+
+    # 默认镂空:四角透明,激光雕刻背景不出刀。
+    transparent = render_document_png(document, tmp_path / "t.png")
+    assert Image.open(transparent).convert("RGBA").getpixel((0, 0)) == (0, 0, 0, 0)
+
+    # 正常:填充不透明白底。
+    white = render_document_png(document, tmp_path / "w.png", background="white")
+    assert Image.open(white).convert("RGBA").getpixel((0, 0)) == (255, 255, 255, 255)
+
+
 def test_delete_selected_layer_updates_selection(tmp_path):
     document = Document()
     first = add_image_layer(document, tmp_path / "first.svg")

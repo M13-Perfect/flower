@@ -94,6 +94,7 @@ h2 {
 }
 
 .editor-grid {
+  align-items: start;
   display: grid;
   gap: 12px;
   grid-template-columns: 260px minmax(620px, 1fr) 320px;
@@ -116,7 +117,8 @@ h2 {
 }
 
 .canvas-panel {
-  align-items: center;
+  align-items: flex-start;
+  align-self: start;
   display: flex;
   justify-content: center;
   overflow: auto;
@@ -170,7 +172,22 @@ h2 {
 }
 
 .fabric-stage-wrap {
-  width: max-content;
+  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+}
+
+.canvas-meta {
+  align-items: center;
+  color: #44535c;
+  display: flex;
+  font-size: 12px;
+  gap: 12px;
+  justify-content: center;
+  width: 100%;
 }
 
 .fabric-stage {
@@ -244,10 +261,18 @@ h2 {
 }
 
 .order-panel,
+.layer-create-panel,
+.path-panel,
 .text-panel {
   border-bottom: 1px solid #e3e7ea;
   margin-bottom: 14px;
   padding-bottom: 14px;
+}
+
+.layer-create-panel {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .text-panel {
@@ -257,6 +282,43 @@ h2 {
   margin-top: 18px;
   padding-bottom: 0;
   padding-top: 14px;
+}
+
+.path-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.path-row {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 56px minmax(0, 1fr) 74px;
+}
+
+.path-row span {
+  color: #44535c;
+  font-size: 12px;
+}
+
+.path-row code {
+  background: #f8fafb;
+  border: 1px solid #dce2e6;
+  border-radius: 6px;
+  color: #44535c;
+  font-family: inherit;
+  font-size: 11px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 6px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-row .secondary-action {
+  font-size: 12px;
+  min-height: 32px;
+  padding: 5px 6px;
 }
 
 .text-field,
@@ -467,6 +529,28 @@ h2 {
   margin-top: 12px;
 }
 
+.output-directory-row {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 118px;
+  margin-top: 10px;
+}
+
+.output-directory-row span {
+  background: #f8fafb;
+  border: 1px solid #dce2e6;
+  border-radius: 6px;
+  color: #44535c;
+  font-size: 12px;
+  min-height: 36px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .primary-action {
   background: #26352f;
   border: 1px solid #26352f;
@@ -485,6 +569,15 @@ h2 {
   min-height: 38px;
   padding: 8px 12px;
   width: 100%;
+}
+
+.visually-hidden-file {
+  height: 1px;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  position: absolute;
+  width: 1px;
 }
 
 .save-panel textarea {

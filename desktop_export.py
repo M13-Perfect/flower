@@ -17,7 +17,7 @@ from typing import Any
 from xml.etree import ElementTree
 
 from glyph_service import rebuild_render_text
-from models import Document, ImageLayer, Layer, TextLayer
+from models import Document, ImageLayer, Layer, TextLayer, layer_text_style
 from text_layout import fit_text_box
 
 # services/api(导出权威所在)未必已安装为包,确保它在 sys.path 上,
@@ -261,12 +261,17 @@ def _text_layer(layer: TextLayer) -> dict[str, Any]:
         line_spacing=line_spacing,
         letter_spacing=letter_spacing,
     )
+    # 字体样式（加粗/下划线）解析后烘进 style，供 svg/dxf 矢量端消费（与预览同一套 layer_text_style）。
+    tstyle = layer_text_style(layer)
     schema["style"] = {
         "fontSize": float(fit.font_size),
         "fill": layer.fill_color or layer.color or "#111111",
         "align": align,
         "lineHeight": line_spacing,
         "letterSpacing": letter_spacing,
+        "bold": tstyle.bold,
+        "underline": tstyle.underline,
+        "boldStrength": tstyle.bold_strength,
     }
     schema["layout"] = {"mode": "box", "overflow": "visible", "verticalAlign": vertical_align}
     # textLayout: 每行最终文本(字形替换已并入 render_text) + 每行 anchor='ls' 锚点(box 本地像素)。

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type RefObject } from "react";
 
 import {
   EXPORT_SETTINGS_SCHEMA_VERSION,
@@ -8,7 +8,13 @@ import {
   type TextLayer,
   validateLayerDocument,
 } from "@flower/design-core";
-import { createApiClient, type FontSummary, type HealthResponse, type ParsedOrder } from "./api/client";
+import {
+  createApiClient,
+  type FontSummary,
+  type HealthResponse,
+  type ParsedOrder,
+  type PathSettings,
+} from "./api/client";
 import { FabricCanvas } from "./canvas/FabricCanvas";
 import {
   applyGlyphOverrideToTextLayer,
@@ -25,6 +31,9 @@ import {
   downloadTextFile,
   type ExportBackground,
 } from "./export/exportPipeline";
+import { addImageAssetLayer, addSvgAssetLayer, addTextLayer } from "./editorActions";
+import { ADD_ASSET_BUTTON_LABEL } from "./editorLabels";
+import { loadProjectFonts } from "./fontLoader";
 import { GlyphPicker } from "./GlyphPicker";
 import { createDxfDataUrl, createOutputOrderName, selectInitialEditableLayerId } from "./orderWorkflow";
 import "./styles.css";
@@ -33,6 +42,8 @@ type HealthState =
   | { status: "loading" }
   | { status: "ready"; health: HealthResponse }
   | { status: "error"; message: string };
+
+type PathDirectoryKind = "asset" | "font" | "output";
 
 const apiClient = createApiClient();
 
@@ -48,11 +59,24 @@ export function App() {
   const [parsedOrder, setParsedOrder] = useState<ParsedOrder | null>(null);
   const [fonts, setFonts] = useState<FontSummary[]>([]);
   const [fontMessage, setFontMessage] = useState("loading");
+  const [pathSettings, setPathSettings] = useState<PathSettings>({
+    assetDirectories: [],
+    fontDirectories: [],
+    outputDirectory: null,
+  });
+  const [settingsMessage, setSettingsMessage] = useState("loading");
   const [exportScale, setExportScale] = useState(() => document.exportSettings.png.scale);
+  const [outputWidth, setOutputWidth] = useState(() =>
+    Math.round(document.canvas.width * document.exportSettings.png.scale),
+  );
+  const [outputHeight, setOutputHeight] = useState(() =>
+    Math.round(document.canvas.height * document.exportSettings.png.scale),
+  );
   const [transparentExport, setTransparentExport] = useState(
     () => document.exportSettings.png.background === "transparent",
   );
   const [exportMessage, setExportMessage] = useState("ready");
+  const assetInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,6 +94,29 @@ export function App() {
             status: "error",
             message: error instanceof Error ? error.message : "Backend health check failed",
           });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSettingsMessage("loading");
+
+    apiClient
+      .getPathSettings()
+      .then((settings) => {
+        if (!cancelled) {
+          setPathSettings(settings);
+          setSettingsMessage("ready");
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setSettingsMessage(error instanceof Error ? error.message : "Path settings failed");
         }
       });
 
@@ -101,6 +148,25 @@ export function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (fonts.length === 0) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void loadProjectFonts(fonts, apiClient.fontFileUrl).then((loaded) => {
+      if (!cancelled && loaded > 0) {
+        setFontMessage(`${fonts.length} fonts / ${loaded} loaded`);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fonts]);
 
   const selectedLayer = useMemo(
     () => findLayerById(document.layers, selectedLayerId),
@@ -156,6 +222,16 @@ export function App() {
         setSavedJson(JSON.stringify(templateResponse.document, null, 2));
         setSaveMessage("template applied");
         setExportScale(templateResponse.document.exportSettings.png.scale);
+        setOutputWidth(
+          Math.round(
+            templateResponse.document.canvas.width * templateResponse.document.exportSettings.png.scale,
+          ),
+        );
+        setOutputHeight(
+          Math.round(
+            templateResponse.document.canvas.height * templateResponse.document.exportSettings.png.scale,
+          ),
+        );
         setTransparentExport(templateResponse.document.exportSettings.png.background === "transparent");
         setOrderMessage("template applied");
       })
@@ -217,6 +293,108 @@ export function App() {
     setSaveMessage("valid");
   };
 
+  const handleAddTextLayer = useCallback(() => {
+    try {
+      const result = addTextLayer(document);
+      setDocument(result.document);
+      setSelectedLayerId(result.layerId);
+      setSavedJson(JSON.stringify(result.document, null, 2));
+      setSaveMessage("text layer added");
+    } catch (error) {
+      setSaveMessage(error instanceof Error ? error.message : "text layer add failed");
+    }
+  }, [document]);
+
+  const handleChooseAsset = useCallback(() => {
+    assetInputRef.current?.click();
+  }, []);
+
+  const handleChoosePathDirectory = useCallback(
+    (kind: PathDirectoryKind) => {
+      const chooseDirectory = window.flowerDesktop?.chooseDirectory;
+      if (!chooseDirectory) {
+        setSettingsMessage("desktop picker unavailable");
+        return;
+      }
+
+      setSettingsMessage(`choosing ${kind}`);
+      void chooseDirectory()
+        .then((directory) => {
+          if (!directory) {
+            setSettingsMessage("cancelled");
+            return null;
+          }
+
+          const request: PathSettings = {
+            assetDirectories: pathSettings.assetDirectories,
+            fontDirectories: pathSettings.fontDirectories,
+            outputDirectory: pathSettings.outputDirectory ?? null,
+          };
+          if (kind === "asset") {
+            request.assetDirectories = [directory];
+          }
+          if (kind === "font") {
+            request.fontDirectories = [directory];
+          }
+          if (kind === "output") {
+            request.outputDirectory = directory;
+          }
+
+          return apiClient.updatePathSettings(request).then((settings) => ({ settings, kind }));
+        })
+        .then((result) => {
+          if (!result) {
+            return;
+          }
+          setPathSettings(result.settings);
+          setSettingsMessage("paths saved");
+
+          if (result.kind === "font") {
+            setFontMessage("loading");
+            void apiClient
+              .listFonts()
+              .then((response) => {
+                setFonts(response.fonts);
+                setFontMessage(
+                  response.fonts.length > 0 ? `${response.fonts.length} fonts` : "no fonts",
+                );
+              })
+              .catch((error: unknown) => {
+                setFonts([]);
+                setFontMessage(error instanceof Error ? error.message : "Font scan failed");
+              });
+          }
+        })
+        .catch((error: unknown) => {
+          setSettingsMessage(error instanceof Error ? error.message : "Path update failed");
+        });
+    },
+    [pathSettings],
+  );
+
+  const handleAssetFileChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.currentTarget.files?.[0];
+      event.currentTarget.value = "";
+      if (!file) {
+        return;
+      }
+
+      setSaveMessage("adding asset");
+      void createImportedLayer(document, file)
+        .then((result) => {
+          setDocument(result.document);
+          setSelectedLayerId(result.layerId);
+          setSavedJson(JSON.stringify(result.document, null, 2));
+          setSaveMessage("asset layer added");
+        })
+        .catch((error: unknown) => {
+          setSaveMessage(error instanceof Error ? error.message : "asset layer add failed");
+        });
+    },
+    [document],
+  );
+
   const handleApplyGlyph = useCallback(
     (input: TextGlyphOverrideInput) => {
       if (!selectedLayerId) {
@@ -235,9 +413,50 @@ export function App() {
     [selectedLayerId],
   );
 
+  const handleChangeExportScale = useCallback(
+    (scale: number) => {
+      if (scale <= 0) {
+        return;
+      }
+      setExportScale(scale);
+      setOutputWidth(Math.max(1, Math.round(document.canvas.width * scale)));
+      setOutputHeight(Math.max(1, Math.round(document.canvas.height * scale)));
+    },
+    [document.canvas.height, document.canvas.width],
+  );
+
+  const handleChangeOutputWidth = useCallback(
+    (width: number) => {
+      if (width <= 0) {
+        return;
+      }
+      const scale = width / document.canvas.width;
+      setExportScale(scale);
+      setOutputWidth(Math.max(1, Math.round(width)));
+      setOutputHeight(Math.max(1, Math.round(document.canvas.height * scale)));
+    },
+    [document.canvas.height, document.canvas.width],
+  );
+
+  const handleChangeOutputHeight = useCallback(
+    (height: number) => {
+      if (height <= 0) {
+        return;
+      }
+      const scale = height / document.canvas.height;
+      setExportScale(scale);
+      setOutputHeight(Math.max(1, Math.round(height)));
+      setOutputWidth(Math.max(1, Math.round(document.canvas.width * scale)));
+    },
+    [document.canvas.height, document.canvas.width],
+  );
+
   const handleExportSvg = useCallback(() => {
     try {
-      const exported = createSvgExport(document, { background: exportBackground });
+      const exported = createSvgExport(document, {
+        background: exportBackground,
+        fontFaceUrlForAsset: apiClient.fontFileUrl,
+      });
       downloadTextFile(exported.content, exported.fileName, exported.mimeType);
       setExportMessage(`SVG ${exported.metadata.exportedAt}`);
     } catch (error) {
@@ -247,7 +466,13 @@ export function App() {
 
   const handleExportPng = useCallback(() => {
     setExportMessage("PNG exporting");
-    void createPngExport(document, { background: exportBackground, scale: exportScale })
+    void createPngExport(document, {
+      background: exportBackground,
+      fontFaceUrlForAsset: apiClient.fontFileUrl,
+      outputHeight,
+      outputWidth,
+      scale: exportScale,
+    })
       .then((exported) => {
         downloadDataUrl(exported.dataUrl, exported.fileName);
         setExportMessage(`PNG ${exported.width}x${exported.height}`);
@@ -276,8 +501,19 @@ export function App() {
   const handleSaveAllOutputs = useCallback(() => {
     setExportMessage("saving outputs");
     void Promise.all([
-      Promise.resolve(createSvgExport(document, { background: exportBackground })),
-      createPngExport(document, { background: exportBackground, scale: exportScale }),
+      Promise.resolve(
+        createSvgExport(document, {
+          background: exportBackground,
+          fontFaceUrlForAsset: apiClient.fontFileUrl,
+        }),
+      ),
+      createPngExport(document, {
+        background: exportBackground,
+        fontFaceUrlForAsset: apiClient.fontFileUrl,
+        outputHeight,
+        outputWidth,
+        scale: exportScale,
+      }),
       apiClient.exportDxf({ document, units: document.exportSettings.dxf.units }),
     ])
       .then(([svgExport, pngExport, dxfExport]) =>
@@ -287,6 +523,7 @@ export function App() {
           svg: svgExport.content,
           pngDataUrl: pngExport.dataUrl,
           dxfContentBase64: dxfExport.contentBase64,
+          outputDirectory: pathSettings.outputDirectory,
         }),
       )
       .then((saved) => {
@@ -297,7 +534,15 @@ export function App() {
       .catch((error: unknown) => {
         setExportMessage(error instanceof Error ? error.message : "Output save failed");
       });
-  }, [document, exportBackground, exportScale, parsedOrder?.customerName]);
+  }, [
+    document,
+    exportBackground,
+    exportScale,
+    outputHeight,
+    outputWidth,
+    parsedOrder?.customerName,
+    pathSettings.outputDirectory,
+  ]);
 
   return (
     <main className="app-shell">
@@ -319,6 +564,19 @@ export function App() {
             onChangeOrderId={setOrderId}
             onChangeOrderNote={setOrderNote}
             onParseAndApply={handleParseAndApplyOrder}
+          />
+
+          <LayerCreatePanel
+            assetInputRef={assetInputRef}
+            onAddText={handleAddTextLayer}
+            onAssetFileChange={handleAssetFileChange}
+            onChooseAsset={handleChooseAsset}
+          />
+
+          <PathSettingsPanel
+            message={settingsMessage}
+            onChooseDirectory={handleChoosePathDirectory}
+            settings={pathSettings}
           />
 
           <div className="panel-header">
@@ -377,14 +635,20 @@ export function App() {
 
           <ExportPanel
             message={exportMessage}
-            scale={exportScale}
+            onChangeOutputHeight={handleChangeOutputHeight}
+            onChangeOutputWidth={handleChangeOutputWidth}
+            onChangeScale={handleChangeExportScale}
             transparent={transparentExport}
-            onChangeScale={setExportScale}
             onChangeTransparent={setTransparentExport}
+            onChooseOutputDirectory={() => handleChoosePathDirectory("output")}
             onExportDxf={handleExportDxf}
             onExportPng={handleExportPng}
             onExportSvg={handleExportSvg}
             onSaveAll={handleSaveAllOutputs}
+            outputDirectory={pathSettings.outputDirectory}
+            outputHeight={outputHeight}
+            outputWidth={outputWidth}
+            scale={exportScale}
           />
 
           <div className="save-panel">
@@ -400,6 +664,90 @@ export function App() {
         </aside>
       </section>
     </main>
+  );
+}
+
+function LayerCreatePanel({
+  assetInputRef,
+  onAddText,
+  onAssetFileChange,
+  onChooseAsset,
+}: {
+  assetInputRef: RefObject<HTMLInputElement | null>;
+  onAddText: () => void;
+  onAssetFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onChooseAsset: () => void;
+}) {
+  return (
+    <section className="layer-create-panel" aria-label="Create layers">
+      <button className="secondary-action" onClick={onAddText} type="button">
+        Add text
+      </button>
+      <button className="secondary-action" onClick={onChooseAsset} type="button">
+        {ADD_ASSET_BUTTON_LABEL}
+      </button>
+      <input
+        accept=".svg,.png,.jpg,.jpeg,.webp,.bmp"
+        className="visually-hidden-file"
+        onChange={onAssetFileChange}
+        ref={assetInputRef}
+        type="file"
+      />
+    </section>
+  );
+}
+
+function PathSettingsPanel({
+  message,
+  onChooseDirectory,
+  settings,
+}: {
+  message: string;
+  onChooseDirectory: (kind: PathDirectoryKind) => void;
+  settings: PathSettings;
+}) {
+  return (
+    <section className="path-panel" aria-label="Path settings">
+      <div className="panel-header">
+        <h2>Paths</h2>
+        <span>{message}</span>
+      </div>
+      <PathRow
+        label="素材目录"
+        onChoose={() => onChooseDirectory("asset")}
+        value={settings.assetDirectories[0] ?? "not set"}
+      />
+      <PathRow
+        label="字体目录"
+        onChoose={() => onChooseDirectory("font")}
+        value={settings.fontDirectories[0] ?? "not set"}
+      />
+      <PathRow
+        label="输出目录"
+        onChoose={() => onChooseDirectory("output")}
+        value={settings.outputDirectory ?? "not set"}
+      />
+    </section>
+  );
+}
+
+function PathRow({
+  label,
+  onChoose,
+  value,
+}: {
+  label: string;
+  onChoose: () => void;
+  value: string;
+}) {
+  return (
+    <div className="path-row">
+      <span>{label}</span>
+      <code title={value}>{formatPathLabel(value)}</code>
+      <button className="secondary-action" onClick={onChoose} type="button">
+        Choose
+      </button>
+    </div>
   );
 }
 
@@ -519,22 +867,34 @@ function TextLayerPanel({
 
 function ExportPanel({
   message,
+  onChangeOutputHeight,
+  onChangeOutputWidth,
   onChangeScale,
   onChangeTransparent,
+  onChooseOutputDirectory,
   onExportDxf,
   onExportPng,
   onExportSvg,
   onSaveAll,
+  outputDirectory,
+  outputHeight,
+  outputWidth,
   scale,
   transparent,
 }: {
   message: string;
+  onChangeOutputHeight: (height: number) => void;
+  onChangeOutputWidth: (width: number) => void;
   onChangeScale: (scale: number) => void;
   onChangeTransparent: (transparent: boolean) => void;
+  onChooseOutputDirectory: () => void;
   onExportDxf: () => void;
   onExportPng: () => void;
   onExportSvg: () => void;
   onSaveAll: () => void;
+  outputDirectory?: string | null;
+  outputHeight: number;
+  outputWidth: number;
   scale: number;
   transparent: boolean;
 }) {
@@ -556,6 +916,20 @@ function ExportPanel({
             }
           }}
         />
+        <NumberField
+          label="png width"
+          min={1}
+          step={1}
+          value={outputWidth}
+          onChange={onChangeOutputWidth}
+        />
+        <NumberField
+          label="png height"
+          min={1}
+          step={1}
+          value={outputHeight}
+          onChange={onChangeOutputHeight}
+        />
         <label className="toggle-row">
           <input
             checked={transparent}
@@ -564,6 +938,12 @@ function ExportPanel({
           />
           transparent
         </label>
+      </div>
+      <div className="output-directory-row">
+        <span title={outputDirectory ?? ""}>{formatPathLabel(outputDirectory ?? "not set")}</span>
+        <button className="secondary-action" onClick={onChooseOutputDirectory} type="button">
+          Output folder
+        </button>
       </div>
       <div className="export-actions">
         <button className="secondary-action" onClick={onExportSvg} type="button">
@@ -581,6 +961,13 @@ function ExportPanel({
       </div>
     </div>
   );
+}
+
+function formatPathLabel(value: string): string {
+  if (value.length <= 34) {
+    return value;
+  }
+  return `...${value.slice(-31)}`;
 }
 
 function BackendStatus({ state }: { state: HealthState }) {
@@ -875,4 +1262,68 @@ function createSampleLayerDocument(): LayerDocument {
 
 function svgDataUrl(svg: string): string {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg.trim())}`;
+}
+
+async function createImportedLayer(document: LayerDocument, file: File) {
+  if (isSvgFile(file)) {
+    return addSvgAssetLayer(document, {
+      name: file.name,
+      svgText: await file.text(),
+    });
+  }
+
+  if (!isRasterImageFile(file)) {
+    throw new Error("Unsupported asset file type");
+  }
+
+  const dataUrl = await readFileAsDataUrl(file);
+  const size = await readImageSize(dataUrl);
+  return addImageAssetLayer(document, {
+    dataUrl,
+    height: size.height,
+    name: file.name,
+    width: size.width,
+  });
+}
+
+function isSvgFile(file: File): boolean {
+  return file.type === "image/svg+xml" || file.name.toLocaleLowerCase().endsWith(".svg");
+}
+
+function isRasterImageFile(file: File): boolean {
+  return (
+    file.type.startsWith("image/") &&
+    [".png", ".jpg", ".jpeg", ".webp", ".bmp"].some((extension) =>
+      file.name.toLocaleLowerCase().endsWith(extension),
+    )
+  );
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error("Asset file could not be read"));
+    };
+    reader.onerror = () => reject(new Error("Asset file could not be read"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function readImageSize(dataUrl: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      resolve({
+        height: image.naturalHeight || 1,
+        width: image.naturalWidth || 1,
+      });
+    };
+    image.onerror = () => reject(new Error("Imported image could not be decoded"));
+    image.src = dataUrl;
+  });
 }

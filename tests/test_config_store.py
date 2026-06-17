@@ -6,10 +6,12 @@ from config_store import (
     AIProfile,
     AppConfig,
     active_ai_profile,
+    active_product,
     load_config,
     normalize_output_formats,
     normalize_output_path,
     save_config,
+    with_product_prompts,
 )
 
 
@@ -150,3 +152,29 @@ def test_save_and_load_config_keeps_layout_defaults(tmp_path):
     assert loaded.layout_defaults.flower_width == 333
     assert loaded.layout_defaults.flower_height == 444
     assert loaded.layout_defaults.text_x == 555
+
+
+def test_save_and_load_config_keeps_product_prompts(tmp_path):
+    """提取提示词 / 背景提示词随产品配置往返持久化（空值也合法）。"""
+    path = tmp_path / "config.json"
+    config = with_product_prompts(
+        AppConfig(), extraction_prompt="提取顾客名字与花", background_prompt="木盒礼品语境"
+    )
+
+    save_config(config, path)
+    loaded = load_config(path)
+
+    product = active_product(loaded)
+    assert product.extraction_prompt == "提取顾客名字与花"
+    assert product.background_prompt == "木盒礼品语境"
+
+
+def test_with_product_prompts_allows_empty_and_isolates_other_products(tmp_path):
+    config = with_product_prompts(AppConfig(), extraction_prompt="x", background_prompt="y")
+    cleared = with_product_prompts(config, extraction_prompt="", background_prompt="")
+
+    path = tmp_path / "c.json"
+    save_config(cleared, path)
+    product = active_product(load_config(path))
+    assert product.extraction_prompt == ""
+    assert product.background_prompt == ""

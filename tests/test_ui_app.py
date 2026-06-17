@@ -178,7 +178,6 @@ def test_birth_flower_app_initializes_desktop_ui_state():
             "function_panel",
             "order_panel",
             "production_panel",
-            "production_bar",
         }
         assert hasattr(app, "current_glyph_result")
         assert root.minsize() == (760, 560)

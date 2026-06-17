@@ -564,8 +564,27 @@ function validateGlyphOverride(value: unknown, path: string, errors: string[]) {
   requireNonNegativeInteger(value.index, `${path}.index`, errors);
   requireString(value.originalText, `${path}.originalText`, errors);
   requireString(value.replacement, `${path}.replacement`, errors);
+  if (typeof value.replacement === "string" && containsUnicodeControlCharacter(value.replacement)) {
+    errors.push(`${path}.replacement must not be a Unicode control character`);
+  }
   requireOptionalString(value.codepoint, `${path}.codepoint`, errors);
+  if (typeof value.codepoint === "string" && isControlCodepointString(value.codepoint)) {
+    errors.push(`${path}.codepoint must not be a Unicode control character`);
+  }
   requireOptionalString(value.glyphName, `${path}.glyphName`, errors);
+}
+
+function containsUnicodeControlCharacter(value: string): boolean {
+  return Array.from(value).some((char) => isControlCodepoint(char.codePointAt(0) ?? -1));
+}
+
+function isControlCodepointString(value: string): boolean {
+  const match = value.trim().match(/^(?:U\+|0x)?([0-9a-f]{4,6})$/i);
+  return match ? isControlCodepoint(Number.parseInt(match[1], 16)) : false;
+}
+
+function isControlCodepoint(codepoint: number): boolean {
+  return (codepoint >= 0x0000 && codepoint <= 0x001f) || (codepoint >= 0x007f && codepoint <= 0x009f);
 }
 
 function validateImageLayer(value: Record<string, unknown>, path: string, errors: string[]) {

@@ -498,12 +498,17 @@ def _text_layer_paths(
     font_size = _positive_float(style.get("fontSize"), 1)
     line_height = _positive_float(style.get("lineHeight"), 1)
     letter_spacing = float(style.get("letterSpacing") or 0)
+    # 字体样式（加粗/下划线，来自 desktop_export 烘入的 style）。
+    bold = bool(style.get("bold"))
+    bold_strength = float(style.get("boldStrength") or 0)
+    underline = bool(style.get("underline"))
     line_specs = _resolve_text_line_specs(
         layer, style, cmap, hmtx, units_per_em, font_size, line_height, letter_spacing
     )
     paths: list[Any] = []
 
     for line, cursor, baseline_y in line_specs:
+        line_start_x = cursor
         for char in line:
             codepoint = ord(char)
             glyph_name = cmap.get(codepoint)
@@ -514,19 +519,42 @@ def _text_layer_paths(
                     details={"layerId": layer.get("id"), "codepoint": f"U+{codepoint:04X}"},
                     recoverable=True,
                 )
-            paths.extend(
-                _glyph_paths(
-                    glyph_set[glyph_name],
-                    glyph_name,
-                    cursor,
-                    baseline_y,
-                    font_size / units_per_em,
-                    matrix,
-                    str(layer.get("id", "text")),
+            if bold and bold_strength > 0:
+                # 加粗：box 本地扁平化该字形所有 contour → 整组外扩 → 经 matrix 发 POLYLINE。
+                shapes = _glyph_shapes(
+                    glyph_set[glyph_name], glyph_name, cursor, baseline_y,
+                    font_size / units_per_em, Matrix(), str(layer.get("id", "text")),
                 )
-            )
+                polygons = offset_glyph_polygons(
+                    [list(shape.points) for shape in shapes], bold_strength * font_size
+                )
+                for polygon in polygons:
+                    bold_path = _polygon_ezpath(polygon, matrix)
+                    if bold_path is not None:
+                        paths.append(bold_path)
+            else:
+                paths.extend(
+                    _glyph_paths(
+                        glyph_set[glyph_name],
+                        glyph_name,
+                        cursor,
+                        baseline_y,
+                        font_size / units_per_em,
+                        matrix,
+                        str(layer.get("id", "text")),
+                    )
+                )
             advance = float((hmtx.get(glyph_name) or (units_per_em, 0))[0])
             cursor += advance * font_size / units_per_em + letter_spacing
+        if underline and cursor > line_start_x:
+            # 下划线=基线下方一条闭合矩形（box 本地 → matrix → POLYLINE），EzCad 填充成实条。
+            th = max(1.0, _UNDERLINE_THICKNESS_RATIO * font_size)
+            y0 = baseline_y + _UNDERLINE_GAP_RATIO * font_size
+            y1 = y0 + th
+            rect = [(line_start_x, y0), (cursor, y0), (cursor, y1), (line_start_x, y1)]
+            underline_path = _polygon_ezpath(rect, matrix)
+            if underline_path is not None:
+                paths.append(underline_path)
     return paths
 
 
@@ -789,6 +817,61 @@ def _glyph_paths(
         if _path_has_geometry(path):
             paths.append(path)
     return paths
+
+
+# 字体样式（加粗）：下划线几何比例与预览端 text_renderer 保持一致。
+_UNDERLINE_THICKNESS_RATIO = 0.05
+_UNDERLINE_GAP_RATIO = 0.12
+# pyclipper 用整数坐标，浮点先放大再缩回；1000 倍对 px 级坐标足够精度。
+_CLIPPER_SCALE = 1000.0
+
+
+def offset_glyph_polygons(
+    polygons: list[list[tuple[float, float]]], delta: float
+) -> list[list[tuple[float, float]]]:
+    """对一个字形的全部 contour 点多边形**整体**做轮廓外扩(加粗)：外圈外扩、内孔内缩，保持镂空。
+
+    脚本字体无真粗体字重，加粗=几何外扩。用 pyclipper：先 nonzero union 统一定向（外圈 CCW/
+    内孔 CW），再以正 delta 做 ET_CLOSEDPOLYGON 偏移。delta<=0 或无有效多边形时原样返回。
+    坐标单位与传入一致（应在 box 本地像素空间调用，delta=strength*font_size）。
+    """
+    if delta <= 0:
+        return polygons
+    import pyclipper
+
+    subject = [
+        [(int(round(x * _CLIPPER_SCALE)), int(round(y * _CLIPPER_SCALE))) for x, y in poly]
+        for poly in polygons
+        if len(poly) >= 3
+    ]
+    if not subject:
+        return polygons
+    clipper = pyclipper.Pyclipper()
+    clipper.AddPaths(subject, pyclipper.PT_SUBJECT, True)
+    # nonzero 并集：得到「外圈减内孔」的填充区域并统一定向，offset 才能正确镂空。
+    cleaned = clipper.Execute(pyclipper.CT_UNION, pyclipper.PFT_NONZERO, pyclipper.PFT_NONZERO)
+    if not cleaned:
+        return polygons
+    pco = pyclipper.PyclipperOffset()
+    pco.AddPaths(cleaned, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+    inflated = pco.Execute(delta * _CLIPPER_SCALE)
+    result = [[(x / _CLIPPER_SCALE, y / _CLIPPER_SCALE) for x, y in poly] for poly in inflated]
+    return result or polygons
+
+
+def _polygon_ezpath(polygon: list[tuple[float, float]], matrix: Matrix) -> Any | None:
+    """闭合点多边形（box 本地）→ ezdxf.path.Path（经 matrix 变换，全直线段，输出 POLYLINE）。
+    用于加粗外扩后的字形轮廓与下划线矩形。"""
+    from ezdxf import path as ezpath
+
+    points = [apply_matrix(matrix, point) for point in polygon]
+    if len(points) < 2:
+        return None
+    path = ezpath.Path(points[0])
+    for point in points[1:]:
+        path.line_to(point)
+    path.close()
+    return path if _path_has_geometry(path) else None
 
 
 def _parse_path_shapes(path_data: str, matrix: Matrix, layer_id: str) -> list[PathShape]:

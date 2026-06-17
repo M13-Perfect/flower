@@ -121,6 +121,75 @@ describe("layer Fabric model conversion", () => {
     expect(validateLayerDocument(next).ok).toBe(true);
   });
 
+  it("keeps property panel geometry edits inside the canvas bounds", () => {
+    const document = createDocument();
+
+    const negative = updateLayerProperty(document, "text_1", {
+      x: -50,
+      y: -40,
+    });
+    expect(negative.layers[0]).toMatchObject({
+      x: 0,
+      y: 0,
+    });
+
+    const oversized = updateLayerProperty(document, "text_1", {
+      scale: 2,
+      x: 900,
+      y: 700,
+    });
+    expect(oversized.layers[0]).toMatchObject({
+      x: 360,
+      y: 440,
+      scaleX: 2,
+      scaleY: 2,
+    });
+    expect(validateLayerDocument(oversized).ok).toBe(true);
+  });
+
+  it("limits property panel scale edits so layers remain inside the canvas", () => {
+    const document = createDocument();
+
+    const oversized = updateLayerProperty(document, "text_1", {
+      scale: 10,
+      x: 700,
+      y: 550,
+    });
+    const layer = oversized.layers[0];
+
+    expect(layer).toMatchObject({
+      x: 0,
+    });
+    expect(layer.scaleX).toBeCloseTo(800 / 220);
+    expect(layer.scaleY).toBeCloseTo(800 / 220);
+    expect(layer.y).toBeCloseTo(600 - 80 * (800 / 220));
+    expect(validateLayerDocument(oversized).ok).toBe(true);
+  });
+
+  it("keeps Fabric snapshot geometry edits inside the canvas bounds", () => {
+    const document = createDocument();
+    const snapshots = document.layers.filter(isSupportedEditorLayer).map(createLayerObjectSnapshot);
+    const movedOutside = {
+      ...snapshots[0],
+      left: -120,
+      top: 900,
+      scaleX: 1.5,
+      scaleY: 1.5,
+    };
+
+    const saved = serializeLayerDocumentFromSnapshots(document, [movedOutside], {
+      updatedAt: "2026-06-12T12:00:00.000Z",
+    });
+
+    expect(saved.layers[0]).toMatchObject({
+      x: 0,
+      y: 480,
+      scaleX: 1.5,
+      scaleY: 1.5,
+    });
+    expect(validateLayerDocument(saved).ok).toBe(true);
+  });
+
   it("saves glyph replacements as text layer glyphOverrides without changing original text", () => {
     const document = createDocument();
 
@@ -135,6 +204,44 @@ describe("layer Fabric model conversion", () => {
     expect(layer).toMatchObject({
       type: "text",
       text: "Avery",
+      glyphOverrides: [
+        {
+          index: 4,
+          originalText: "y",
+          replacement: "\ue123",
+          codepoint: "U+E123",
+          glyphName: "y.swash",
+        },
+      ],
+    });
+    expect(validateLayerDocument(next).ok).toBe(true);
+  });
+
+  it("switches the text layer to the glyph font when applying a PUA glyph", () => {
+    const document = createDocument();
+
+    const next = applyGlyphOverrideToTextLayer(document, "text_1", {
+      index: 4,
+      replacement: "\ue123",
+      codepoint: "U+E123",
+      glyphName: "y.swash",
+      font: {
+        family: "Specimen Script",
+        assetId: "specimen-script",
+        source: "asset",
+        fallbackFamilies: ["serif"],
+      },
+    });
+
+    const layer = next.layers[0];
+    expect(layer).toMatchObject({
+      type: "text",
+      fontRef: {
+        family: "Specimen Script",
+        assetId: "specimen-script",
+        source: "asset",
+        fallbackFamilies: ["serif"],
+      },
       glyphOverrides: [
         {
           index: 4,
@@ -227,6 +334,40 @@ describe("layer Fabric model conversion", () => {
       text: "Averi",
     };
     expect(buildTextWithGlyphOverrides(staleLayer)).toBe("Averi");
+  });
+
+  it("rejects control characters when applying glyph overrides", () => {
+    expect(() =>
+      applyGlyphOverrideToTextLayer(createDocument(), "text_1", {
+        index: 4,
+        replacement: "\n",
+        codepoint: "U+000A",
+        glyphName: "linefeed.alt",
+      }),
+    ).toThrow(/control|Unicode/i);
+  });
+
+  it("ignores legacy control character glyph overrides when building render text", () => {
+    const document = createDocument();
+    const layer = document.layers[0];
+    if (layer.type !== "text") {
+      throw new Error("Expected text layer fixture");
+    }
+
+    expect(
+      buildTextWithGlyphOverrides({
+        ...layer,
+        glyphOverrides: [
+          {
+            index: 4,
+            originalText: "y",
+            replacement: "\n",
+            codepoint: "U+000A",
+            glyphName: "linefeed.alt",
+          },
+        ],
+      }),
+    ).toBe("Avery");
   });
 
   it("lists layers by visual stacking order for the layer panel", () => {

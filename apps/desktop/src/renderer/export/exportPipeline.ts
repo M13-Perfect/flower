@@ -21,6 +21,7 @@ export interface ExportMetadata {
 export interface SvgExportOptions {
   background?: ExportBackground;
   exportedAt?: string;
+  fontFaceUrlForAsset?: (assetId: string) => string;
 }
 
 export interface SvgExportFile {
@@ -43,6 +44,9 @@ export type PngRasterizer = (input: PngRasterizeInput) => Promise<string>;
 export interface PngExportOptions {
   background?: ExportBackground;
   exportedAt?: string;
+  fontFaceUrlForAsset?: (assetId: string) => string;
+  outputHeight?: number;
+  outputWidth?: number;
   rasterize?: PngRasterizer;
   scale?: number;
 }
@@ -86,7 +90,7 @@ export function createSvgExport(document: LayerDocument, options: SvgExportOptio
   return {
     fileName: createExportFileName(metadata, "svg"),
     mimeType: "image/svg+xml",
-    content: buildSvg(document, metadata, background),
+    content: buildSvg(document, metadata, background, options.fontFaceUrlForAsset),
     metadata,
   };
 }
@@ -100,12 +104,14 @@ export async function createPngExport(
   const exportedAt = options.exportedAt ?? new Date().toISOString();
   const metadata = createExportMetadata(document, exportedAt);
   const background = options.background ?? document.exportSettings.png.background;
-  const scale = normalizeScale(options.scale ?? document.exportSettings.png.scale);
-  const width = Math.round(document.canvas.width * scale);
-  const height = Math.round(document.canvas.height * scale);
-  const svg = createSvgExport(document, { background, exportedAt }).content;
+  const rasterSize = resolvePngRasterSize(document, options);
+  const svg = createSvgExport(document, {
+    background,
+    exportedAt,
+    fontFaceUrlForAsset: options.fontFaceUrlForAsset,
+  }).content;
   const rasterize = options.rasterize ?? rasterizeSvgToPng;
-  const rawDataUrl = await rasterize({ svg, width, height, scale, background });
+  const rawDataUrl = await rasterize({ svg, ...rasterSize, background });
   const rawBytes = dataUrlToPngBytes(rawDataUrl);
   const bytes = writePngTextMetadata(rawBytes, PNG_METADATA_KEYWORD, JSON.stringify(metadata));
 
@@ -114,8 +120,8 @@ export async function createPngExport(
     mimeType: "image/png",
     dataUrl: pngBytesToDataUrl(bytes),
     bytes,
-    width,
-    height,
+    width: rasterSize.width,
+    height: rasterSize.height,
     metadata,
   };
 }
@@ -170,10 +176,11 @@ function buildSvg(
   document: LayerDocument,
   metadata: ExportMetadata,
   background: ExportBackground,
+  fontFaceUrlForAsset?: (assetId: string) => string,
 ): string {
-  const layers = flattenRenderableLayers(document.layers)
-    .sort((left, right) => left.zIndex - right.zIndex)
-    .map(renderLayer)
+  const renderableLayers = flattenRenderableLayers(document.layers).sort((left, right) => left.zIndex - right.zIndex);
+  const fontDefs = buildFontFaceDefs(renderableLayers, fontFaceUrlForAsset);
+  const layers = renderableLayers.map(renderLayer)
     .filter((content) => content.length > 0);
   const backgroundRect =
     background === "canvas" && document.canvas.background.type === "solid"
@@ -192,10 +199,53 @@ function buildSvg(
       document.canvas.width,
     )} ${formatNumber(document.canvas.height)}">`,
     `  <metadata id="flower-export-metadata">${escapeText(JSON.stringify(metadata))}</metadata>`,
+    ...fontDefs.map((line) => indentBlock(line, "  ")),
     ...backgroundRect.map((line) => `  ${line}`),
     ...layers.map((line) => indentBlock(line, "  ")),
     "</svg>",
   ].join("\n");
+}
+
+function buildFontFaceDefs(
+  layers: readonly Layer[],
+  fontFaceUrlForAsset?: (assetId: string) => string,
+): string[] {
+  if (!fontFaceUrlForAsset) {
+    return [];
+  }
+
+  const rules = new Map<string, string>();
+  for (const layer of layers) {
+    if (layer.type !== "text" || layer.fontRef.source !== "asset" || !layer.fontRef.assetId) {
+      continue;
+    }
+
+    const family = layer.fontRef.family.trim();
+    if (!family) {
+      continue;
+    }
+
+    rules.set(
+      `${layer.fontRef.assetId}:${family}`,
+      `@font-face { font-family: '${escapeCssString(family)}'; src: url("${escapeCssUrl(
+        fontFaceUrlForAsset(layer.fontRef.assetId),
+      )}"); }`,
+    );
+  }
+
+  if (rules.size === 0) {
+    return [];
+  }
+
+  return [
+    [
+      "<defs>",
+      "  <style><![CDATA[",
+      ...Array.from(rules.values()).map((rule) => `    ${rule}`),
+      "  ]]></style>",
+      "</defs>",
+    ].join("\n"),
+  ];
 }
 
 function renderLayer(layer: Layer): string {
@@ -378,10 +428,30 @@ function buildTextWithGlyphOverrides(layer: TextLayer): string {
       continue;
     }
 
+    if (containsUnicodeControlCharacter(override.replacement) || isControlCodepointString(override.codepoint)) {
+      continue;
+    }
+
     chars[override.index] = override.replacement;
   }
 
   return chars.join("");
+}
+
+function containsUnicodeControlCharacter(value: string): boolean {
+  return Array.from(value).some((char) => isControlCodepoint(char.codePointAt(0) ?? -1));
+}
+
+function isControlCodepointString(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+  const match = value.trim().match(/^(?:U\+|0x)?([0-9a-f]{4,6})$/i);
+  return match ? isControlCodepoint(Number.parseInt(match[1], 16)) : false;
+}
+
+function isControlCodepoint(codepoint: number): boolean {
+  return (codepoint >= 0x0000 && codepoint <= 0x001f) || (codepoint >= 0x007f && codepoint <= 0x009f);
 }
 
 function layerTransform(layer: Layer): string {
@@ -467,6 +537,55 @@ function normalizeScale(value: number): number {
   }
 
   return value;
+}
+
+function resolvePngRasterSize(document: LayerDocument, options: PngExportOptions) {
+  const explicitWidth = positiveInteger(options.outputWidth);
+  const explicitHeight = positiveInteger(options.outputHeight);
+
+  if (explicitWidth !== null && explicitHeight !== null) {
+    return {
+      width: explicitWidth,
+      height: explicitHeight,
+      scale: normalizeScale(explicitWidth / document.canvas.width),
+    };
+  }
+
+  if (explicitWidth !== null) {
+    const scale = normalizeScale(explicitWidth / document.canvas.width);
+    return {
+      width: explicitWidth,
+      height: Math.max(1, Math.round(document.canvas.height * scale)),
+      scale,
+    };
+  }
+
+  if (explicitHeight !== null) {
+    const scale = normalizeScale(explicitHeight / document.canvas.height);
+    return {
+      width: Math.max(1, Math.round(document.canvas.width * scale)),
+      height: explicitHeight,
+      scale,
+    };
+  }
+
+  const scale = normalizeScale(options.scale ?? document.exportSettings.png.scale);
+  return {
+    width: Math.max(1, Math.round(document.canvas.width * scale)),
+    height: Math.max(1, Math.round(document.canvas.height * scale)),
+    scale,
+  };
+}
+
+function positiveInteger(value: number | undefined): number | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error("PNG output size must be a positive number");
+  }
+
+  return Math.max(1, Math.round(value));
 }
 
 function assertValidDocument(document: LayerDocument) {
@@ -717,6 +836,14 @@ function escapeText(value: string): string {
 
 function escapeAttribute(value: string): string {
   return escapeText(value).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+function escapeCssString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function escapeCssUrl(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n|\r/g, "");
 }
 
 function formatNumber(value: number): string {

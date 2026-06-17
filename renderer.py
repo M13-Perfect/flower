@@ -193,8 +193,16 @@ def render_png(design: BirthFlowerDesign, output_path: Path | str) -> Path:
 
 
 
-def render_document_png(document: Document, output_path: Path | str) -> Path:
-    """按多图层 Document 合成 PNG；这是新架构的最终位图导出入口。"""
+def render_document_png(
+    document: Document, output_path: Path | str, *, background: str = "transparent"
+) -> Path:
+    """按多图层 Document 合成 PNG；这是新架构的最终位图导出入口。
+
+    background:
+      transparent(默认/镂空)——激光雕刻按位图明暗下刀,实心背景会把整块底也刻出来;
+        透明底只保留花/字墨迹,导入 EzCad 雕刻时背景不出刀。
+      white(正常)——填充不透明白底,适合普通查看 / 打印。
+    """
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError as exc:
@@ -203,9 +211,8 @@ def render_document_png(document: Document, output_path: Path | str) -> Path:
         raise ValueError("当前文档没有任何图层，无法导出。")
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # 背景透明:激光雕刻按位图明暗下刀,实心背景(原来的米色)会把整块底也刻出来;
-    # 透明底只保留花/字墨迹,导入 EzCad 雕刻时背景不出刀。
-    canvas = Image.new("RGBA", (document.canvas_width, document.canvas_height), (0, 0, 0, 0))
+    fill = (255, 255, 255, 255) if str(background).strip().casefold() == "white" else (0, 0, 0, 0)
+    canvas = Image.new("RGBA", (document.canvas_width, document.canvas_height), fill)
     # 渲染流程：先清空画布，再按 z_index 从底到顶合成所有 visible 叶子图层（图组已摊平）。
     for layer in document.flat_render_layers():
         if not layer.visible:

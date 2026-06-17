@@ -179,6 +179,65 @@ describe("desktop API client", () => {
     expect(calls[0].init?.method).toBe("GET");
   });
 
+  it("builds a backend font file URL for browser font loading and SVG embedding", () => {
+    const client = createApiClient({
+      baseUrl: "http://127.0.0.1:8765/",
+      fetch: async () => new Response("{}"),
+    });
+
+    expect(client.fontFileUrl("specimen script")).toBe(
+      "http://127.0.0.1:8765/fonts/specimen%20script/file",
+    );
+  });
+
+  it("gets and updates desktop path settings", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      calls.push({ input, init });
+      return new Response(
+        JSON.stringify({
+          assetDirectories: ["C:/assets"],
+          fontDirectories: ["C:/fonts"],
+          outputDirectory: "C:/exports",
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      );
+    };
+
+    const client = createApiClient({
+      baseUrl: "http://127.0.0.1:8765",
+      fetch: fetchImpl,
+    });
+
+    await expect(client.getPathSettings()).resolves.toMatchObject({
+      assetDirectories: ["C:/assets"],
+      fontDirectories: ["C:/fonts"],
+      outputDirectory: "C:/exports",
+    });
+    await expect(
+      client.updatePathSettings({
+        assetDirectories: ["D:/materials"],
+        fontDirectories: ["D:/fonts"],
+        outputDirectory: "D:/exports",
+      }),
+    ).resolves.toMatchObject({ outputDirectory: "C:/exports" });
+
+    expect(String(calls[0].input)).toBe("http://127.0.0.1:8765/settings/paths");
+    expect(calls[0].init?.method).toBe("GET");
+    expect(String(calls[1].input)).toBe("http://127.0.0.1:8765/settings/paths");
+    expect(calls[1].init?.method).toBe("PUT");
+    expect(calls[1].init?.body).toBe(
+      JSON.stringify({
+        assetDirectories: ["D:/materials"],
+        fontDirectories: ["D:/fonts"],
+        outputDirectory: "D:/exports",
+      }),
+    );
+  });
+
   it("posts order notes to the backend parser", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const fetchImpl: typeof fetch = async (input, init) => {
@@ -333,6 +392,7 @@ describe("desktop API client", () => {
         svg: "<svg></svg>",
         pngDataUrl: "data:image/png;base64,abc",
         dxfContentBase64: "ZA==",
+        outputDirectory: "C:/exports",
       }),
     ).resolves.toMatchObject({ outputDir: "outputs/Lacey" });
     expect(String(calls[0].input)).toBe("http://127.0.0.1:8765/outputs/save");
@@ -344,6 +404,7 @@ describe("desktop API client", () => {
         svg: "<svg></svg>",
         pngDataUrl: "data:image/png;base64,abc",
         dxfContentBase64: "ZA==",
+        outputDirectory: "C:/exports",
       }),
     );
   });

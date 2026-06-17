@@ -69,6 +69,12 @@ export interface FontGlyphsResponse {
   glyphCount: number;
 }
 
+export interface PathSettings {
+  assetDirectories: string[];
+  fontDirectories: string[];
+  outputDirectory?: string | null;
+}
+
 export interface FlowerChoice {
   choice: number;
   name: string;
@@ -139,6 +145,7 @@ export interface SaveOutputsRequest {
   svg: string;
   pngDataUrl: string;
   dxfContentBase64?: string | null;
+  outputDirectory?: string | null;
 }
 
 export interface SavedOutputFile {
@@ -188,6 +195,27 @@ export function createApiClient(options: ApiClientOptions = {}) {
         fetchImpl,
         `${baseUrl}/fonts/${encodeURIComponent(fontId)}/glyphs`,
         "Font glyph scan failed",
+      );
+    },
+
+    fontFileUrl(fontId: string): string {
+      return `${baseUrl}/fonts/${encodeURIComponent(fontId)}/file`;
+    },
+
+    async getPathSettings(): Promise<PathSettings> {
+      return requestJson<PathSettings>(
+        fetchImpl,
+        `${baseUrl}/settings/paths`,
+        "Path settings load failed",
+      );
+    },
+
+    async updatePathSettings(request: PathSettings): Promise<PathSettings> {
+      return putJson<PathSettings>(
+        fetchImpl,
+        `${baseUrl}/settings/paths`,
+        request,
+        "Path settings update failed",
       );
     },
 
@@ -258,6 +286,28 @@ async function postJson<T>(
 ): Promise<T> {
   const response = await fetchImpl(url, {
     method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new ApiError(`${failureMessage} with HTTP ${response.status}`, response.status);
+  }
+
+  return (await response.json()) as T;
+}
+
+async function putJson<T>(
+  fetchImpl: typeof globalThis.fetch,
+  url: string,
+  body: unknown,
+  failureMessage: string,
+): Promise<T> {
+  const response = await fetchImpl(url, {
+    method: "PUT",
     headers: {
       accept: "application/json",
       "content-type": "application/json",

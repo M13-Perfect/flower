@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Canvas,
   FabricImage,
@@ -10,7 +10,7 @@ import {
   type FabricObject,
 } from "fabric";
 
-import type { LayerDocument } from "@flower/design-core";
+import type { CanvasSpec, LayerDocument } from "@flower/design-core";
 import {
   buildTextWithGlyphOverrides,
   isSupportedEditorLayer,
@@ -19,6 +19,8 @@ import {
   type SupportedEditorLayer,
   type SupportedFabricType,
 } from "./layerFabricModel";
+import { constrainCanvasObjectBox } from "./canvasConstraints";
+import { calculateCanvasViewport } from "./canvasViewport";
 
 interface FabricCanvasProps {
   document: LayerDocument;
@@ -51,11 +53,50 @@ export function FabricCanvas({
   const fabricCanvasRef = useRef<Canvas | null>(null);
   const documentRef = useRef(document);
   const hydrateTokenRef = useRef(0);
+  const isHydratingRef = useRef(false);
+  const selectedLayerIdRef = useRef(selectedLayerId);
+  const stageWrapRef = useRef<HTMLDivElement | null>(null);
   const [loadErrors, setLoadErrors] = useState<string[]>([]);
+  const [viewportBounds, setViewportBounds] = useState({ width: 900, height: 680 });
+  const viewport = useMemo(
+    () => calculateCanvasViewport(document.canvas, viewportBounds),
+    [document.canvas, viewportBounds],
+  );
 
   useEffect(() => {
     documentRef.current = document;
   }, [document]);
+
+  useEffect(() => {
+    selectedLayerIdRef.current = selectedLayerId;
+  }, [selectedLayerId]);
+
+  useEffect(() => {
+    const stageWrap = stageWrapRef.current;
+    if (!stageWrap) {
+      return;
+    }
+
+    const updateBounds = () => {
+      const rect = stageWrap.getBoundingClientRect();
+      const viewportHeight =
+        typeof window === "undefined" ? rect.height : Math.max(360, window.innerHeight - 190);
+      setViewportBounds({
+        height: Math.max(320, Math.floor(viewportHeight)),
+        width: Math.max(320, Math.floor(rect.width)),
+      });
+    };
+
+    updateBounds();
+    const resizeObserver = new ResizeObserver(updateBounds);
+    resizeObserver.observe(stageWrap);
+    window.addEventListener("resize", updateBounds);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", updateBounds);
+    };
+  }, []);
 
   useEffect(() => {
     const canvasElement = canvasElementRef.current;
@@ -64,20 +105,30 @@ export function FabricCanvas({
     }
 
     const fabricCanvas = new Canvas(canvasElement, {
-      width: document.canvas.width,
-      height: document.canvas.height,
+      height: viewport.displayHeight,
       preserveObjectStacking: true,
       selection: true,
+      width: viewport.displayWidth,
     });
+    const cleanupNativeDrag = disableNativeCanvasDrag(fabricCanvas);
 
     fabricCanvasRef.current = fabricCanvas;
 
     const notifySelection = () => {
+      if (isHydratingRef.current) {
+        return;
+      }
+
       const activeObject = fabricCanvas.getActiveObject();
       onSelectLayer(isEditorFabricObject(activeObject) ? activeObject.layerId : null);
     };
 
     const notifyDocumentChange = () => {
+      fabricCanvas.getObjects().forEach((object) => {
+        if (isEditorFabricObject(object)) {
+          constrainObjectToCanvas(object, documentRef.current.canvas);
+        }
+      });
       const snapshots = fabricCanvas
         .getObjects()
         .map(createSnapshotFromFabricObject)
@@ -85,17 +136,52 @@ export function FabricCanvas({
       const nextDocument = serializeLayerDocumentFromSnapshots(documentRef.current, snapshots);
       onChangeDocument(nextDocument);
     };
+    const constrainActiveObject = (event: { target?: FabricObject }) => {
+      if (isEditorFabricObject(event.target)) {
+        constrainObjectToCanvas(event.target, documentRef.current.canvas, false);
+        fabricCanvas.requestRenderAll();
+      }
+    };
+    const fitActiveObject = (event: { target?: FabricObject }) => {
+      if (isEditorFabricObject(event.target)) {
+        constrainObjectToCanvas(event.target, documentRef.current.canvas, true);
+        fabricCanvas.requestRenderAll();
+      }
+    };
+    const finishActiveTransform = (event: PointerEvent | MouseEvent) => {
+      if (fabricCanvas.disposed) {
+        return;
+      }
+      if (hasCurrentTransform(fabricCanvas)) {
+        fabricCanvas.endCurrentTransform(event);
+        fabricCanvas.getObjects().forEach((object) => {
+          if (isEditorFabricObject(object)) {
+            constrainObjectToCanvas(object, documentRef.current.canvas);
+          }
+        });
+        fabricCanvas.requestRenderAll();
+      }
+    };
 
     fabricCanvas.on("selection:created", notifySelection);
     fabricCanvas.on("selection:updated", notifySelection);
     fabricCanvas.on("selection:cleared", notifySelection);
+    fabricCanvas.on("object:moving", constrainActiveObject);
+    fabricCanvas.on("object:scaling", fitActiveObject);
     fabricCanvas.on("object:modified", notifyDocumentChange);
+    window.addEventListener("pointerup", finishActiveTransform, true);
+    window.addEventListener("pointercancel", finishActiveTransform, true);
+    window.addEventListener("mouseup", finishActiveTransform, true);
 
     return () => {
+      window.removeEventListener("pointerup", finishActiveTransform, true);
+      window.removeEventListener("pointercancel", finishActiveTransform, true);
+      window.removeEventListener("mouseup", finishActiveTransform, true);
+      cleanupNativeDrag();
       void fabricCanvas.dispose();
       fabricCanvasRef.current = null;
     };
-  }, [document.canvas.height, document.canvas.width, onChangeDocument, onSelectLayer]);
+  }, [onChangeDocument, onSelectLayer]);
 
   useEffect(() => {
     const fabricCanvas = fabricCanvasRef.current;
@@ -110,11 +196,13 @@ export function FabricCanvas({
       .filter(isSupportedEditorLayer)
       .sort((left, right) => left.zIndex - right.zIndex);
 
+    isHydratingRef.current = true;
     fabricCanvas.clear();
     fabricCanvas.setDimensions({
-      width: document.canvas.width,
-      height: document.canvas.height,
+      height: viewport.displayHeight,
+      width: viewport.displayWidth,
     });
+    fabricCanvas.setZoom(viewport.scale);
     fabricCanvas.backgroundColor =
       document.canvas.background.type === "solid" ? document.canvas.background.color : "";
 
@@ -136,11 +224,12 @@ export function FabricCanvas({
 
       const nextObjects = objects.filter((object): object is EditorFabricObject => object !== null);
       fabricCanvas.add(...nextObjects);
-      restoreActiveObject(fabricCanvas, selectedLayerId);
+      restoreActiveObject(fabricCanvas, selectedLayerIdRef.current);
       fabricCanvas.requestRenderAll();
       setLoadErrors(errors);
+      isHydratingRef.current = false;
     });
-  }, [document, selectedLayerId]);
+  }, [document, viewport.displayHeight, viewport.displayWidth, viewport.scale]);
 
   useEffect(() => {
     const fabricCanvas = fabricCanvasRef.current;
@@ -153,7 +242,13 @@ export function FabricCanvas({
   }, [selectedLayerId]);
 
   return (
-    <div className="fabric-stage-wrap">
+    <div className="fabric-stage-wrap" ref={stageWrapRef}>
+      <div className="canvas-meta" role="status">
+        <span>
+          Canvas {document.canvas.width} x {document.canvas.height} {document.canvas.unit}
+        </span>
+        <span>Preview {viewport.zoomLabel}</span>
+      </div>
       <div className="fabric-stage">
         <canvas ref={canvasElementRef} />
       </div>
@@ -166,6 +261,59 @@ export function FabricCanvas({
       ) : null}
     </div>
   );
+}
+
+function constrainObjectToCanvas(
+  object: EditorFabricObject,
+  canvas: CanvasSpec,
+  scaleToFit = true,
+) {
+  const next = constrainCanvasObjectBox(
+    canvas,
+    {
+      fitScaleX: object.fitScaleX,
+      fitScaleY: object.fitScaleY,
+      left: object.left ?? 0,
+      modelHeight: object.modelHeight,
+      modelWidth: object.modelWidth,
+      scaleX: positiveDimension(object.scaleX),
+      scaleY: positiveDimension(object.scaleY),
+      top: object.top ?? 0,
+    },
+    { scaleToFit },
+  );
+
+  object.set({
+    left: next.left,
+    scaleX: next.scaleX,
+    scaleY: next.scaleY,
+    top: next.top,
+  });
+  object.setCoords();
+}
+
+function hasCurrentTransform(fabricCanvas: Canvas): boolean {
+  return Boolean((fabricCanvas as unknown as { _currentTransform?: unknown })._currentTransform);
+}
+
+function preventNativeCanvasDrag(event: DragEvent) {
+  event.preventDefault();
+}
+
+function disableNativeCanvasDrag(fabricCanvas: Canvas): () => void {
+  const canvases = [fabricCanvas.lowerCanvasEl, fabricCanvas.upperCanvasEl].filter(
+    (canvas): canvas is HTMLCanvasElement => Boolean(canvas),
+  );
+  canvases.forEach((canvas) => {
+    canvas.draggable = false;
+    canvas.addEventListener("dragstart", preventNativeCanvasDrag);
+  });
+
+  return () => {
+    canvases.forEach((canvas) => {
+      canvas.removeEventListener("dragstart", preventNativeCanvasDrag);
+    });
+  };
 }
 
 async function createFabricObjectFromLayer(layer: SupportedEditorLayer): Promise<EditorFabricObject> {

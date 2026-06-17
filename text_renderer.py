@@ -5,8 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from glyph_service import rebuild_render_text
-from models import TextLayer
+from models import TextLayer, layer_text_style
 from text_layout import fit_text_box
+
+# 下划线几何（占字号比例）：粗细与文字底间隙。预览与矢量端用同一组比例，保证一致。
+UNDERLINE_THICKNESS_RATIO = 0.05
+UNDERLINE_GAP_RATIO = 0.12
 
 
 @dataclass(frozen=True)
@@ -91,8 +95,16 @@ class TextRenderer:
             warnings.extend(fit.warnings)
         font = self._load_font(ImageFont, font_path, fit.font_size, warnings)
         fill = self._fill_color(layer)
+        # 字体样式（新增）：加粗=Pillow stroke_width(faux-bold)，下划线=文字下方画线。
+        # 强度按字号等比，stroke=0/underline=False 时与原渲染逐像素一致（现有图层零回归）。
+        style = layer_text_style(layer)
+        stroke = round(style.bold_strength * fit.font_size) if style.bold else 0
+        underline = style.underline
         lines = list(fit.lines) or render_text.splitlines() or [render_text]
-        line_images = [self._render_line(Image, ImageDraw, font, line, fill, tracking) for line in lines]
+        line_images = [
+            self._render_line(Image, ImageDraw, font, line, fill, tracking, stroke, underline, fit.font_size)
+            for line in lines
+        ]
         non_empty_lines = [line_image for line_image in line_images if line_image is not None]
         if not non_empty_lines:
             warnings.append("文本没有可见墨迹：已渲染透明文本图层。")
@@ -130,17 +142,36 @@ class TextRenderer:
         except TypeError:
             return image_font_module.load_default()
 
-    def _render_line(self, image_module, image_draw_module, font, line: str, fill: str, tracking: float):
+    def _render_line(
+        self,
+        image_module,
+        image_draw_module,
+        font,
+        line: str,
+        fill: str,
+        tracking: float,
+        stroke: int = 0,
+        underline: bool = False,
+        font_size: int = 0,
+    ):
         if line == "":
             return None
+        stroke = max(0, int(stroke))
+        ul_th = max(1, round(UNDERLINE_THICKNESS_RATIO * font_size)) if underline and font_size > 0 else 0
+        ul_gap = round(UNDERLINE_GAP_RATIO * font_size) if ul_th else 0
+        extra_bottom = ul_gap + ul_th  # 下划线占用的额外底部高度（无下划线时为 0）
         if abs(tracking) < 0.001:
             probe = image_module.new("RGBA", (1, 1), (0, 0, 0, 0))
             draw = image_draw_module.Draw(probe)
-            bbox = draw.textbbox((0, 0), line, font=font)
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
             width = max(1, int(round(bbox[2] - bbox[0])))
             height = max(1, int(round(bbox[3] - bbox[1])))
-            image = image_module.new("RGBA", (width, height), (0, 0, 0, 0))
-            image_draw_module.Draw(image).text((-bbox[0], -bbox[1]), line, font=font, fill=fill)
+            image = image_module.new("RGBA", (width, height + extra_bottom), (0, 0, 0, 0))
+            line_draw = image_draw_module.Draw(image)
+            line_draw.text((-bbox[0], -bbox[1]), line, font=font, fill=fill, stroke_width=stroke, stroke_fill=fill)
+            if ul_th:
+                y0 = height + ul_gap
+                line_draw.rectangle([0, y0, width - 1, y0 + ul_th - 1], fill=fill)
             cropped = image.getbbox()
             return image.crop(cropped) if cropped else None
 
@@ -151,7 +182,7 @@ class TextRenderer:
         left = top = 10**9
         right = bottom = -10**9
         for char in line:
-            bbox = draw.textbbox((cursor, 0), char, font=font)
+            bbox = draw.textbbox((cursor, 0), char, font=font, stroke_width=stroke)
             positions.append((char, cursor, bbox))
             left = min(left, bbox[0])
             top = min(top, bbox[1])
@@ -160,10 +191,15 @@ class TextRenderer:
             cursor += float(draw.textlength(char, font=font)) + tracking
         if right <= left or bottom <= top:
             return None
-        image = image_module.new("RGBA", (max(1, int(round(right - left))), max(1, int(round(bottom - top)))), (0, 0, 0, 0))
+        width = max(1, int(round(right - left)))
+        height = max(1, int(round(bottom - top)))
+        image = image_module.new("RGBA", (width, height + extra_bottom), (0, 0, 0, 0))
         line_draw = image_draw_module.Draw(image)
         for char, cursor, _bbox in positions:
-            line_draw.text((cursor - left, -top), char, font=font, fill=fill)
+            line_draw.text((cursor - left, -top), char, font=font, fill=fill, stroke_width=stroke, stroke_fill=fill)
+        if ul_th:
+            y0 = height + ul_gap
+            line_draw.rectangle([0, y0, width - 1, y0 + ul_th - 1], fill=fill)
         cropped = image.getbbox()
         return image.crop(cropped) if cropped else None
 

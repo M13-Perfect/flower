@@ -1,12 +1,23 @@
 # CURRENT_TASKS — flower
 
 > 配 `PROJECT_INDEX.md` 一起读。导出/EzCad 细节看 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
-> 更新：2026-06-15。
+> 更新：2026-06-17。
 
 ## 测试基线
 
 `PYTHONPATH=".;services\api" .\.venv-win\Scripts\python.exe -m pytest tests services/api/tests -q`
 → **358 passed, 0 failed**（2026-06-15 Phase 2 增量 1-5 全部完成后）。ruff clean。
+
+## 本轮（2026-06-17）决策：操作员全权 + 仅「提示词配置」加密码（纯桌面端继续，web 暂缓）
+
+用户拍板：**继续开发纯桌面端**（Tkinter），**web 迁移暂缓**（仅远程/多地操作员才重启）。设计详见 `docs/superpowers/plans/2026-06-17-operator-admin-role-split.md`。
+- **唯一上锁 = 「提示词配置」**（背景提示词 + 提取/字段规则 + 校验规则，即驱动 AI 识别那块）→ 仅管理员、进它才要**密码**。其余**全部操作权限归操作员**。
+- **启动无登录页**：直接进操作员态（全权）；只有打开提示词配置才弹密码。
+- **操作员（全权）**：粘单→解析→复核字段→画布编辑（选层/移动/缩放/旋转/改字/**加删图层**/换素材）→生成；还含资源库、输出设置、新建产品。画布/本单改动写 document。
+- **换素材 = 只在该图层已绑定的变体内换**（不开放整库挑选）。
+- **实现**：复用现有配置锁 `self._locked_widgets`/`_ctk_card(locked=True)`/`config_locked`（原无密码=P4），本轮**只给「提示词配置」那张卡补密码**（存 hash）；其余控件/画布不入锁。
+- **红线**：锁只盖提示词配置、不盖画布；预览==导出走 `fit_text_box` 不破；改完关 App 重开。
+- 注：若日后想把图层模板默认几何/绑定/输出规则也收回管理员，再收窄即可（低成本）。
 
 ## 本轮（2026-06-14）已完成：Phase 4 产品切换器（方案2 可收/展）
 

@@ -16,6 +16,9 @@ DEFAULT_OUTPUT_PATH = DEFAULT_OUTPUT_DIR / "birth_flower.svg"
 DEFAULT_OUTPUT_FORMATS = ("svg", "dxf")
 SUPPORTED_OUTPUT_FORMATS = {"png", "svg", "dxf"}
 DEFAULT_AI_PROFILE_NAME = "OpenAI default"
+# PNG 底:transparent=镂空(默认,激光雕刻背景不出刀)| white=正常白色实心底(普通查看/打印)。
+DEFAULT_PNG_BACKGROUND = "transparent"
+PNG_BACKGROUND_CHOICES = ("transparent", "white")
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,8 @@ class ProductConfig:
     font_library_dirs: tuple[Path, ...] = ()
     defaults: EngravingLayout = EngravingLayout()
     manual_fields: tuple[str, ...] = ()  # 人工确认字段集；空=用产品默认（Phase 2 UI 消费）
+    extraction_prompt: str = ""  # 「提取提示词」：发给 API 的提取指令（按产品存）
+    background_prompt: str = ""  # 「背景提示词」：附加背景上下文（按产品存）
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,8 @@ class AppConfig:
     font_source: Path = Path("Birthmonth_font.ttf")
     output_path: Path = DEFAULT_OUTPUT_PATH
     output_formats: tuple[str, ...] = DEFAULT_OUTPUT_FORMATS
+    # PNG 导出底:transparent=镂空(默认)| white=正常白底。只影响 PNG,SVG/DXF 不变。
+    png_background: str = DEFAULT_PNG_BACKGROUND
     ai_profiles: tuple[AIProfile, ...] = (AIProfile(),)
     active_ai_profile: str = DEFAULT_AI_PROFILE_NAME
     layout_defaults: EngravingLayout = EngravingLayout()
@@ -94,6 +101,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         font_source=Path(_string_value(payload, "font_source", str(AppConfig().font_source))),
         output_path=normalize_output_path(_string_value(payload, "output_path", str(AppConfig().output_path))),
         output_formats=normalize_output_formats(payload.get("output_formats")),
+        png_background=normalize_png_background(payload.get("png_background")),
         ai_profiles=profiles,
         active_ai_profile=active_profile,
         layout_defaults=_layout_from_payload(payload.get("layout_defaults")),
@@ -112,6 +120,7 @@ def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Pa
         "font_source": str(config.font_source),
         "output_path": str(config.output_path),
         "output_formats": list(normalize_output_formats(config.output_formats)),
+        "png_background": normalize_png_background(config.png_background),
         "ai_profiles": [_ai_profile_to_payload(profile) for profile in config.ai_profiles],
         "active_ai_profile": active_ai_profile(config).name,
         "layout_defaults": _layout_to_payload(config.layout_defaults),
@@ -148,14 +157,23 @@ def _layout_from_payload(payload: Any) -> EngravingLayout:
             values[field] = int(raw)
         except (TypeError, ValueError):
             values[field] = getattr(default, field)
+    # 字体样式（新增）：bool/float 字段，单独解析（不能走上面的 int 转换）。
+    style: dict[str, Any] = {}
+    for flag in ("bold", "underline", "italic"):
+        style[flag] = bool(payload.get(flag, getattr(default, flag)))
+    for fkey in ("bold_strength", "letter_spacing"):
+        try:
+            style[fkey] = float(payload.get(fkey, getattr(default, fkey)))
+        except (TypeError, ValueError):
+            style[fkey] = getattr(default, fkey)
     try:
-        return EngravingLayout(**values)
+        return EngravingLayout(**values, **style)
     except TypeError:
         return default
 
 
-def _layout_to_payload(layout: EngravingLayout) -> dict[str, int]:
-    """把全局默认布局写入配置；只保存数值，不保存任何图层快照。"""
+def _layout_to_payload(layout: EngravingLayout) -> dict[str, Any]:
+    """把全局默认布局写入配置；只保存数值与字体样式，不保存任何图层快照。"""
     return {
         "canvas_width": layout.canvas_width,
         "canvas_height": layout.canvas_height,
@@ -168,6 +186,11 @@ def _layout_to_payload(layout: EngravingLayout) -> dict[str, int]:
         "text_width": layout.text_width,
         "text_height": layout.text_height,
         "text_size": layout.text_size,
+        "bold": layout.bold,
+        "underline": layout.underline,
+        "italic": layout.italic,
+        "bold_strength": layout.bold_strength,
+        "letter_spacing": layout.letter_spacing,
     }
 
 def normalize_output_formats(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
@@ -177,6 +200,12 @@ def normalize_output_formats(values: list[str] | tuple[str, ...] | None) -> tupl
         if item in SUPPORTED_OUTPUT_FORMATS and item not in normalized:
             normalized.append(item)
     return tuple(normalized) or DEFAULT_OUTPUT_FORMATS
+
+
+def normalize_png_background(value: Any) -> str:
+    """PNG 底归一化:仅接受 transparent/white,其它(含 None/旧配置)回落 transparent。"""
+    item = str(value).strip().casefold() if value is not None else ""
+    return item if item in PNG_BACKGROUND_CHOICES else DEFAULT_PNG_BACKGROUND
 
 
 def active_ai_profile(config: AppConfig) -> AIProfile:
@@ -255,6 +284,27 @@ def with_product_library_dirs(
     return replace(config, products=products, flower_dir=flower_dir, font_source=font_source)
 
 
+def with_product_prompts(
+    config: AppConfig,
+    *,
+    extraction_prompt: str,
+    background_prompt: str,
+    product_id: str | None = None,
+) -> AppConfig:
+    """更新指定产品（默认当前激活产品）的「提取提示词」「背景提示词」，返回新配置（不可变）。
+
+    其余产品原样保留。空字符串是合法值（表示未填）。
+    """
+    target_id = product_id or config.active_product_id
+    products = tuple(
+        replace(product, extraction_prompt=extraction_prompt, background_prompt=background_prompt)
+        if product.id == target_id
+        else product
+        for product in config.products
+    )
+    return replace(config, products=products)
+
+
 def _bool_value(payload: dict[str, Any], key: str, default: bool) -> bool:
     value = payload.get(key, default)
     return value if isinstance(value, bool) else default
@@ -295,6 +345,8 @@ def _product_from_payload(payload: dict[str, Any]) -> ProductConfig:
         font_library_dirs=_path_tuple(payload.get("font_library_dirs")),
         defaults=_layout_from_payload(payload.get("defaults")),
         manual_fields=_str_tuple(payload.get("manual_fields")),
+        extraction_prompt=_optional_string_value(payload, "extraction_prompt", ""),
+        background_prompt=_optional_string_value(payload, "background_prompt", ""),
     )
 
 
@@ -306,6 +358,8 @@ def _product_to_payload(product: ProductConfig) -> dict[str, Any]:
         "font_library_dirs": [str(path) for path in product.font_library_dirs],
         "defaults": _layout_to_payload(product.defaults),
         "manual_fields": list(product.manual_fields),
+        "extraction_prompt": product.extraction_prompt,
+        "background_prompt": product.background_prompt,
     }
 
 

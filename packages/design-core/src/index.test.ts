@@ -100,6 +100,26 @@ describe("design-core schemas", () => {
     expect(result.errors).toContain("document.canvas.width must be a positive number");
   });
 
+  it("rejects glyph override control character replacements", () => {
+    const document = createValidDocument() as any;
+    document.layers[0].glyphOverrides = [
+      {
+        index: 0,
+        originalText: "A",
+        replacement: "\n",
+        codepoint: "U+000A",
+        glyphName: "linefeed.alt",
+      },
+    ];
+
+    const result = validateLayerDocument(document);
+
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain(
+      "layers[0].glyphOverrides[0].replacement must not be a Unicode control character",
+    );
+  });
+
   it("rejects old nested transform JSON", () => {
     const document = createValidDocument() as any;
     document.layers[0] = {

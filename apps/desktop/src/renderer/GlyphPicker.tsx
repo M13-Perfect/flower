@@ -92,6 +92,7 @@ export function GlyphPicker({ apiClient, layer, onApplyGlyph }: GlyphPickerProps
   }, [apiClient, selectedFontId]);
 
   const glyphs = glyphsState.status === "ready" ? glyphsState.value : [];
+  const selectedFont = fonts.find((font) => font.id === selectedFontId) ?? null;
   const visibleGlyphs = glyphs.filter((glyph) => {
     if (filter === "pua") {
       return glyph.isPua;
@@ -186,13 +187,23 @@ export function GlyphPicker({ apiClient, layer, onApplyGlyph }: GlyphPickerProps
                     index: selectedIndex,
                     replacement: glyph.char,
                     codepoint: glyph.codepoint ?? undefined,
+                    font: selectedFont
+                      ? {
+                          assetId: selectedFont.id,
+                          fallbackFamilies: ["serif"],
+                          family: selectedFont.familyName,
+                          source: "asset",
+                        }
+                      : undefined,
                     glyphName: glyph.glyphName,
                   });
                 }}
                 title={`${glyph.glyphName}${glyph.codepoint ? ` ${glyph.codepoint}` : ""}`}
                 type="button"
               >
-                <span className="glyph-preview">{glyph.char ?? "gid"}</span>
+                <span className="glyph-preview" style={{ fontFamily: selectedFont?.familyName }}>
+                  {glyph.char ?? "gid"}
+                </span>
                 <span className="glyph-name">{glyph.glyphName}</span>
                 <span className="glyph-code">{glyph.codepoint ?? `#${glyph.glyphId}`}</span>
               </button>

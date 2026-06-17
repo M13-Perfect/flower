@@ -26,3 +26,9 @@ user/
 *.ttf
 *.otf
 新建文本文档.txt
+
+# Dev server logs / temp render output / IDE config / session scratch
+dev-*.log
+tmp_out/
+.idea/
+.claude/session-log.md

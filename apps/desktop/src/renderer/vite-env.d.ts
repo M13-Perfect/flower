@@ -2,6 +2,7 @@
 
 interface Window {
   flowerDesktop?: {
+    chooseDirectory: () => Promise<string | null>;
     platform: string;
   };
 }
