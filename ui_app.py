@@ -856,6 +856,9 @@ class BirthFlowerApp:
         self.layer_underline_var = tk.BooleanVar(value=False)
         self.layer_letter_spacing_var = tk.StringVar(value="0")
         self.preview_canvas: tk.Canvas | None = None
+        self.preview_ruler_x: tk.Canvas | None = None
+        self.preview_ruler_y: tk.Canvas | None = None
+        self._preview_mouse_pos: tuple[int, int] | None = None
         self.remark_text: tk.Text | None = None
         self.confirm_button: ttk.Button | None = None
         self.inline_text_entry: tk.Text | None = None
@@ -1467,8 +1470,21 @@ class BirthFlowerApp:
 
     def _build_preview_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
         panel, body = self._ctk_card(parent, "实时画板")
-        body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        ruler_bg = "#f3f4f6"
+        ruler_border = "#d1d5db"
+        corner = tk.Frame(body, width=44, height=28, bg=ruler_bg, highlightthickness=1, highlightbackground=ruler_border)
+        corner.grid(row=0, column=0, sticky="nsew")
+        self.preview_ruler_x = tk.Canvas(
+            body, height=28, bg=ruler_bg, highlightthickness=1, highlightbackground=ruler_border
+        )
+        self.preview_ruler_x.grid(row=0, column=1, sticky="ew")
+        self.preview_ruler_y = tk.Canvas(
+            body, width=44, bg=ruler_bg, highlightthickness=1, highlightbackground=ruler_border
+        )
+        self.preview_ruler_y.grid(row=1, column=0, sticky="ns")
 
         # 画板保持白底：代表浅色木料，雕刻预览是深灰折线 + 黑墨字，翻黑会看不见。
         self.preview_canvas = tk.Canvas(
@@ -1479,7 +1495,7 @@ class BirthFlowerApp:
             highlightthickness=1,
             highlightbackground=APP_COLORS["border"],
         )
-        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self.preview_canvas.grid(row=1, column=1, sticky="nsew")
         self.preview_canvas.bind("<Button-1>", self._on_canvas_press)
         self.preview_canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.preview_canvas.bind("<Button-3>", self._show_canvas_context_menu)
@@ -1487,6 +1503,8 @@ class BirthFlowerApp:
         self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", lambda _event: self._redraw_preview())
+        self.preview_canvas.bind("<Motion>", self._on_preview_mouse_motion)
+        self.preview_canvas.bind("<Leave>", self._on_preview_mouse_leave)
         self.preview_canvas.bind("<Delete>", lambda _event: self._delete_selected_layer())
         self.preview_canvas.bind("<BackSpace>", lambda _event: self._delete_selected_layer())
         return panel
@@ -4334,6 +4352,7 @@ class BirthFlowerApp:
         except ValueError:
             layout = EngravingLayout()
         scale, offset_x, offset_y = self._preview_transform(layout)
+        self._draw_preview_rulers(layout, scale, offset_x, offset_y)
 
         def sx(value: float) -> float:
             return offset_x + value * scale
@@ -4369,6 +4388,112 @@ class BirthFlowerApp:
         if self.inline_text_entry is not None and not self.inline_text_is_closing:
             self.inline_text_window = None
             self._place_inline_text_editor()
+
+    def _preview_physical_size_mm(self, layout: EngravingLayout) -> tuple[float, float]:
+        """返回当前设计画布对应的物理毫米尺寸；模板不可读时按默认 80mm 宽等比兜底。"""
+        try:
+            phys = load_template_physical_size()
+            return float(phys.width_mm), float(phys.height_mm)
+        except Exception:
+            width_mm = 80.0
+            return width_mm, width_mm * layout.canvas_height / layout.canvas_width
+
+    def _draw_preview_rulers(
+        self,
+        layout: EngravingLayout,
+        scale: float,
+        offset_x: float,
+        offset_y: float,
+    ) -> None:
+        ruler_x = self.preview_ruler_x
+        ruler_y = self.preview_ruler_y
+        canvas = self.preview_canvas
+        if ruler_x is None or ruler_y is None or canvas is None:
+            return
+        ruler_x.delete("all")
+        ruler_y.delete("all")
+        width_px = max(1, canvas.winfo_width())
+        height_px = max(1, canvas.winfo_height())
+        ruler_w = max(1, ruler_x.winfo_width())
+        ruler_h = max(1, ruler_y.winfo_height())
+        outside = "#e5e7eb"
+        active = "#ffffff"
+        tick = "#6b7280"
+        text = "#374151"
+        guide = "#2563eb"
+        ruler_x.create_rectangle(0, 0, ruler_w, 28, fill=outside, outline="")
+        ruler_y.create_rectangle(0, 0, 44, ruler_h, fill=outside, outline="")
+        design_left = offset_x
+        design_top = offset_y
+        design_right = offset_x + layout.canvas_width * scale
+        design_bottom = offset_y + layout.canvas_height * scale
+        ruler_x.create_rectangle(max(0, design_left), 0, min(width_px, design_right), 28, fill=active, outline="")
+        ruler_y.create_rectangle(0, max(0, design_top), 44, min(height_px, design_bottom), fill=active, outline="")
+        width_mm, height_mm = self._preview_physical_size_mm(layout)
+        x_px_per_mm = (layout.canvas_width * scale) / width_mm if width_mm > 0 else 1.0
+        y_px_per_mm = (layout.canvas_height * scale) / height_mm if height_mm > 0 else 1.0
+        x_step = self._ruler_major_step_mm(x_px_per_mm)
+        y_step = self._ruler_major_step_mm(y_px_per_mm)
+        self._draw_horizontal_ruler_ticks(ruler_x, width_mm, x_px_per_mm, x_step, design_left, design_right, tick, text)
+        self._draw_vertical_ruler_ticks(ruler_y, height_mm, y_px_per_mm, y_step, design_top, design_bottom, tick, text)
+        if self._preview_mouse_pos is not None:
+            mx, my = self._preview_mouse_pos
+            if design_left <= mx <= design_right and design_top <= my <= design_bottom:
+                ruler_x.create_line(mx, 0, mx, 28, fill=guide, width=1)
+                ruler_y.create_line(0, my, 44, my, fill=guide, width=1)
+        ruler_x.create_text(6, 15, text="mm", anchor="w", fill="#6b7280", font=("TkDefaultFont", 8))
+        ruler_y.create_text(22, 10, text="mm", anchor="center", fill="#6b7280", font=("TkDefaultFont", 8))
+
+    @staticmethod
+    def _ruler_major_step_mm(px_per_mm: float) -> int:
+        for step in (1, 2, 5, 10, 20, 50, 100):
+            if step * px_per_mm >= 48:
+                return step
+        return 200
+
+    def _draw_horizontal_ruler_ticks(self, canvas, width_mm, px_per_mm, major_step, left, right, tick, text) -> None:
+        minor_step = major_step / 5
+        mark = 0.0
+        while mark <= width_mm + 1e-6:
+            x = left + mark * px_per_mm
+            if left - 1 <= x <= right + 1:
+                is_major = abs((mark / major_step) - round(mark / major_step)) < 1e-6
+                length = 16 if is_major else 8
+                canvas.create_line(x, 28, x, 28 - length, fill=tick)
+                if is_major:
+                    canvas.create_text(x + 2, 3, text=f"{mark:g}", anchor="nw", fill=text, font=("TkDefaultFont", 8))
+            mark += minor_step
+
+    def _draw_vertical_ruler_ticks(self, canvas, height_mm, px_per_mm, major_step, top, bottom, tick, text) -> None:
+        minor_step = major_step / 5
+        mark = 0.0
+        while mark <= height_mm + 1e-6:
+            y = top + mark * px_per_mm
+            if top - 1 <= y <= bottom + 1:
+                is_major = abs((mark / major_step) - round(mark / major_step)) < 1e-6
+                length = 16 if is_major else 8
+                canvas.create_line(44, y, 44 - length, y, fill=tick)
+                if is_major:
+                    canvas.create_text(4, y + 2, text=f"{mark:g}", anchor="nw", fill=text, font=("TkDefaultFont", 8))
+            mark += minor_step
+
+    def _on_preview_mouse_motion(self, event) -> None:
+        self._preview_mouse_pos = (event.x, event.y)
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        self._draw_preview_rulers(layout, scale, offset_x, offset_y)
+
+    def _on_preview_mouse_leave(self, _event) -> None:
+        self._preview_mouse_pos = None
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        self._draw_preview_rulers(layout, scale, offset_x, offset_y)
 
     def _draw_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
         """预览素材图层；每个 ImageLayer 独立绘制，不再读取单一 current_asset。"""
