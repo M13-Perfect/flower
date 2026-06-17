@@ -69,6 +69,10 @@ IMPORTABLE_VECTOR_SUFFIXES = {".svg"}
 IMPORTABLE_BITMAP_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 IMPORTABLE_ASSET_SUFFIXES = IMPORTABLE_VECTOR_SUFFIXES | IMPORTABLE_BITMAP_SUFFIXES
 SINGLE_REMARK_SUFFIXES = {".txt", ".json", ".csv"}
+PREVIEW_ZOOM_MIN = 0.2
+PREVIEW_ZOOM_MAX = 8.0
+PREVIEW_ZOOM_STEP = 1.25
+PREVIEW_WHEEL_PAN_STEP = 60
 # 三态大小写切换:点击循环 默认→大写→小写;影响"识别内容"的输出大小写。
 TEXT_CASE_ORDER = ("default", "upper", "lower")
 TEXT_CASE_LABELS = {"default": "默认", "upper": "大写", "lower": "小写"}
@@ -870,6 +874,11 @@ class BirthFlowerApp:
         self._drag_start: tuple[int, int] | None = None
         self._drag_mode: str = "move"
         self.selected_preview_item: str | None = None
+        # 画板视图状态：默认等比适配；滚轮缩放时只改变视图，不改 Document/export 坐标。
+        self.preview_zoom = 1.0
+        self.preview_pan_x = 0.0
+        self.preview_pan_y = 0.0
+        self.preview_zoom_status_var = tk.StringVar(value=self._preview_zoom_percent_text())
         # 素材下拉框的当前值先作为待添加素材保存；只有点击“添加素材”才真正创建 ImageLayer。
         self.pending_flower_asset_label: str = ""
         # 初始化、刷新列表、解析订单等程序化更新期间，不让控件事件触发业务写入。
@@ -1468,7 +1477,18 @@ class BirthFlowerApp:
     def _build_preview_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
         panel, body = self._ctk_card(parent, "实时画板")
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        status_row = ctk.CTkFrame(body, fg_color="transparent")
+        status_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        status_row.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            status_row,
+            textvariable=self.preview_zoom_status_var,
+            anchor="e",
+            text_color=APP_COLORS["muted"],
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="e")
 
         # 画板保持白底：代表浅色木料，雕刻预览是深灰折线 + 黑墨字，翻黑会看不见。
         self.preview_canvas = tk.Canvas(
@@ -1479,14 +1499,19 @@ class BirthFlowerApp:
             highlightthickness=1,
             highlightbackground=APP_COLORS["border"],
         )
-        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        self.preview_canvas.grid(row=1, column=0, sticky="nsew")
         self.preview_canvas.bind("<Button-1>", self._on_canvas_press)
         self.preview_canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.preview_canvas.bind("<Button-3>", self._show_canvas_context_menu)
-        self.preview_canvas.bind("<Button-2>", self._show_canvas_context_menu)
+        self.preview_canvas.bind("<Button-2>", self._on_canvas_pan_press)
         self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.preview_canvas.bind("<B2-Motion>", self._on_canvas_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self.preview_canvas.bind("<ButtonRelease-2>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", lambda _event: self._redraw_preview())
+        self.preview_canvas.bind("<MouseWheel>", self._on_canvas_mousewheel)
+        self.preview_canvas.bind("<Button-4>", self._on_canvas_mousewheel)
+        self.preview_canvas.bind("<Button-5>", self._on_canvas_mousewheel)
         self.preview_canvas.bind("<Delete>", lambda _event: self._delete_selected_layer())
         self.preview_canvas.bind("<BackSpace>", lambda _event: self._delete_selected_layer())
         return panel
@@ -4327,6 +4352,7 @@ class BirthFlowerApp:
         canvas = self.preview_canvas
         if canvas is None:
             return
+        self._update_preview_zoom_status()
         canvas.delete("all")
         self.preview_text_images.clear()
         try:
@@ -4579,7 +4605,15 @@ class BirthFlowerApp:
     def _draw_debug_rect(self, canvas: tk.Canvas, left: float, top: float, right: float, bottom: float, color: str, sx, sy) -> None:
         canvas.create_rectangle(sx(left), sy(top), sx(right), sy(bottom), outline=color, dash=(4, 3), tags=("debug_bbox",))
 
-    def _preview_transform(self, layout: EngravingLayout) -> tuple[float, float, float]:
+    def _preview_zoom_percent_text(self) -> str:
+        return f"{round(self.preview_zoom * 100)}%"
+
+    def _update_preview_zoom_status(self) -> None:
+        var = getattr(self, "preview_zoom_status_var", None)
+        if var is not None:
+            var.set(self._preview_zoom_percent_text())
+
+    def _preview_base_transform(self, layout: EngravingLayout) -> tuple[float, float, float]:
         canvas = self.preview_canvas
         if canvas is None:
             return 1.0, 0.0, 0.0
@@ -4589,6 +4623,83 @@ class BirthFlowerApp:
         offset_x = (canvas_width - layout.canvas_width * scale) / 2
         offset_y = (canvas_height - layout.canvas_height * scale) / 2
         return scale, offset_x, offset_y
+
+    def _preview_transform(self, layout: EngravingLayout) -> tuple[float, float, float]:
+        """返回 Document→画板屏幕坐标变换；包含用户滚轮缩放和平移偏移。"""
+        base_scale, base_offset_x, base_offset_y = self._preview_base_transform(layout)
+        zoom = max(PREVIEW_ZOOM_MIN, min(PREVIEW_ZOOM_MAX, self.preview_zoom))
+        return (
+            base_scale * zoom,
+            base_offset_x + self.preview_pan_x,
+            base_offset_y + self.preview_pan_y,
+        )
+
+    def _wheel_direction(self, event) -> int:
+        """Normalize wheel direction across Windows/macOS (<MouseWheel>) and Linux/X11 (Button-4/5)."""
+        delta = getattr(event, "delta", 0)
+        if delta:
+            return 1 if delta > 0 else -1
+        if getattr(event, "num", None) == 4:
+            return 1
+        if getattr(event, "num", None) == 5:
+            return -1
+        return 0
+
+    def _wheel_horizontal_pan_requested(self, event) -> bool:
+        """Alt/Shift + wheel: horizontal pan, matching common editor/CAD shortcuts."""
+        state = int(getattr(event, "state", 0) or 0)
+        shift_pressed = bool(state & 0x0001)
+        # Alt is usually Mod1 (0x0008) on Tk/X11; Windows Tk may report extended high bits.
+        alt_pressed = bool(state & 0x0008 or state & 0x20000)
+        return shift_pressed or alt_pressed
+
+    def _on_canvas_mousewheel(self, event) -> str:
+        """以鼠标所在点为中心缩放画板；Alt/Shift+滚轮都可横向平移，模拟 PS/Figma/CAD 手感。"""
+        canvas = self.preview_canvas
+        if canvas is None:
+            return "break"
+        if self.inline_text_entry is not None:
+            self._commit_inline_text_edit()
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+
+        direction = self._wheel_direction(event)
+        if direction == 0:
+            return "break"
+
+        if self._wheel_horizontal_pan_requested(event):
+            # Shift/Alt + 滚轮只移动视口，不改变缩放；方向保持“滚轮向上→内容向右”。
+            self.preview_pan_x += direction * PREVIEW_WHEEL_PAN_STEP
+            canvas.focus_set()
+            self._redraw_preview()
+            return "break"
+
+        old_scale, old_offset_x, old_offset_y = self._preview_transform(layout)
+        if old_scale <= 0:
+            return "break"
+
+        old_zoom = self.preview_zoom
+        factor = PREVIEW_ZOOM_STEP if direction > 0 else 1 / PREVIEW_ZOOM_STEP
+        new_zoom = max(PREVIEW_ZOOM_MIN, min(PREVIEW_ZOOM_MAX, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-9:
+            return "break"
+
+        mouse_x = float(event.x)
+        mouse_y = float(event.y)
+        doc_x = (mouse_x - old_offset_x) / old_scale
+        doc_y = (mouse_y - old_offset_y) / old_scale
+        base_scale, base_offset_x, base_offset_y = self._preview_base_transform(layout)
+        new_scale = base_scale * new_zoom
+        # 关键：让滚轮前鼠标下的 document 点，滚轮后仍在同一个屏幕坐标。
+        self.preview_zoom = new_zoom
+        self.preview_pan_x = mouse_x - doc_x * new_scale - base_offset_x
+        self.preview_pan_y = mouse_y - doc_y * new_scale - base_offset_y
+        self._update_preview_zoom_status()
+        canvas.focus_set()
+        self._redraw_preview()
+        return "break"
 
     def _draw_selection_controls(self, canvas: tk.Canvas, layout: EngravingLayout, sx, sy) -> None:
         if self.inline_text_entry is not None:
@@ -4865,8 +4976,45 @@ class BirthFlowerApp:
         self._refresh_layers_panel()
         self._redraw_preview()
 
+    def _on_canvas_pan_press(self, event) -> str:
+        """鼠标中键按住后拖动平移画板；不改变图层选择和导出坐标。"""
+        canvas = self.preview_canvas
+        if canvas is None:
+            return "break"
+        if self.inline_text_entry is not None:
+            self._commit_inline_text_edit()
+        self._drag_target = None
+        self._drag_mode = "pan"
+        self._drag_start = (event.x, event.y)
+        self._set_preview_cursor("fleur")
+        canvas.focus_set()
+        return "break"
+
+    def _set_preview_cursor(self, cursor: str) -> None:
+        canvas = self.preview_canvas
+        if canvas is None:
+            return
+        try:
+            canvas.configure(cursor=cursor)
+        except tk.TclError:
+            pass
+
+    def _pan_preview_by(self, dx: float, dy: float) -> None:
+        """Move only the viewport in screen pixels; document/export coordinates stay unchanged."""
+        self.preview_pan_x += dx
+        self.preview_pan_y += dy
+
     def _on_canvas_drag(self, event) -> None:
-        if self._drag_target is None or self._drag_start is None:
+        if self._drag_start is None:
+            return
+        screen_dx = event.x - self._drag_start[0]
+        screen_dy = event.y - self._drag_start[1]
+        self._drag_start = (event.x, event.y)
+        if self._drag_mode == "pan":
+            self._pan_preview_by(screen_dx, screen_dy)
+            self._redraw_preview()
+            return
+        if self._drag_target is None:
             return
         layer = self.document.layer_by_id(self._drag_target)
         if layer is None or layer.locked:
@@ -4876,9 +5024,8 @@ class BirthFlowerApp:
         except ValueError:
             return
         scale, _offset_x, _offset_y = self._preview_transform(layout)
-        dx = (event.x - self._drag_start[0]) / scale
-        dy = (event.y - self._drag_start[1]) / scale
-        self._drag_start = (event.x, event.y)
+        dx = screen_dx / scale
+        dy = screen_dy / scale
         if self._drag_mode == "resize":
             if isinstance(layer, TextLayer):
                 CanvasTextItem(layer).resize_by(dx, dy)
@@ -4896,6 +5043,9 @@ class BirthFlowerApp:
     def _on_canvas_release(self, _event) -> None:
         self._drag_target = None
         self._drag_start = None
+        if self._drag_mode == "pan":
+            self._set_preview_cursor("")
+        self._drag_mode = "move"
 
 
 def _preview_text_ink_image(text: str, font_size: int, font_path: Path | None):
