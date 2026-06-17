@@ -193,6 +193,11 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         assert app.preview_canvas.bind("<Button-5>")
         assert app.preview_canvas.bind("<Delete>")
         assert app.preview_canvas.bind("<BackSpace>")
+        assert app.preview_canvas.bind("<Motion>")
+        assert app.preview_canvas.bind("<Leave>")
+        assert app.preview_ruler_x is not None
+        assert app.preview_ruler_y is not None
+        assert app.preview_ruler_corner is not None
         # 菜单已迁到数据驱动的自绘 CtkMenu；直接校验 app._menus 的数据结构。
         menus = dict(app._menus)
         assert list(menus) == ["文件", "编辑", "查看", "帮助"]
@@ -249,6 +254,23 @@ def test_preview_mousewheel_zoom_keeps_mouse_anchor():
     finally:
         root.destroy()
 
+
+def test_preview_ruler_interval_uses_readable_mm_steps_without_display():
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+
+    assert app._ruler_interval_mm(100) == pytest.approx(1)
+    assert app._ruler_interval_mm(10) == pytest.approx(10)
+    assert app._ruler_interval_mm(1) == pytest.approx(100)
+
+
+def test_preview_physical_size_mm_falls_back_to_scaled_80mm_without_display(monkeypatch):
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    layout = ui_app_module.EngravingLayout(canvas_width=1600, canvas_height=800)
+    monkeypatch.setattr(
+        ui_app_module, "load_template_physical_size", lambda: (_ for _ in ()).throw(RuntimeError("missing"))
+    )
+
+    assert app._template_physical_size_mm(layout) == pytest.approx((80.0, 40.0))
 
 def test_preview_zoom_status_text_updates_without_display():
     class FakeVar:
