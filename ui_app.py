@@ -73,6 +73,10 @@ PREVIEW_ZOOM_MIN = 0.2
 PREVIEW_ZOOM_MAX = 8.0
 PREVIEW_ZOOM_STEP = 1.25
 PREVIEW_WHEEL_PAN_STEP = 60
+RULER_THICKNESS = 28
+RULER_TICK_COLOR = "#b7bec8"
+RULER_TEXT_COLOR = "#4b5563"
+RULER_GUIDE_COLOR = "#3a7afe"
 # 三态大小写切换:点击循环 默认→大写→小写;影响"识别内容"的输出大小写。
 TEXT_CASE_ORDER = ("default", "upper", "lower")
 TEXT_CASE_LABELS = {"default": "默认", "upper": "大写", "lower": "小写"}
@@ -860,6 +864,10 @@ class BirthFlowerApp:
         self.layer_underline_var = tk.BooleanVar(value=False)
         self.layer_letter_spacing_var = tk.StringVar(value="0")
         self.preview_canvas: tk.Canvas | None = None
+        self.preview_ruler_corner: tk.Canvas | None = None
+        self.preview_ruler_x: tk.Canvas | None = None
+        self.preview_ruler_y: tk.Canvas | None = None
+        self.preview_pointer: tuple[float, float] | None = None
         self.remark_text: tk.Text | None = None
         self.confirm_button: ttk.Button | None = None
         self.inline_text_entry: tk.Text | None = None
@@ -1491,15 +1499,31 @@ class BirthFlowerApp:
         ).grid(row=0, column=0, sticky="e")
 
         # 画板保持白底：代表浅色木料，雕刻预览是深灰折线 + 黑墨字，翻黑会看不见。
+        # 上/左刻度尺固定显示物理 mm，跟随同一个 document→screen 变换。
+        ruler_frame = tk.Frame(body, bg="white", highlightthickness=1, highlightbackground=APP_COLORS["border"])
+        ruler_frame.grid(row=1, column=0, sticky="nsew")
+        ruler_frame.columnconfigure(1, weight=1)
+        ruler_frame.rowconfigure(1, weight=1)
+        self.preview_ruler_corner = tk.Canvas(
+            ruler_frame, width=RULER_THICKNESS, height=RULER_THICKNESS, bg="#f8fafc", highlightthickness=0
+        )
+        self.preview_ruler_corner.grid(row=0, column=0, sticky="nsew")
+        self.preview_ruler_x = tk.Canvas(
+            ruler_frame, height=RULER_THICKNESS, bg="#f8fafc", highlightthickness=0
+        )
+        self.preview_ruler_x.grid(row=0, column=1, sticky="ew")
+        self.preview_ruler_y = tk.Canvas(
+            ruler_frame, width=RULER_THICKNESS, bg="#f8fafc", highlightthickness=0
+        )
+        self.preview_ruler_y.grid(row=1, column=0, sticky="ns")
         self.preview_canvas = tk.Canvas(
-            body,
+            ruler_frame,
             width=720,
             height=532,
             bg="white",
-            highlightthickness=1,
-            highlightbackground=APP_COLORS["border"],
+            highlightthickness=0,
         )
-        self.preview_canvas.grid(row=1, column=0, sticky="nsew")
+        self.preview_canvas.grid(row=1, column=1, sticky="nsew")
         self.preview_canvas.bind("<Button-1>", self._on_canvas_press)
         self.preview_canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.preview_canvas.bind("<Button-3>", self._show_canvas_context_menu)
@@ -1509,6 +1533,8 @@ class BirthFlowerApp:
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.preview_canvas.bind("<ButtonRelease-2>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", lambda _event: self._redraw_preview())
+        self.preview_canvas.bind("<Motion>", self._on_canvas_motion)
+        self.preview_canvas.bind("<Leave>", self._on_canvas_leave)
         self.preview_canvas.bind("<MouseWheel>", self._on_canvas_mousewheel)
         self.preview_canvas.bind("<Button-4>", self._on_canvas_mousewheel)
         self.preview_canvas.bind("<Button-5>", self._on_canvas_mousewheel)
@@ -3348,15 +3374,15 @@ class BirthFlowerApp:
 
     def _bind_layer_menu(self, widget, layer) -> None:
         """递归把右键/中键弹层菜单绑到整行（含 CTkOptionMenu 内部控件）——右键图层即打开其功能菜单。"""
-        widget.bind("<Button-3>", lambda e, l=layer: self._layer_menu(l, e))
-        widget.bind("<Button-2>", lambda e, l=layer: self._layer_menu(l, e))
+        widget.bind("<Button-3>", lambda e, layer_ref=layer: self._layer_menu(layer_ref, e))
+        widget.bind("<Button-2>", lambda e, layer_ref=layer: self._layer_menu(layer_ref, e))
         for child in widget.winfo_children():
             self._bind_layer_menu(child, layer)
 
     def _lib_label_for_id(self, libraries, library_id: str) -> str:
         if not library_id:
             return ""
-        lib = next((l for l in libraries if l.id == library_id), None)
+        lib = next((library for library in libraries if library.id == library_id), None)
         return self._library_label(lib) if lib is not None else ""
 
     def _flower_label_for_layer(self, layer) -> str:
@@ -3439,7 +3465,7 @@ class BirthFlowerApp:
         # 拖柄：按住拖动调序（仅此控件触发拖动，避免和整行左键选中冲突）。
         handle = ctk.CTkLabel(line, text="⠿", text_color=APP_COLORS["muted"], width=12, cursor="fleur")
         handle.grid(row=0, column=0, padx=(0, 4))
-        handle.bind("<ButtonPress-1>", lambda e, l=layer: self._layer_drag_start(l, e))
+        handle.bind("<ButtonPress-1>", lambda e, layer_ref=layer: self._layer_drag_start(layer_ref, e))
         handle.bind("<B1-Motion>", self._layer_drag_motion)
         handle.bind("<ButtonRelease-1>", self._layer_drag_release)
         row["handle"] = handle
@@ -3465,7 +3491,7 @@ class BirthFlowerApp:
         row["dim"] = dim
         # 左键整行选中（拖柄除外）；右键整行（含子控件）弹功能菜单——像桌面右键图标，此处图标换成一行图层。
         for area in (card, line, icon, status, content, dim):
-            area.bind("<Button-1>", lambda _e, l=layer: self._select_layer_row(l))
+            area.bind("<Button-1>", lambda _e, layer_ref=layer: self._select_layer_row(layer_ref))
         self._bind_layer_menu(card, layer)
         return row
 
@@ -3644,7 +3670,7 @@ class BirthFlowerApp:
             return  # 落回原位，免重排
         order_ids.pop(old_pos)
         order_ids.insert(insert_idx, drag_id)
-        layer_by_id = {l.id: l for l in self.document.layers}
+        layer_by_id = {doc_layer.id: doc_layer for doc_layer in self.document.layers}
         self.document.layers[:] = [layer_by_id[lid] for lid in reversed(order_ids)]  # 列表是 下→上
         self.document.normalize_z_indexes()
         self.status_var.set("图层顺序已更新")
@@ -3655,7 +3681,7 @@ class BirthFlowerApp:
     def _layer_menu(self, layer, event=None) -> None:
         self._select_layer_row(layer)
         menu = tk.Menu(self.root, tearoff=False)
-        menu.add_command(label="位置 / 尺寸…", command=lambda l=layer: self._open_layer_geometry_dialog(l))
+        menu.add_command(label="位置 / 尺寸…", command=lambda layer_ref=layer: self._open_layer_geometry_dialog(layer_ref))
         # 改库 / 改素材或字体：行内不放下拉，统一收进右键菜单（候选来自 active_bundle）。
         if isinstance(layer, ImageLayer):
             lib_labels = list(self._image_lib_by_label)
@@ -3663,14 +3689,14 @@ class BirthFlowerApp:
                 lib_menu = tk.Menu(menu, tearoff=False)
                 for lbl in lib_labels:
                     lib_menu.add_command(label=self._abbrev(lbl, 24),
-                                         command=lambda l=layer, x=lbl: self._on_layer_image_lib_changed(l, x))
+                                         command=lambda layer_ref=layer, x=lbl: self._on_layer_image_lib_changed(layer_ref, x))
                 menu.add_cascade(label="素材库", menu=lib_menu)
             item_labels = list(self.flower_label_map)
             if item_labels:
                 item_menu = tk.Menu(menu, tearoff=False)
                 for lbl in item_labels:
                     item_menu.add_command(label=self._abbrev(lbl, 28),
-                                          command=lambda l=layer, x=lbl: self._on_layer_material_changed(l, x))
+                                          command=lambda layer_ref=layer, x=lbl: self._on_layer_material_changed(layer_ref, x))
                 menu.add_cascade(label="素材", menu=item_menu)
         if isinstance(layer, TextLayer):
             lib_labels = list(self._font_lib_by_label)
@@ -3678,18 +3704,18 @@ class BirthFlowerApp:
                 lib_menu = tk.Menu(menu, tearoff=False)
                 for lbl in lib_labels:
                     lib_menu.add_command(label=self._abbrev(lbl, 24),
-                                         command=lambda l=layer, x=lbl: self._on_layer_font_lib_changed(l, x))
+                                         command=lambda layer_ref=layer, x=lbl: self._on_layer_font_lib_changed(layer_ref, x))
                 menu.add_cascade(label="字体库", menu=lib_menu)
             font_labels = list(self.font_label_map)
             if font_labels:
                 font_menu = tk.Menu(menu, tearoff=False)
                 for lbl in font_labels:
                     font_menu.add_command(label=self._abbrev(lbl, 28),
-                                          command=lambda l=layer, x=lbl: self._on_layer_font_changed(l, x))
+                                          command=lambda layer_ref=layer, x=lbl: self._on_layer_font_changed(layer_ref, x))
                 menu.add_cascade(label="字体", menu=font_menu)
             align_menu = tk.Menu(menu, tearoff=False)
             for key, lbl in (("left", "左对齐"), ("center", "居中"), ("right", "右对齐")):
-                align_menu.add_command(label=lbl, command=lambda l=layer, k=key: self._set_layer_align(l, k))
+                align_menu.add_command(label=lbl, command=lambda layer_ref=layer, k=key: self._set_layer_align(layer_ref, k))
             menu.add_cascade(label="对齐", menu=align_menu)
         menu.add_separator()
         menu.add_command(label="隐藏" if layer.visible else "显示", command=self._toggle_selected_layer_visible)
@@ -4395,6 +4421,146 @@ class BirthFlowerApp:
         if self.inline_text_entry is not None and not self.inline_text_is_closing:
             self.inline_text_window = None
             self._place_inline_text_editor()
+        self._redraw_preview_rulers(layout, scale, offset_x, offset_y)
+
+    def _template_physical_size_mm(self, layout: EngravingLayout) -> tuple[float, float]:
+        """返回当前模板的输出物理尺寸(mm)。读取失败时按既有 DXF 默认宽度 80mm 等比派生高度。"""
+        fallback_width = 80.0
+        fallback_height = (
+            fallback_width * (layout.canvas_height / layout.canvas_width)
+            if layout.canvas_width
+            else fallback_width
+        )
+        try:
+            phys = load_template_physical_size()
+            width = float(phys.width_mm)
+            height = float(phys.height_mm)
+            if width > 0 and height > 0:
+                return width, height
+        except Exception as exc:
+            LOGGER.warning("读取模板物理尺寸失败,刻度尺使用默认尺寸: %s", exc)
+        return fallback_width, fallback_height
+
+    def _ruler_interval_mm(self, px_per_mm: float) -> float:
+        """根据当前缩放选择易读的 mm 主刻度间隔；单位固定 mm。"""
+        if px_per_mm <= 0:
+            return 10.0
+        target_px = 72.0
+        for interval in (1, 2, 5, 10, 20, 50, 100, 200, 500):
+            if interval * px_per_mm >= target_px:
+                return float(interval)
+        return 1000.0
+
+    def _redraw_preview_rulers(
+        self, layout: EngravingLayout, scale: float, offset_x: float, offset_y: float
+    ) -> None:
+        x_ruler = self.preview_ruler_x
+        y_ruler = self.preview_ruler_y
+        corner = self.preview_ruler_corner
+        canvas = self.preview_canvas
+        if x_ruler is None or y_ruler is None or corner is None or canvas is None:
+            return
+        for ruler in (x_ruler, y_ruler, corner):
+            ruler.delete("all")
+        x_ruler.create_rectangle(
+            0, 0, max(1, x_ruler.winfo_width()), RULER_THICKNESS, fill="#f8fafc", outline=""
+        )
+        y_ruler.create_rectangle(
+            0, 0, RULER_THICKNESS, max(1, y_ruler.winfo_height()), fill="#f8fafc", outline=""
+        )
+        corner.create_rectangle(0, 0, RULER_THICKNESS, RULER_THICKNESS, fill="#eef2f7", outline="")
+        corner.create_text(
+            RULER_THICKNESS - 4,
+            RULER_THICKNESS - 5,
+            text="mm",
+            anchor="se",
+            fill=RULER_TEXT_COLOR,
+            font=("TkDefaultFont", 8),
+        )
+
+        phys_w, phys_h = self._template_physical_size_mm(layout)
+        doc_per_mm_x = layout.canvas_width / phys_w if phys_w else 1.0
+        doc_per_mm_y = layout.canvas_height / phys_h if phys_h else 1.0
+        px_per_mm_x = scale * doc_per_mm_x
+        px_per_mm_y = scale * doc_per_mm_y
+        major_x = self._ruler_interval_mm(px_per_mm_x)
+        major_y = self._ruler_interval_mm(px_per_mm_y)
+        minor_x = major_x / 5.0
+        minor_y = major_y / 5.0
+        self._draw_horizontal_ruler_ticks(x_ruler, offset_x, scale, doc_per_mm_x, phys_w, major_x, minor_x)
+        self._draw_vertical_ruler_ticks(y_ruler, offset_y, scale, doc_per_mm_y, phys_h, major_y, minor_y)
+        self._draw_ruler_guides(layout, scale, offset_x, offset_y)
+
+    def _draw_horizontal_ruler_ticks(
+        self, ruler: tk.Canvas, offset_x: float, scale: float, doc_per_mm: float, max_mm: float, major: float, minor: float
+    ) -> None:
+        width = max(1, ruler.winfo_width())
+        left = max(0.0, offset_x)
+        right = min(float(width), offset_x + max_mm * doc_per_mm * scale)
+        if right > left:
+            ruler.create_rectangle(left, 0, right, RULER_THICKNESS, fill="#ffffff", outline="")
+        ruler.create_line(left, RULER_THICKNESS - 1, right, RULER_THICKNESS - 1, fill="#cbd5e1")
+        tick = 0.0
+        while tick <= max_mm + 1e-6:
+            x = offset_x + tick * doc_per_mm * scale
+            if 0 <= x <= width:
+                is_major = abs((tick / major) - round(tick / major)) < 1e-6
+                length = 13 if is_major else 7
+                color = RULER_TICK_COLOR if is_major else "#d5dae2"
+                ruler.create_line(x, RULER_THICKNESS, x, RULER_THICKNESS - length, fill=color)
+                if is_major:
+                    ruler.create_text(
+                        x + 2,
+                        4,
+                        text=f"{int(round(tick))}",
+                        anchor="nw",
+                        fill=RULER_TEXT_COLOR,
+                        font=("TkDefaultFont", 8),
+                    )
+            tick += minor
+
+    def _draw_vertical_ruler_ticks(
+        self, ruler: tk.Canvas, offset_y: float, scale: float, doc_per_mm: float, max_mm: float, major: float, minor: float
+    ) -> None:
+        height = max(1, ruler.winfo_height())
+        top = max(0.0, offset_y)
+        bottom = min(float(height), offset_y + max_mm * doc_per_mm * scale)
+        if bottom > top:
+            ruler.create_rectangle(0, top, RULER_THICKNESS, bottom, fill="#ffffff", outline="")
+        ruler.create_line(RULER_THICKNESS - 1, top, RULER_THICKNESS - 1, bottom, fill="#cbd5e1")
+        tick = 0.0
+        while tick <= max_mm + 1e-6:
+            y = offset_y + tick * doc_per_mm * scale
+            if 0 <= y <= height:
+                is_major = abs((tick / major) - round(tick / major)) < 1e-6
+                length = 13 if is_major else 7
+                color = RULER_TICK_COLOR if is_major else "#d5dae2"
+                ruler.create_line(RULER_THICKNESS, y, RULER_THICKNESS - length, y, fill=color)
+                if is_major:
+                    ruler.create_text(
+                        4,
+                        y + 2,
+                        text=f"{int(round(tick))}",
+                        anchor="nw",
+                        fill=RULER_TEXT_COLOR,
+                        font=("TkDefaultFont", 8),
+                    )
+            tick += minor
+
+    def _draw_ruler_guides(self, layout: EngravingLayout, scale: float, offset_x: float, offset_y: float) -> None:
+        if self.preview_pointer is None or self.preview_ruler_x is None or self.preview_ruler_y is None:
+            return
+        x, y = self.preview_pointer
+        in_doc_x = offset_x <= x <= offset_x + layout.canvas_width * scale
+        in_doc_y = offset_y <= y <= offset_y + layout.canvas_height * scale
+        if in_doc_x:
+            self.preview_ruler_x.create_line(
+                x, 0, x, RULER_THICKNESS, fill=RULER_GUIDE_COLOR, width=2, tags=("ruler_guide",)
+            )
+        if in_doc_y:
+            self.preview_ruler_y.create_line(
+                0, y, RULER_THICKNESS, y, fill=RULER_GUIDE_COLOR, width=2, tags=("ruler_guide",)
+            )
 
     def _draw_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
         """预览素材图层；每个 ImageLayer 独立绘制，不再读取单一 current_asset。"""
@@ -4652,6 +4818,24 @@ class BirthFlowerApp:
         # Alt is usually Mod1 (0x0008) on Tk/X11; Windows Tk may report extended high bits.
         alt_pressed = bool(state & 0x0008 or state & 0x20000)
         return shift_pressed or alt_pressed
+
+    def _on_canvas_motion(self, event) -> None:
+        self.preview_pointer = (float(event.x), float(event.y))
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        self._redraw_preview_rulers(layout, scale, offset_x, offset_y)
+
+    def _on_canvas_leave(self, _event) -> None:
+        self.preview_pointer = None
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        scale, offset_x, offset_y = self._preview_transform(layout)
+        self._redraw_preview_rulers(layout, scale, offset_x, offset_y)
 
     def _on_canvas_mousewheel(self, event) -> str:
         """以鼠标所在点为中心缩放画板；Alt/Shift+滚轮都可横向平移，模拟 PS/Figma/CAD 手感。"""
