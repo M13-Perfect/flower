@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
-from gpt_parser import parse_order_remark_with_gpt
-from local_order_parser import parse_order_remark_local
+from gpt_parser import parse_order_remark_with_gpt, parse_orders_with_gpt
+# 本地规则已停用（全局 AI 对齐），保留可恢复：
+# from local_order_parser import parse_order_remark_local
 from models import AIParseConfig, ParseResult
 from order_catalog import LibraryBundle, enrich_parse_result
 
 
 Parser = Callable[..., ParseResult]
 LocalParser = Callable[[str], ParseResult]
+OrdersParser = Callable[..., list[ParseResult]]
+
+# 订单块第一行的「订单号」：≥6 位数字，可带 xN 数量后缀（如 29972194015x1）。
+_ORDER_NUMBER_RE = re.compile(r"^\s*(\d{6,})\s*(?:[xX]\s*(\d+))?\s*$")
 
 
 def parse_order_remark_auto(
@@ -23,12 +29,103 @@ def parse_order_remark_auto(
 ) -> ParseResult:
     """根据配置选择解析顺序；若传入 bundle（产品素材/字体库），再把结果落到具体素材/字体 key。
 
-    不传 bundle 时行为与旧版完全一致（向后兼容，现有调用/测试不受影响）。
+    **全局使用 AI 解析**：本地回退已停用（见 _resolve_order_remark）；传/不传 bundle 仅决定是否富化落素材。
     """
     result = _resolve_order_remark(remark, gpt_parser, local_parser, ai_config)
     if bundle is not None:
         result = enrich_parse_result(result, bundle)
     return result
+
+
+def parse_orders_auto(
+    remark: str,
+    *,
+    ai_config: AIParseConfig | None = None,
+    bundle: LibraryBundle | None = None,
+    gpt_orders_parser: OrdersParser | None = None,
+    local_parser: LocalParser | None = None,
+) -> list[ParseResult]:
+    """多订单识别：一次粘贴可含多笔订单，返回 ParseResult 列表（每笔一条）。
+
+    **全局使用 AI 解析**（用户要求）：始终走多订单 GPT，不受「AI 优先」开关影响；
+    AI 失败直接抛错由 UI 提示，**不再静默回退本地规则**。传入 bundle 时每条再富化落素材/字体 key。
+    本地兜底代码（_local_orders / split_order_blocks / _should_prefer_ai 门控）已注释停用、保留可恢复。
+    """
+    gpt = gpt_orders_parser or parse_orders_with_gpt
+    # 本地规则已停用：注释掉本地解析器与按块兜底，全局只用 AI。
+    # local = local_parser or parse_order_remark_local
+
+    results = [r for r in _call_orders_gpt(gpt, remark, ai_config) if r is not None]
+    # if _should_prefer_ai(ai_config):
+    #     try:
+    #         results = [r for r in _call_orders_gpt(gpt, remark, ai_config) if r is not None]
+    #     except Exception:
+    #         results = []
+    # if not results:
+    #     results = _local_orders(remark, local)
+
+    if bundle is not None:
+        results = [enrich_parse_result(result, bundle) for result in results]
+    return results
+
+
+def _call_orders_gpt(
+    gpt: OrdersParser, remark: str, ai_config: AIParseConfig | None
+) -> list[ParseResult]:
+    if ai_config is None:
+        return gpt(remark)
+    return gpt(
+        remark,
+        api_key=ai_config.api_key,
+        model=ai_config.model,
+        project=ai_config.project,
+        organization=ai_config.organization,
+        provider=ai_config.provider,
+        base_url=ai_config.base_url,
+        system_prompt=ai_config.system_prompt,
+        background_prompt=ai_config.background_prompt,
+        timeout=ai_config.timeout,
+    )
+
+
+def _local_orders(remark: str, local: LocalParser) -> list[ParseResult]:
+    """无 AI 兜底：按订单块切分，逐块走本地规则；单块时与旧行为一致。"""
+    blocks = split_order_blocks(remark)
+    if len(blocks) <= 1:
+        result = local(remark)
+        number = blocks[0][0] if blocks else ""
+        if number and not result.order_number:
+            result = replace(result, order_number=number)
+        return [result]
+    results: list[ParseResult] = []
+    for order_number, quantity, block_text in blocks:
+        result = local(block_text)
+        patch: dict[str, Any] = {}
+        if order_number and not result.order_number:
+            patch["order_number"] = order_number
+        if quantity and result.quantity == 1:
+            patch["quantity"] = quantity
+        results.append(replace(result, **patch) if patch else result)
+    return results
+
+
+def split_order_blocks(remark: str) -> list[tuple[str, int, str]]:
+    """把多笔订单文本按空行切块；每块第一行若是订单号则提取。返回 [(order_number, quantity, block_text)]。"""
+    blocks: list[tuple[str, int, str]] = []
+    for raw in re.split(r"\n\s*\n", remark.strip()):
+        if not raw.strip():
+            continue
+        order_number = ""
+        quantity = 1
+        for line in raw.splitlines():
+            match = _ORDER_NUMBER_RE.match(line)
+            if match:
+                order_number = match.group(1)
+                if match.group(2):
+                    quantity = int(match.group(2))
+                break
+        blocks.append((order_number, quantity, raw))
+    return blocks
 
 
 def _resolve_order_remark(
@@ -37,31 +134,40 @@ def _resolve_order_remark(
     local_parser: LocalParser | None = None,
     ai_config: AIParseConfig | None = None,
 ) -> ParseResult:
-    """根据配置选择解析顺序：勾选 AI 优先时先调 API，否则只走本地规则。"""
+    """**全局使用 AI 解析**（用户要求）：始终走 GPT，不受「AI 优先」开关影响；
+    AI 失败直接抛错由 UI 提示，AI 结果不完整返回低置信 + warnings，**不再回退本地规则**。
+    本地兜底（parse_order_remark_local / prefer-AI 门控）已注释停用、保留可恢复。
+    （local_parser 形参仅为签名兼容保留，已不再使用。）
+    """
     gpt = gpt_parser or parse_order_remark_with_gpt
-    local = local_parser or parse_order_remark_local
+    # 本地规则已停用：注释掉本地解析器与回退，全局只用 AI。
+    # local = local_parser or parse_order_remark_local
 
-    if _should_prefer_ai(ai_config):
-        gpt_error = ""
-        try:
-            gpt_result = _call_gpt(gpt, remark, ai_config)
-            if _is_complete(gpt_result):
-                return _success_without_warnings(gpt_result)
-            gpt_error = _incomplete_reason(gpt_result)
-        except Exception as exc:
-            gpt_error = str(exc)
+    gpt_result = _call_gpt(gpt, remark, ai_config)
+    if _is_complete(gpt_result):
+        return _success_without_warnings(gpt_result)
+    return _with_low_parse_confidence(gpt_result, [f"AI解析不完整：{_incomplete_reason(gpt_result)}"])
 
-        local_result = local(remark)
-        if _is_complete(local_result):
-            return _success_without_warnings(local_result)
-        return _combined_failure(local_result, gpt_error)
-
-    # 未勾选 AI 优先时不调用 API，避免慢请求和不必要费用。
-    local_result = local(remark)
-    if _is_complete(local_result):
-        return _success_without_warnings(local_result)
-
-    return _local_failure(local_result)
+    # --- 旧逻辑（AI 优先门控 + 本地回退），保留可恢复 ---
+    # local = local_parser or parse_order_remark_local
+    # if _should_prefer_ai(ai_config):
+    #     gpt_error = ""
+    #     try:
+    #         gpt_result = _call_gpt(gpt, remark, ai_config)
+    #         if _is_complete(gpt_result):
+    #             return _success_without_warnings(gpt_result)
+    #         gpt_error = _incomplete_reason(gpt_result)
+    #     except Exception as exc:
+    #         gpt_error = str(exc)
+    #     local_result = local(remark)
+    #     if _is_complete(local_result):
+    #         return _success_without_warnings(local_result)
+    #     return _combined_failure(local_result, gpt_error)
+    #
+    # local_result = local(remark)
+    # if _is_complete(local_result):
+    #     return _success_without_warnings(local_result)
+    # return _local_failure(local_result)
 
 
 def _should_prefer_ai(ai_config: AIParseConfig | None) -> bool:

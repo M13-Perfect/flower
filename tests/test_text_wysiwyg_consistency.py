@@ -137,3 +137,51 @@ def test_short_single_name_stays_one_line():
 
     fit = fit_text_box("Emma", 520, 420, FONT, personalization_type="name")
     assert len(fit.lines) == 1
+
+
+def _text_layer(doc):
+    from models import TextLayer
+
+    return next(layer for layer in doc.layers if isinstance(layer, TextLayer))
+
+
+def _png_ink_bbox(doc, path):
+    from PIL import Image
+
+    from renderer import render_document_png
+
+    return Image.open(render_document_png(doc, path)).convert("RGBA").getbbox()
+
+
+def _dxf_right_x_canvas(ezdxf, doc, path):
+    from desktop_export import render_document_dxf
+
+    dxf_doc = ezdxf.readfile(str(render_document_dxf(doc, path)))
+    xs: list[float] = []
+    for entity in dxf_doc.modelspace():
+        if entity.dxftype() == "SPLINE":
+            xs.extend(p[0] for p in entity.control_points)
+        elif entity.dxftype() == "POLYLINE":
+            xs.extend(p[0] for p in entity.points())
+    assert xs
+    scale = 80.0 / 1732.0  # DEFAULT_PHYSICAL_WIDTH_MM / canvas_width
+    return max(xs) / scale  # 最右 x，换回 canvas 像素
+
+
+def test_ending_heart_right_edge_matches_preview_and_vector(tmp_path):
+    # 末尾爱心：预览(PNG)与导出(DXF)都比无爱心向右扩，且“最右缘”跨端一致（爱心落点同一）。
+    ezdxf = _require_assets()
+    doc_no = _build_doc("Mia", font_size=190)
+    doc_yes = _build_doc("Mia", font_size=190)
+    _text_layer(doc_yes).ending_heart = True
+
+    png_no = _png_ink_bbox(doc_no, tmp_path / "no.png")
+    png_yes = _png_ink_bbox(doc_yes, tmp_path / "yes.png")
+    assert png_yes[2] > png_no[2] + 10  # 预览右扩（出现爱心）
+
+    rx_no = _dxf_right_x_canvas(ezdxf, doc_no, tmp_path / "no.dxf")
+    rx_yes = _dxf_right_x_canvas(ezdxf, doc_yes, tmp_path / "yes.dxf")
+    assert rx_yes > rx_no + 10  # 矢量右扩（出现爱心）
+
+    # 预览爱心右缘 ≈ 矢量爱心右缘（残差仅来自栅格 vs 轮廓测量）。
+    assert abs(png_yes[2] - rx_yes) < 16

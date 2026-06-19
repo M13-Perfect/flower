@@ -1,8 +1,10 @@
 from __future__ import annotations
 import ctypes
 import dataclasses
+import json
 import logging
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -45,6 +47,7 @@ from glyph_service import (
     build_glyph_catalog,
     check_runtime_dependencies,
     codepoint_to_char,
+    font_uses_symbol_heart,
     normalize_codepoint,
     rebuild_render_text,
     recommended_glyph_variants,
@@ -52,14 +55,27 @@ from glyph_service import (
     resolve_glyph,
 )
 from models import AIParseConfig, BirthFlowerDesign, Document, EngravingLayout, FlowerAsset, FontAsset, ImageLayer, TextLayer, ParseResult, add_image_layer, add_text_layer, delete_layer, hit_test, move_layer
-from order_importer import load_order_remark_from_file
-from parse_pipeline import parse_order_remark_auto
+from order_importer import load_order_from_file, load_order_remark_from_file
+from parse_pipeline import parse_orders_auto
 from order_catalog import LibraryBundle
 from production import ProductionParams, resolve_chain
-from gpt_parser import DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, parse_order_remark_with_gpt
+from gpt_parser import (
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_MODEL,
+    build_orders_system_prompt,
+    parse_order_remark_with_gpt,
+)
 from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_document_png, render_dxf, render_png, render_svg
 from desktop_export import render_document_dxf, render_document_vector_svg
-from text_layout import measure_text_ink_bbox, layout_personalization_text
+from text_layout import (
+    measure_text_ink_bbox,
+    layout_personalization_text,
+    text_box_size_for_font,
+    SAFE_MARGIN_X,
+    SAFE_MARGIN_Y,
+    ENDING_HEART_ADVANCE_RATIO,
+)
 
 
 DEFAULT_FLOWER_DIR = Path("BirthMonth flowers")
@@ -71,8 +87,10 @@ IMPORTABLE_ASSET_SUFFIXES = IMPORTABLE_VECTOR_SUFFIXES | IMPORTABLE_BITMAP_SUFFI
 SINGLE_REMARK_SUFFIXES = {".txt", ".json", ".csv"}
 PREVIEW_ZOOM_MIN = 0.2
 PREVIEW_ZOOM_MAX = 8.0
-PREVIEW_ZOOM_STEP = 1.25
-PREVIEW_WHEEL_PAN_STEP = 60
+PREVIEW_ZOOM_STEP = 0.05  # 每次滚轮线性缩放 5 个百分点：上滚 +0.05，下滚 -0.05
+# 画布内联编辑文字时按墨迹反推文本框用的「不封顶」上限：远大于任何画布，
+# 使 text_box_size_for_font 永不 clamp、字号守恒（框随墨迹自由长大、可越界）。
+UNBOUNDED_BOX_SIZE = 10_000_000.0
 RULER_THICKNESS = 28
 RULER_TICK_COLOR = "#b7bec8"
 RULER_TEXT_COLOR = "#4b5563"
@@ -95,11 +113,9 @@ APP_COLORS = {
     "input": "#2b2b2b",
 }
 # 全局深色外观（CustomTkinter）；模块导入即设定，App 与离线冒烟脚本都生效。
-# 引导解释器没装 ctk（ctk=None）时跳过；_reexec 会切到装了 ctk 的 .venv-win 再真正建 UI。
 if ctk is not None:
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("dark-blue")
-
 # 产品切换列（方案2）收起/展开两种宽度（像素）。
 PRODUCT_RAIL_COLLAPSED_WIDTH = 48
 PRODUCT_RAIL_EXPANDED_WIDTH = 168
@@ -608,8 +624,12 @@ def format_font_asset_label(asset: FontAsset) -> str:
     design = asset.font_design or f"Font {asset.index}"
     size = asset.file_size or _safe_file_size(asset.path)
     size_text = _format_file_size(size)
-    suffix = "含字形" if asset.has_ending_glyphs else "普通"
-    return f"{design} - {asset.name} - {asset.path.name} - {size_text} - {suffix}"
+    # 末尾装饰按真实形态区分：Font 4 是独立爱心 SVG（无字形映射），其余带装饰的是字体内末尾字形。
+    if asset.has_ending_glyphs:
+        ending = "末尾爱心" if font_uses_symbol_heart(design) else "末尾字形"
+    else:
+        ending = "常规"
+    return f"{design} - {asset.name} - {asset.path.name} - {size_text} - {ending}"
 
 
 def output_path_for_format(base_path: Path | str, output_format: str) -> Path:
@@ -617,6 +637,29 @@ def output_path_for_format(base_path: Path | str, output_format: str) -> Path:
     if clean_format not in {"png", "svg", "dxf"}:
         raise ValueError(f"不支持的输出格式：{output_format}")
     return Path(base_path).with_suffix(f".{clean_format}")
+
+
+# Windows 非法文件名字符（含控制符）；保留设备名命中时加下划线避让。
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_FILENAME_STEMS = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
+def sanitize_filename_stem(name: str | None) -> str:
+    """把用户填写 / 订单号清成安全的文件名主干（不含扩展名）。
+
+    去掉非法字符与首尾空格、点（Windows 不允许结尾点/空格），命中保留设备名时前缀下划线。
+    清成空串则返回 ''，由调用方按优先级回退。
+    """
+    cleaned = _ILLEGAL_FILENAME_CHARS.sub("", str(name or "")).strip().strip(" .").strip()
+    if not cleaned:
+        return ""
+    if cleaned.casefold() in _RESERVED_FILENAME_STEMS:
+        cleaned = f"_{cleaned}"
+    return cleaned
 
 
 def validate_output_formats(values: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -641,6 +684,52 @@ def _format_file_size(size: int) -> str:
     if size < 1024:
         return f"{size} B"
     return f"{size / 1024:.1f} KB"
+
+
+def _default_field_defs() -> list[dict]:
+    """前台「字段」区的默认提取规则（birth-flower-card）。规则在前台可编辑、按产品持久化。
+
+    每个字段 = 一条提取规则；规则正文直接写明要填后端 schema 的哪个字段（text/month/flower/font）。
+    业务规则（月→花对照表、字体编号）放这里而非写死在 gpt_parser，确保「提示词规则全在前台」。
+    """
+    return [
+        {
+            "key": "field1",
+            "name": "刻字内容",
+            "type": "文本",
+            "instruction": (
+                "填 text：取订单 Personalization 字段（要雕刻的名字 / 文字），"
+                "保留大小写、标点、特殊字符（& # ! 等）；去首尾空白，"
+                "并把中间连续的多个空格合并成一个空格（多余空格属无效、不影响生产，不要为此写 warning）；"
+                "不要把 GiftMessage 当作 text；缺失填空串。"
+            ),
+        },
+        {
+            "key": "field2",
+            "name": "出生花",
+            "type": "素材",
+            "instruction": (
+                "填 month / flower / flower_name：订单写「月份 - 花名」（如 Dec - Narcissus）。"
+                "month = 英文月份转 1-12；flower_name = 原文花名；flower = 该月第几朵(1 或 2)，按下表："
+                "1月 1=Snowdrop 2=Carnation；2月 1=Violet 2=Primrose；3月 1=Daffodil 2=Cherry Blossom；"
+                "4月 1=Daisy 2=Sweetpea；5月 1=Lily of the Valley 2=Hawthorn；6月 1=Rose 2=Honeysuckle；"
+                "7月 1=Waterlily 2=Larkspur；8月 1=Poppy 2=Gladiolus；9月 1=Aster 2=Morning Glory；"
+                "10月 1=Marigold 2=Cosmos；11月 1=Chrysanthemum 2=Peony；12月 1=Holly 2=Narcissus。"
+                "拼写差异(Sweet Pea/Sweetpea、Water Lily/Waterlily、大小写)按表归一；查不到填 null。"
+            ),
+        },
+        {
+            "key": "field3",
+            "name": "字体",
+            "type": "字体",
+            "instruction": (
+                "填 font：取「Font N」的数字。Font 1=Malovely Script 常规，2=Malovely Script 末尾字形，"
+                "3=AdoraBella 常规，4=AdoraBella 末尾爱心（末尾附加独立爱心符号，非字体字形）；"
+                "客户写字体名 / 外观（如「Malovely」「带爱心」）可据此映射到编号；"
+                "只有 1-4 有效，超出或拿不准填 null。"
+            ),
+        },
+    ]
 
 
 def build_ai_parse_config(
@@ -783,22 +872,24 @@ class BirthFlowerApp:
         # 字段 = 一条想让 AI 从订单提取的信息：name/type/instruction + 实时值(result)。
         # type ∈ 文本/素材/字体（见 docs/.../2026-06-16-field-engine-redesign.md）。
         # 结果(result)在 P1 为占位 mock，P3 接 GPT 真填；各字段挂自己的 StringVar 以便跨重渲染保值。
-        self.field_results: dict[str, str] = {"field1": "Ammy", "field2": "1月", "field3": "Font5"}
-        self.field_defs: list[dict] = [
-            {"key": "field1", "name": "Info1", "type": "文本",
-             "instruction": "顾客需要定制的文本内容，不超过20个字符，如果超过20个字符，输出error"},
-            {"key": "field2", "name": "Info2", "type": "素材",
-             "instruction": "顾客生日的月份，只可以是1~12月中的某一个，请严格按照1月，2月，3月这样的表达方式给我"},
-            {"key": "field3", "name": "Info3", "type": "字体",
-             "instruction": "顾客想要的字体编号，请严格按照 font1；font2，font3这样的格式给我"},
-        ]
+        self.field_results: dict[str, str] = {"field1": "", "field2": "", "field3": ""}
+        # 字段定义 = 前台可编辑的「提取规则」（默认完整规则，按产品从配置载入覆盖）。是发给 API 提示词的唯一规则来源。
+        self.field_defs: list[dict] = []
+        self.field_seq = 0
+        self._load_field_defs_into_self()  # 设 field_defs + field_seq（默认或产品已存的编辑值）
         for _f in self.field_defs:
             self._ensure_field_vars(_f)
-        self.field_seq = len(self.field_defs)  # 下一个字段编号自增基准
         self.fields_body = None  # 合并后的「字段」卡 body（一字段一卡）
         self.filename_template_var = tk.StringVar(value="")
         self.background_prompt_text = None
         self.generated_prompt_text = None
+        # 多订单识别队列：一次粘贴可含多笔订单，逐笔载入编辑器确认/生成。
+        self.parsed_orders: list[ParseResult] = []
+        self._parsed_order_index = 0
+        self.current_order_number = ""
+        self.order_queue_label = None
+        self.order_prev_button = None
+        self.order_next_button = None
         self.config_locked_var = tk.BooleanVar(value=False)
         self.lock_button = None
         # 配置锁：受锁控件登记表（订单备注框/导入解析清空/锁按钮本身不入列表）。
@@ -874,6 +965,8 @@ class BirthFlowerApp:
         self.inline_text_window: int | None = None
         self.inline_text_layer_id: str | None = None
         self.inline_text_original_text: str = ""
+        # 进入内联编辑时快照文本框几何，Esc 取消时连同文字一并还原（编辑中框会随墨迹变动）。
+        self.inline_text_original_box: tuple[float, float, float, float, float, float] | None = None
         self.inline_text_render_after_id: str | None = None
         self.inline_text_is_closing = False
         self.floating_text_editor: FloatingTextEditor | None = None
@@ -901,6 +994,11 @@ class BirthFlowerApp:
         self.current_glyph_overrides: dict[int, dict[str, object]] = {}
         self.selected_glyph_position: int | None = None
         self.runtime_dependency_status = check_runtime_dependencies()
+        # 收件夹监听（automation 一期）：一次只处理「当前一单」，生成后再放行下一单；inbox_folder 空则不启用。
+        self._inbox_active: Path | None = None  # 当前已载入、待生成的收件夹订单文件
+        self._inbox_after_id: str | None = None
+        self._inbox_dir: Path | None = None
+        self._inbox_processed_dir: Path | None = None
 
         self._build_menu()
         self._build_layout()
@@ -913,6 +1011,8 @@ class BirthFlowerApp:
         for warning in (self.glyph_config.load_warning, self.glyph_bindings.load_warning, self.glyph_rules.load_warning):
             if warning:
                 self.root.after(0, lambda warning=warning: messagebox.showwarning("字形配置", warning))
+        # 启动收件夹监听（automation 一期；inbox_folder 未配置时为空操作）。
+        self._start_inbox_poller()
 
     def _build_menu(self) -> None:
         # 菜单数据驱动，弹窗用自绘 CtkMenu（深色圆角、无系统白边）；不再用原生 tk.Menu / 菜单栏。
@@ -1371,8 +1471,8 @@ class BirthFlowerApp:
         production_panel = self._build_production_panel(panel)  # 「图层」卡，真实动态行 + 保留隐藏全局选择器联动
         cards = [
             order_panel,
-            self._build_background_prompt_panel(panel),
             self._build_fields_panel(panel),
+            self._build_background_prompt_panel(panel),
             production_panel,
             self._build_library_panel(panel),
             self._build_generate_prompt_panel(panel),
@@ -1475,11 +1575,25 @@ class BirthFlowerApp:
         self._btn(action_row, "导入", self.import_remark_file).grid(row=0, column=1, padx=(0, 8))
         self._btn(action_row, "解析", self.parse_remark, primary=True).grid(row=0, column=2, padx=(0, 8))
         self._btn(action_row, "清空", self.clear_remark).grid(row=0, column=3)
-        ctk.CTkLabel(
-            body, text="下方配置可加密码锁：管理员配置 / 操作员只填订单文本", anchor="w",
-            text_color=APP_COLORS["muted"], font=ctk.CTkFont(size=11),
-            wraplength=270, justify="left",
-        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        # 多订单队列导航：一次粘贴多笔订单时，逐笔载入编辑器确认/生成（单笔时隐藏）。
+        queue_row = ctk.CTkFrame(body, fg_color="transparent")
+        queue_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        queue_row.columnconfigure(0, weight=1)
+        self.order_queue_label = ctk.CTkLabel(
+            queue_row, text="", anchor="w", text_color=APP_COLORS["muted"],
+            font=ctk.CTkFont(size=11),
+        )
+        self.order_queue_label.grid(row=0, column=0, sticky="w")
+        self.order_prev_button = self._btn(queue_row, "‹ 上一笔", self._show_prev_order, width=70)
+        self.order_prev_button.grid(row=0, column=1, padx=(0, 6))
+        self.order_next_button = self._btn(queue_row, "下一笔 ›", self._show_next_order, width=70)
+        self.order_next_button.grid(row=0, column=2)
+        self.order_prev_button.grid_remove()
+        self.order_next_button.grid_remove()
+
+
+            
         return panel
 
     def _build_preview_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -1527,11 +1641,8 @@ class BirthFlowerApp:
         self.preview_canvas.bind("<Button-1>", self._on_canvas_press)
         self.preview_canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.preview_canvas.bind("<Button-3>", self._show_canvas_context_menu)
-        self.preview_canvas.bind("<Button-2>", self._on_canvas_pan_press)
         self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
-        self.preview_canvas.bind("<B2-Motion>", self._on_canvas_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
-        self.preview_canvas.bind("<ButtonRelease-2>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", lambda _event: self._redraw_preview())
         self.preview_canvas.bind("<Motion>", self._on_canvas_motion)
         self.preview_canvas.bind("<Leave>", self._on_canvas_leave)
@@ -1543,7 +1654,8 @@ class BirthFlowerApp:
         return panel
 
     def _build_production_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        panel, body = self._ctk_card(parent, "图层", locked=True)
+        # 图层卡移出配置锁定区：操作员在锁定态下仍可增删/编辑图层（不入锁、标题不带🔒）。
+        panel, body = self._ctk_card(parent, "图层")
         body.columnconfigure(0, weight=1)
 
         header = ctk.CTkFrame(body, fg_color="transparent")
@@ -1569,11 +1681,12 @@ class BirthFlowerApp:
         action_row = ctk.CTkFrame(body, fg_color="transparent")
         action_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         action_row.columnconfigure(0, weight=1)
-        self._register_lock(
-            self._btn(action_row, "+ 文字图层", self._add_text_layer_from_fields, primary=True)
+        # 不入锁：图层增删属操作员日常动作，配置锁定时仍可用。
+        self._btn(
+            action_row, "+ 文字图层", self._add_text_layer_from_fields, primary=True
         ).grid(row=0, column=1, padx=(0, 6))
-        self._register_lock(
-            self._btn(action_row, "+ 图片图层", self._add_selected_flower_to_canvas)
+        self._btn(
+            action_row, "+ 图片图层", self._add_selected_flower_to_canvas
         ).grid(row=0, column=2)
 
         # 隐藏容器承载原四个全局选择器：parse/扫描/选库 全部联动仍依赖它们。
@@ -1630,8 +1743,8 @@ class BirthFlowerApp:
         )
 
     def _build_fields_panel(self, parent) -> ctk.CTkFrame:
-        """合并后的「字段」卡：一字段一张子卡（结果 + 类型 + 提取规则）。属配置锁定区。"""
-        panel, body = self._ctk_card(parent, "字段", locked=True)
+        """合并后的「字段」卡：一字段一张子卡（结果 + 提取规则）。属配置锁定区。"""
+        panel, body = self._ctk_card(parent, "info", locked=True)
         self.fields_body = body
         self._render_fields()
         return panel
@@ -1644,10 +1757,6 @@ class BirthFlowerApp:
             child.destroy()
         self._prune_locked()
         body.columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            body, text="每个字段 = 一条提取规则 + 一个结果（结果为占位，P3 接 GPT 真填）", anchor="w",
-            text_color=APP_COLORS["muted"], font=ctk.CTkFont(size=11), wraplength=270, justify="left",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
         for i, field in enumerate(self.field_defs):
             self._ensure_field_vars(field)
             card = ctk.CTkFrame(
@@ -1658,38 +1767,58 @@ class BirthFlowerApp:
             card.columnconfigure(0, weight=1)
             top = ctk.CTkFrame(card, fg_color="transparent")
             top.grid(row=0, column=0, sticky="ew", padx=7, pady=(7, 3))
-            top.columnconfigure(2, weight=1)
-            self._field_chip(top, field["name_var"].get()).grid(row=0, column=0, padx=(0, 6))
-            self._register_lock(ctk.CTkOptionMenu(
-                top, variable=field["type_var"], values=["文本", "素材", "字体"], width=72,
-                command=lambda _c: self._on_field_changed(),
-                fg_color=APP_COLORS["background"], button_color=APP_COLORS["accent"],
-                button_hover_color=APP_COLORS["accent_soft"], text_color=APP_COLORS["text"],
-            )).grid(row=0, column=1, padx=(0, 6))
-            result = self._register_lock(ctk.CTkEntry(
-                top, textvariable=field["result_var"], fg_color=APP_COLORS["background"],
+            top.columnconfigure(1, weight=1)
+            # chip 用位置编号 info1/info2/…（按当前顺序实时算），不显示内部 name；
+            # name 仍保留给提取提示词（刻字内容/出生花/字体等语义标签）。
+            self._field_chip(top, f"info{i + 1}").grid(row=0, column=0, padx=(0, 6))
+            # 字段类型不再用下拉框选择；类型/约束统一写进下方「提取规则」提示词里。
+            # 结果框只读：只显示 AI 解析回填的值（见 _apply_results_to_fields，映射 B「填X」），
+            # 不入配置锁——它本就不可手输，锁开合都保持只读。
+            result = ctk.CTkEntry(
+                top, textvariable=field["result_var"], state="readonly",
+                fg_color=APP_COLORS["background"],
                 border_color=APP_COLORS["border"], text_color=APP_COLORS["text"],
-            ))
+            )
             # error 哨兵：结果为 error（不区分大小写）→ 标红（禁用「生成」的联动在 P3 接真值时做）。
             if field["result_var"].get().strip().lower() == "error":
                 result.configure(border_color=APP_COLORS["warning"], text_color=APP_COLORS["warning"])
-            result.grid(row=0, column=2, sticky="ew")
+            result.grid(row=0, column=1, sticky="ew")
             self._register_lock(
                 self._btn(top, "✕", lambda key=field["key"]: self._delete_field(key), width=30)
-            ).grid(row=0, column=3, padx=(6, 0))
-            self._register_lock(ctk.CTkEntry(
-                card, textvariable=field["inst_var"], fg_color=APP_COLORS["background"],
-                border_color=APP_COLORS["border"], text_color=APP_COLORS["text"],
-                placeholder_text="提取规则：告诉 AI 提取什么、约束是什么",
-            )).grid(row=1, column=0, sticky="ew", padx=7, pady=(0, 7))
+            ).grid(row=0, column=2, padx=(6, 0))
+            # 规则较长（含对照表），用多行 Textbox 编辑；KeyRelease 同步进 inst_var、FocusOut 落盘。
+            inst_box = self._register_lock(ctk.CTkTextbox(
+                card, height=78, fg_color=APP_COLORS["background"], wrap="word",
+                border_width=1, border_color=APP_COLORS["border"], text_color=APP_COLORS["text"],
+            ))
+            inst_box.grid(row=1, column=0, sticky="ew", padx=7, pady=(0, 7))
+            inst_box.insert("1.0", field["inst_var"].get())
+            inst_box.bind(
+                "<KeyRelease>",
+                lambda _e, f=field, b=inst_box: f["inst_var"].set(b.get("1.0", "end-1c")),
+            )
+            inst_box.bind("<FocusOut>", lambda _e: self._persist_prompts())
         self._register_lock(
             self._btn(body, "添加字段 +", self._add_field)
         ).grid(row=len(self.field_defs) + 1, column=0, sticky="w", pady=(8, 0))
 
+    def _next_field_key(self) -> str:
+        """生成唯一字段 key：取现有 fieldN 中最大序号 +1。
+
+        不能用「字段数量+1」当 key：删掉中间字段后会与存活字段撞 key
+        （如 field1/field3 删后再加得 field3 撞车）。最大序号+1 始终唯一。
+        """
+        max_n = 0
+        for f in self.field_defs:
+            k = str(f.get("key", ""))
+            if k.startswith("field") and k[5:].isdigit():
+                max_n = max(max_n, int(k[5:]))
+        return f"field{max_n + 1}"
+
     def _add_field(self) -> None:
-        self.field_seq += 1
-        key = f"field{self.field_seq}"
-        field = {"key": key, "name": f"字段{self.field_seq}", "type": "文本", "instruction": ""}
+        # 编号基于「现有字段数量」+1（chip 实时按位置显示 infoN），不再按点击次数累加。
+        key = self._next_field_key()
+        field = {"key": key, "name": f"info{len(self.field_defs) + 1}", "type": "文本", "instruction": ""}
         self._ensure_field_vars(field)
         self.field_defs.append(field)
         self._on_field_changed()
@@ -1699,11 +1828,13 @@ class BirthFlowerApp:
         self._on_field_changed()
 
     def _on_field_changed(self) -> None:
-        # 字段增删/类型变 → 重渲染字段卡。（图层行已改为独立单行设计，不再随字段联动。）
+        # 字段增删 → 重渲染字段卡 + 落盘（字段就是提示词规则，改动要持久化）。
         self._render_fields()
+        self._persist_prompts()
 
     def _build_library_panel(self, parent) -> ctk.CTkFrame:
-        panel, body = self._ctk_card(parent, "字体库 / 素材库", locked=True)
+        # 库卡移出配置锁定区：操作员在锁定态下仍可上传字体/素材（不入锁、标题不带🔒）。
+        panel, body = self._ctk_card(parent, "字体库 / 素材库")
         body.columnconfigure(0, weight=1)
         font_names = [getattr(lib, "name", "") or "字体库" for lib in self.active_bundle.font_libraries] or ["字体库1"]
         image_names = [getattr(lib, "name", "") or "素材库" for lib in self.active_bundle.image_libraries] or ["素材库1"]
@@ -1714,18 +1845,17 @@ class BirthFlowerApp:
                 line.grid(row=row, column=0, sticky="ew", pady=2)
                 line.columnconfigure(0, weight=1)
                 ctk.CTkLabel(line, text=f"{prefix} · {name}", anchor="w").grid(row=0, column=0, sticky="w")
-                self._register_lock(
-                    self._btn(line, "点击上传", self.open_settings, width=80)
-                ).grid(row=0, column=1, padx=(6, 0))
+                # 不入锁：上传库素材属操作员动作，配置锁定时仍可用。
+                self._btn(line, "点击上传", self.open_settings, width=80).grid(row=0, column=1, padx=(6, 0))
                 row += 1
-        ctk.CTkLabel(
-            body, text="库目录当前在菜单栏「设置」中管理", anchor="w",
-            text_color=APP_COLORS["muted"], font=ctk.CTkFont(size=11),
-        ).grid(row=row, column=0, sticky="w", pady=(6, 0))
         return panel
 
     def _build_output_settings_panel(self, parent) -> ctk.CTkFrame:
         panel, body = self._ctk_card(parent, "输出设置", locked=True)
+        # 本卡是「标签 + 输入」两栏布局：标签列固定窄宽、不拉伸，输入列独占剩余宽度。
+        # _ctk_card 默认给 col0 weight=1（适配单栏卡），此处必须改回 0；否则 col0/col1
+        # 各分一半宽度 → 标签与控件之间出现大空档、输入框被挤窄、整排看着错位（间隔太宽）。
+        body.columnconfigure(0, weight=0, minsize=64)
         body.columnconfigure(1, weight=1)
         ctk.CTkLabel(body, text="输出目录", anchor="w").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 8))
         dir_row = ctk.CTkFrame(body, fg_color="transparent")
@@ -1737,12 +1867,15 @@ class BirthFlowerApp:
         fmt_row = ctk.CTkFrame(body, fg_color="transparent")
         fmt_row.grid(row=1, column=1, sticky="w", pady=4)
         for output_format, label in (("png", "PNG"), ("svg", "SVG"), ("dxf", "DXF")):
+            # width=56：CTkCheckBox 默认整框宽 100，而「□ PNG」可见内容仅约 48，
+            # 多出的 50 余像素全是框内死空白 → 三项被撑得很开。收到贴合内容的 56，
+            # 配 padx=(0,8) 让 PNG/SVG/DXF 紧凑成一组、间距适中且清晰可见。
             self._register_lock(ctk.CTkCheckBox(
-                fmt_row, text=label, variable=self.output_format_vars[output_format],
+                fmt_row, text=label, width=56, variable=self.output_format_vars[output_format],
                 onvalue=True, offvalue=False, checkbox_width=18, checkbox_height=18,
                 fg_color=APP_COLORS["accent"], hover_color=APP_COLORS["accent_soft"],
-            )).pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(body, text="文件命名", anchor="w").grid(row=2, column=0, sticky="w", pady=4, padx=(0, 8))
+            )).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(body, text="文件名", anchor="w").grid(row=2, column=0, sticky="w", pady=4, padx=(0, 8))
         self._register_lock(ctk.CTkEntry(
             body, textvariable=self.filename_template_var, placeholder_text="可填 GPT 识别的订单号字段",
         )).grid(row=2, column=1, sticky="ew", pady=4)
@@ -1805,53 +1938,102 @@ class BirthFlowerApp:
                 pass
         self.status_var.set("配置已锁定（密码校验 P4 接入）" if locked else "配置已解锁")
 
+    def _assemble_field_rules(self) -> str:
+        """把「字段」区的提取规则拼成发给 API 的【提取规则】正文（每字段一行）。
+
+        提示词规则全部来自前台可编辑的字段，本地不写死业务规则。
+        """
+        lines: list[str] = []
+        for field in self.field_defs:
+            name = (field["name_var"].get() if "name_var" in field else field.get("name", "")).strip()
+            ftype = (field["type_var"].get() if "type_var" in field else field.get("type", "")).strip()
+            inst = (field["inst_var"].get() if "inst_var" in field else field.get("instruction", "")).strip()
+            if not inst:
+                continue
+            prefix = f"- {name}（{ftype}）：" if (name or ftype) else "- "
+            lines.append(prefix + inst)
+        return "\n".join(lines)
+
+    def _serialize_field_defs(self) -> str:
+        """把字段定义序列化成 JSON 存进 product.extraction_prompt（admin 编辑后持久化）。"""
+        items = []
+        for field in self.field_defs:
+            items.append({
+                "key": field.get("key", ""),
+                "name": field["name_var"].get() if "name_var" in field else field.get("name", ""),
+                "type": field["type_var"].get() if "type_var" in field else field.get("type", "文本"),
+                "instruction": field["inst_var"].get() if "inst_var" in field else field.get("instruction", ""),
+            })
+        return json.dumps(items, ensure_ascii=False)
+
+    def _load_field_defs_into_self(self) -> None:
+        """从当前产品配置（extraction_prompt 存的 JSON）载入字段；无/非法 JSON → 用默认完整规则。"""
+        raw = (active_product(self.config).extraction_prompt or "").strip()
+        defs: list[dict] | None = None
+        if raw:
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError):
+                data = None
+            if isinstance(data, list):
+                parsed: list[dict] = []
+                for i, item in enumerate(data):
+                    if not isinstance(item, dict):
+                        continue
+                    parsed.append({
+                        "key": str(item.get("key") or f"field{i + 1}"),
+                        "name": str(item.get("name", f"字段{i + 1}")),
+                        "type": str(item.get("type", "文本")),
+                        "instruction": str(item.get("instruction", "")),
+                    })
+                if parsed:
+                    defs = parsed
+        self.field_defs = defs if defs is not None else _default_field_defs()
+        self.field_seq = len(self.field_defs)
+
     def _persist_prompts(self) -> None:
-        """把「背景提示词」存回当前产品配置并落盘（失焦/切产品时触发）。
-        提取已回档为多字段「字段」卡（UI 态 mock，P3 接真），不走提示词持久化；
-        product.extraction_prompt 原样保留不动。"""
+        """把「字段（提取规则）+ 背景提示词」存回当前产品配置并落盘（失焦/增删/切产品时触发）。"""
+        extraction = self._serialize_field_defs()
         background = ""
         if self.background_prompt_text is not None:
             background = self.background_prompt_text.get("1.0", "end-1c").strip()
         product = active_product(self.config)
-        if background == product.background_prompt:
+        if extraction == product.extraction_prompt and background == product.background_prompt:
             return  # 无变化不写盘
         self.config = with_product_prompts(
-            self.config, extraction_prompt=product.extraction_prompt, background_prompt=background
+            self.config, extraction_prompt=extraction, background_prompt=background
         )
         save_config(self.config)
 
     def _load_prompts_into_widgets(self) -> None:
-        """把当前产品的背景提示词载入文本框（切产品后调用）。"""
-        product = active_product(self.config)
+        """切产品后：把新产品的字段定义 + 背景提示词载入控件。"""
+        self._load_field_defs_into_self()
+        for field in self.field_defs:
+            self._ensure_field_vars(field)
+        if self.fields_body is not None:
+            self._render_fields()
         box = self.background_prompt_text
         if box is None:
             return
         box.delete("1.0", "end")
-        if product.background_prompt:
-            box.insert("1.0", product.background_prompt)
+        if active_product(self.config).background_prompt:
+            box.insert("1.0", active_product(self.config).background_prompt)
 
     def _show_generated_prompt(self) -> None:
-        """本地拼装预览：字段提取规则 + 背景词 + 订单信息。P3 再接库目录与真实发送格式。"""
-        lines = ["[字段提取规则]"]
-        for field in self.field_defs:
-            lines.append(
-                f"- {field['name_var'].get()}（{field['type_var'].get()}）：{field['inst_var'].get()}"
-            )
+        """预览真正会发给 API 的内容：字段规则套进脚手架的系统提示词 + 用户内容（订单文本）。"""
         background = ""
         if self.background_prompt_text is not None:
             background = self.background_prompt_text.get("1.0", "end-1c").strip()
-        if background:
-            lines += ["", f"[背景提示词] {background}"]
+        system_prompt = build_orders_system_prompt(self._assemble_field_rules(), background)
         remark = self._current_remark_text().strip()
-        lines += ["", f"[订单信息] {remark or '（未填写）'}"]
-        text = "\n".join(lines)
+        text = f"{system_prompt}\n\n[user] 订单信息\n{remark or '（未填写）'}"
         box = self.generated_prompt_text
         if box is not None:
             box.configure(state="normal")
             box.delete("1.0", "end")
             box.insert("1.0", text)
             box.configure(state="disabled")
-        self.status_var.set("已生成提示词预览（本地拼装；P3 接库目录与真实发送格式）")
+        
 
     def _current_remark_text(self) -> str:
         if self.remark_text is not None:
@@ -1872,6 +2054,103 @@ class BirthFlowerApp:
         self.personalization_type_var.set("unknown")
         self.confidence_var.set("Readiness: -")
         self._set_warnings(["等待解析；识别结果不会自动生成最终文件。"])
+
+    def _start_inbox_poller(self) -> None:
+        """启动收件夹监听（automation 一期）。
+
+        外部本地服务把店小秘订单写成 {order_id}.json 投进 ``config.inbox_folder``；
+        这里用 Tk ``after`` 轮询，发现新文件就自动载入备注并（按配置）解析，但**永远停在生成前**
+        ——由操作员复核后手点「生成」。``inbox_folder`` 未配置时整段为空操作，对现有用户零影响。
+        """
+        folder = str(self.config.inbox_folder).strip()
+        # Path("") 会被规范化成 "."；空字符串与 "." 都视为「未配置/功能关」。
+        if folder in ("", "."):
+            return
+        self._inbox_dir = Path(folder)
+        self._inbox_processed_dir = self._inbox_dir / "processed"
+        self._poll_inbox_once()
+
+    def _poll_inbox_once(self) -> None:
+        """每秒扫一次收件夹；始终载入「最新送达」的订单（按文件修改时间）。
+
+        新文件一到即**覆盖**当前应用内订单信息与文件名（由 _auto_load_order 重写两个框）；
+        被覆盖的旧当前单（未点「生成」）移入 processed/ 丢弃。操作员点「生成」后由
+        _advance_inbox_after_generate 把当前单移入 processed 再放行下一单。
+        """
+        inbox_dir = self._inbox_dir
+        if inbox_dir is None:
+            return
+        try:
+            if inbox_dir.is_dir():
+                pending = list(inbox_dir.glob("*.json"))
+                if pending:
+                    # 最新送达：mtime 最大，名字作并列兜底。
+                    newest = max(pending, key=lambda p: (p.stat().st_mtime, p.name))
+                    if self._inbox_active is None or newest != self._inbox_active:
+                        # 新文件抢占：把被覆盖的旧当前单（未生成）移入 processed 丢弃。
+                        if self._inbox_active is not None:
+                            self._move_inbox_file_to_processed(self._inbox_active)
+                        self._inbox_active = newest
+                        self.root.after(0, self._auto_load_order, newest)
+        except tk.TclError:
+            return  # 窗口销毁中，停止续约
+        except Exception:
+            LOGGER.exception("收件夹轮询失败")
+        try:
+            self._inbox_after_id = self.root.after(1000, self._poll_inbox_once)
+        except tk.TclError:
+            self._inbox_after_id = None
+
+    def _auto_load_order(self, path: Path) -> None:
+        """主线程：载入收件夹里『当前这一单』的备注并（按 inbox_autoparse）解析，停在生成前。
+
+        不移动文件——待操作员点「生成」成功后，由 _advance_inbox_after_generate 移入 processed 并放行下一单。
+        """
+        if not path.exists():
+            self._inbox_active = None
+            return
+        try:
+            order = load_order_from_file(path)
+        except (OSError, ValueError) as exc:
+            self._set_warnings([f"自动载入订单失败（{path.name}）：{exc}"])
+            self._move_inbox_file_to_processed(path)  # 坏文件挪走，别堵住队列
+            self._inbox_active = None
+            return
+        remark = " ".join(order.remark.split())
+        order_id = order.order_id.strip()
+        # 订单号置顶为第 1 行（对齐解析器「订单块首行=订单号」约定），其后接产品规格备注。
+        self._set_remark_text(f"{order_id}\n{remark}" if order_id else remark)
+        # 订单号同时写进「文件名」框（该框即导出文件名来源，按订单号命名）。
+        if order_id:
+            self.filename_template_var.set(order_id)
+        self._set_warnings([])
+        self.status_var.set(f"📥 已载入订单 {path.stem}（复核后点「生成」，将自动载入下一单）")
+        if self.config.inbox_autoparse:
+            self.parse_remark()  # 自动解析（后台线程）；绝不自动生成
+
+    def _move_inbox_file_to_processed(self, path: Path) -> None:
+        """把已载入的订单文件移入 inbox/processed/，避免重启后重复触发。"""
+        processed_dir = self._inbox_processed_dir
+        if processed_dir is None:
+            return
+        try:
+            processed_dir.mkdir(parents=True, exist_ok=True)
+            target = processed_dir / path.name
+            index = 1
+            while target.exists():
+                target = processed_dir / f"{path.stem}-{index}{path.suffix}"
+                index += 1
+            path.replace(target)
+        except OSError:
+            LOGGER.exception("移动收件夹订单文件失败：%s", path)
+
+    def _advance_inbox_after_generate(self) -> None:
+        """生成成功后：把当前收件夹订单移入 processed/ 并放行下一单（无当前单则空操作）。"""
+        active = self._inbox_active
+        if active is None:
+            return
+        self._inbox_active = None
+        self._move_inbox_file_to_processed(active)
 
     def open_settings(self) -> None:
         window = self._themed_toplevel()
@@ -1968,14 +2247,16 @@ class BirthFlowerApp:
         frame = ttk.Frame(notebook, padding=12)
         notebook.add(frame, text="AI 识别")
         profile = active_ai_profile(self.config)
-        self.ai_prefer_var = tk.BooleanVar(value=profile.prefer_ai)
         self.ai_provider_var = tk.StringVar(value=profile.provider)
         self.ai_model_var = tk.StringVar(value=profile.model)
         self.ai_base_url_var = tk.StringVar(value=profile.base_url)
         self.ai_api_key_env_var = tk.StringVar(value=profile.api_key_env_var)
         self.ai_project_env_var = tk.StringVar(value=profile.project_env_var)
         self.ai_org_env_var = tk.StringVar(value=profile.org_env_var)
-        ttk.Checkbutton(frame, text="优先使用 AI 解析", variable=self.ai_prefer_var).grid(row=0, column=0, columnspan=2, sticky="w", pady=4)
+        # 解析已全局走 AI（本地规则停用）；原「AI 优先」开关→只读说明，现按用户要求一并注释移除（保留可恢复）。
+        # ttk.Label(
+        #     frame, text="解析始终使用 AI 识别（本地规则已停用，请配置好下方 API Key）",
+        # ).grid(row=0, column=0, columnspan=2, sticky="w", pady=4)
         provider_combo = ttk.Combobox(frame, textvariable=self.ai_provider_var, values=("openai", "deepseek"), state="readonly")
         provider_combo.bind("<<ComboboxSelected>>", self._on_ai_provider_change)
         self._add_row(frame, 1, "服务商", provider_combo)
@@ -2296,7 +2577,12 @@ class BirthFlowerApp:
         run_background(self.root, work, on_success, on_error)
 
     def _current_ai_config(self) -> AIParseConfig:
-        return build_ai_parse_config(active_ai_profile(self.config), self.session_api_key_var.get())
+        config = build_ai_parse_config(active_ai_profile(self.config), self.session_api_key_var.get())
+        # 提示词规则全部来自前台：system_prompt = 字段区拼出的提取规则；background_prompt = 背景提示词框。
+        # gpt_parser.build_orders_system_prompt 把规则套进结构脚手架，本地不再写死任何业务规则。
+        rules = self._assemble_field_rules()
+        background = active_product(self.config).background_prompt or ""
+        return dataclasses.replace(config, system_prompt=rules, background_prompt=background)
 
     def _settings_ai_profile(self) -> AIProfile:
         return build_ai_profile_from_settings(
@@ -2307,7 +2593,7 @@ class BirthFlowerApp:
             api_key_env_var=self.ai_api_key_env_var.get(),
             project_env_var=self.ai_project_env_var.get(),
             org_env_var=self.ai_org_env_var.get(),
-            prefer_ai=bool(self.ai_prefer_var.get()),
+            prefer_ai=True,  # 全局使用 AI 解析：「AI 优先」开关已移除，恒为开。
         )
 
     def _selected_output_formats(self) -> tuple[str, ...]:
@@ -2480,10 +2766,69 @@ class BirthFlowerApp:
 
         run_background(
             self.root,
-            lambda: parse_order_remark_auto(remark, ai_config=ai_config, bundle=self.active_bundle),
-            self._apply_parse_result,
+            lambda: parse_orders_auto(remark, ai_config=ai_config, bundle=self.active_bundle),
+            self._apply_parsed_orders,
             on_error,
         )
+
+    def _apply_parsed_orders(self, results) -> None:
+        """多订单识别结果落地：存队列、载入第 1 笔到编辑器，其余可用「上一笔/下一笔」逐笔切换。"""
+        results = [r for r in (results or []) if r is not None]
+        if not results:
+            self.parsed_orders = []
+            self._parsed_order_index = 0
+            self.status_var.set("未识别到订单")
+            messagebox.showwarning("解析", "未能从文本中识别出任何订单，请检查粘贴内容。")
+            self._update_order_queue_ui()
+            return
+        self.parsed_orders = results
+        self._parsed_order_index = 0
+        self._apply_parse_result(results[0])
+        self._update_order_queue_ui()
+        self.status_var.set(
+            f"识别到 {len(results)} 笔订单，已载入第 1 笔，逐笔确认后点「生成」"
+            if len(results) > 1
+            else "识别完成"
+        )
+
+    def _show_order_at(self, index: int) -> None:
+        if not self.parsed_orders:
+            return
+        index = max(0, min(index, len(self.parsed_orders) - 1))
+        self._parsed_order_index = index
+        self._apply_parse_result(self.parsed_orders[index])
+        self._update_order_queue_ui()
+
+    def _show_prev_order(self) -> None:
+        self._show_order_at(self._parsed_order_index - 1)
+
+    def _show_next_order(self) -> None:
+        self._show_order_at(self._parsed_order_index + 1)
+
+    def _update_order_queue_ui(self) -> None:
+        """刷新订单队列指示条：单笔时隐藏导航；多笔时显示「第 i/N 单 · 订单号」与上一/下一按钮。"""
+        total = len(self.parsed_orders)
+        label = self.order_queue_label
+        prev_btn = self.order_prev_button
+        next_btn = self.order_next_button
+        if label is None:
+            return
+        if total <= 1:
+            label.configure(text="")
+            if prev_btn is not None:
+                prev_btn.grid_remove()
+            if next_btn is not None:
+                next_btn.grid_remove()
+            return
+        index = self._parsed_order_index
+        order_number = (self.parsed_orders[index].order_number or "—")
+        label.configure(text=f"第 {index + 1}/{total} 单 · 订单号 {order_number}")
+        if prev_btn is not None:
+            prev_btn.grid()
+            prev_btn.configure(state="normal" if index > 0 else "disabled")
+        if next_btn is not None:
+            next_btn.grid()
+            next_btn.configure(state="normal" if index < total - 1 else "disabled")
 
     def open_output_dir(self) -> None:
         output_dir = normalize_output_path(self.output_var.get()).parent
@@ -2500,6 +2845,8 @@ class BirthFlowerApp:
 
     def _apply_parse_result(self, result) -> None:
         self.last_parse_result = result
+        # 订单号是后端按订单生成文件/写 metadata.orderId 的关键参数，识别到就记下。
+        self.current_order_number = getattr(result, "order_number", "") or ""
         if result.text:
             self.name_var.set(result.text)
         if result.month is not None:
@@ -2509,6 +2856,7 @@ class BirthFlowerApp:
         if result.flower is not None:
             self.flower_var.set(str(result.flower))
         self.personalization_type_var.set(getattr(result, "personalization_type", "unknown") or "unknown")
+        self._apply_results_to_fields(result)  # 映射 B：把解析值回填进各 info 字段的只读结果框
         self._refresh_flower_choices()
         self._select_flower_by_current_fields()
         self._select_font_by_current_field()
@@ -2516,6 +2864,56 @@ class BirthFlowerApp:
         if result.warnings:
             self._show_parse_warning_dialog(result)
         self._redraw_preview()
+
+    # ===== 映射（混合）：先认显式「填X」声明，匹配不到再按提示词中文/英文语义关键词回退 =====
+    # 字段「提取规则」正文若以「填 <schema字段>」声明要填后端哪个字段（默认提示词写法），按此精确映射；
+    # 多数用户用自然语言写规则（如「提取花朵的名称」），无「填X」时按 _RESULT_SEMANTIC_KEYWORDS 语义回退。
+    # 一字段可命中多个 schema 字段，按可读性优先级取一个展示：花名 > 文字 > 字体 > 月份 > 第几朵。
+    _RESULT_FILL_PRIORITY = ("flower_name", "text", "font", "month", "flower")
+    # 语义关键词表：schema 字段 → 触发词（中文 + 英文）。元组顺序即命中优先级（高 → 低）。
+    _RESULT_SEMANTIC_KEYWORDS = (
+        ("flower_name", ("花名", "花朵", "出生花", "花", "flower_name", "flower")),
+        ("font", ("字体", "字型", "font")),
+        ("text", ("刻字", "文本", "文字", "名字", "text")),
+        ("month", ("月份", "月", "month")),
+    )
+
+    def _apply_results_to_fields(self, result) -> None:
+        """按各字段提示词映射把解析结果回填进只读结果框（result_var）并存进 field_results。"""
+        for field in self.field_defs:
+            self._ensure_field_vars(field)
+            instruction = field["inst_var"].get() or field.get("instruction", "")
+            key = self._field_result_target(instruction)
+            value = self._result_attr_display(key, result) if key else ""
+            field["result_var"].set(value)
+            self.field_results[field["key"]] = value
+
+    def _field_result_target(self, instruction: str) -> str | None:
+        """返回该字段提示词指向的 ParseResult 字段名：先显式「填X」声明、再语义关键词回退；无 → None。"""
+        instruction = instruction or ""
+        # 1) 显式「填X」：取第一处「填」到首个冒号/句号/换行前的声明区，匹配 schema 字段名（避免正文误命中）。
+        match = re.search(r"填([^：:。\n]*)", instruction)
+        if match:
+            segment = match.group(1)
+            for key in self._RESULT_FILL_PRIORITY:
+                if re.search(rf"(?<!\w){re.escape(key)}(?!\w)", segment):
+                    return key
+        # 2) 语义回退：整段提示词里按优先级找中文/英文关键词。
+        for key, keywords in self._RESULT_SEMANTIC_KEYWORDS:
+            if any(kw in instruction for kw in keywords):
+                return key
+        return None
+
+    @staticmethod
+    def _result_attr_display(key: str, result) -> str:
+        """取 ParseResult 上 key 对应值并转成展示字符串（None/缺失 → 空串）。"""
+        value = getattr(result, key, None)
+        if value is None:
+            return ""
+        # 字体按「font4」格式展示（对齐字段提示词「font1/font2/font3」的写法）。
+        if key == "font":
+            return f"font{value}"
+        return value.strip() if isinstance(value, str) else str(value)
 
     def _show_parse_warning_dialog(self, result) -> None:
         """主题化「需人工确认」弹窗（取代原生 messagebox）：醒目列缺失字段 + 折叠 AI/本地原文。"""
@@ -2977,6 +3375,25 @@ class BirthFlowerApp:
             LOGGER.warning("读取模板物理宽度失败,DXF 用默认尺寸: %s", exc)
             return None
 
+    def _resolve_output_basename(self, base_output_path: Path) -> str:
+        """决定导出文件名主干（不含扩展名），按优先级回退：
+
+        1) 「文件名」框：纯文本所见即所得（清洗非法字符）；
+        2) 当前订单号：优先解析到的 current_order_number，回退 inbox 收件夹 JSON 文件名 stem；
+        3) 都没有时回退「输出目录」路径里的原文件名（旧行为），保证名字永不为空。
+        """
+        typed = sanitize_filename_stem(self.filename_template_var.get())
+        if typed:
+            return typed
+        order_no = sanitize_filename_stem(self.current_order_number)
+        if order_no:
+            return order_no
+        if self._inbox_active is not None:
+            inbox_stem = sanitize_filename_stem(self._inbox_active.stem)
+            if inbox_stem:
+                return inbox_stem
+        return base_output_path.stem
+
     def confirm_and_generate(self) -> None:
         glyph_result = self._resolve_current_glyph()
         try:
@@ -3031,8 +3448,10 @@ class BirthFlowerApp:
         generated_paths: list[Path] = []
         try:
             base_output_path = normalize_output_path(self.output_var.get())
+            output_stem = self._resolve_output_basename(base_output_path)
             for output_format in selected_formats:
-                target_path = output_path_for_format(base_output_path, output_format)
+                # 保留目录，仅替换文件名主干 + 扩展名；不走 with_suffix，避免主干含点时被截断。
+                target_path = base_output_path.with_name(f"{output_stem}.{output_format}")
                 # 有图层时走 services/api 真实矢量导出:DXF/SVG 在 CAD 里可编辑、纯矢量。
                 if self.document.layers and output_format == "svg":
                     generated_paths.append(
@@ -3070,6 +3489,7 @@ class BirthFlowerApp:
         self._save_current_config()
         self.status_var.set("生成完成")
         messagebox.showinfo("生成完成", "已生成：\n" + "\n".join(str(path) for path in generated_paths))
+        self._advance_inbox_after_generate()  # 收件夹来源的订单：生成成功后放行下一单
 
     def _current_readiness_parse_result(self) -> ParseResult:
         result = build_readiness_parse_result_from_values(
@@ -3950,9 +4370,44 @@ class BirthFlowerApp:
             return
         layer.letter_spacing = spacing
         layer.tracking = spacing  # 两字段同步，避免导出端 `letter_spacing or tracking` 读到旧值。
-        # 文本修改后只更新 TextLayer，自身仍可继续编辑并重新渲染。
+        # 字号=真实大小：图层属性面板改字号即按字号反推文本框（框随字号长大，§58）；超画布安全区则封顶。
+        # 菜单栏全局设置不走此路、不覆盖各图层；手动「宽/高」走 _apply_layer_production，互不影响。
+        clamped = self._resize_text_box_to_font(layer)
         self._refresh_layers_panel()
         self._redraw_preview()
+        if clamped:
+            self.status_var.set("字号过大：已按画布安全区可雕刻范围封顶")
+
+    def _resize_text_box_to_font(self, layer: TextLayer, *, clamp_to_safe_area: bool = True) -> bool:
+        """按图层当前字号+文字墨迹反推文本框尺寸（字号=真实大小、框随墨迹长大、最多自动断 2 行），
+        并以原框中心为锚重定位 → 改字号/改文字时文字中心不跳、框对称地绕中心长大或缩小。
+
+        clamp_to_safe_area=True（默认）：框最大封顶到画布安全区，超出则 text_box_size_for_font 缩字号，
+        返回是否被封顶。
+        clamp_to_safe_area=False（画布内联编辑文字用）：给极大上限 → 永不封顶、字号守恒，框随墨迹自由
+        长大（可越出画布安全区）；返回「框是否已超出安全区」仅作非阻塞提示。"""
+        font_path = getattr(layer, "font_path", None)
+        text = (getattr(layer, "original_text", "") or getattr(layer, "text", "") or "").strip()
+        safe_w = max(1.0, self.document.canvas_width - 2 * SAFE_MARGIN_X)
+        safe_h = max(1.0, self.document.canvas_height - 2 * SAFE_MARGIN_Y)
+        max_w, max_h = (safe_w, safe_h) if clamp_to_safe_area else (UNBOUNDED_BOX_SIZE, UNBOUNDED_BOX_SIZE)
+        adv = ENDING_HEART_ADVANCE_RATIO if getattr(layer, "ending_heart", False) else 0.0
+        new_w, new_h, clamped = text_box_size_for_font(
+            text, layer.font_size, font_path,
+            max_width=max_w, max_height=max_h, ending_advance_ratio=adv,
+        )
+        # 以原框中心为锚，改字号/改文字时文字中心不动。
+        old_cx = layer.x + layer.text_box_width * layer.scale_x / 2
+        old_cy = layer.y + layer.text_box_height * layer.scale_y / 2
+        layer.text_box_width = new_w
+        layer.text_box_height = new_h
+        layer.width = new_w  # 文本图层视觉范围=文本框，同步保旋转中心/选择框/导出几何一致
+        layer.height = new_h
+        layer.x = old_cx - new_w * layer.scale_x / 2
+        layer.y = old_cy - new_h * layer.scale_y / 2
+        if clamp_to_safe_area:
+            return clamped
+        return bool(new_w * layer.scale_x > safe_w or new_h * layer.scale_y > safe_h)
 
     def _nudge_selected_layer(self, dx: int, dy: int) -> None:
         if self.inline_text_entry is not None:
@@ -4176,7 +4631,7 @@ class BirthFlowerApp:
     def _apply_auto_glyph_rules_to_layer(self, layer: TextLayer) -> None:
         """按当前字体规则自动应用首尾字形；失败只提示 warning，不阻塞渲染。"""
         try:
-            render_text, overrides, warnings, applied = apply_automatic_glyph_rules(
+            render_text, overrides, warnings, applied, wants_ending_heart = apply_automatic_glyph_rules(
                 layer.original_text,
                 self._font_design_label(),
                 layer.font_path,
@@ -4189,6 +4644,8 @@ class BirthFlowerApp:
             return
         layer.render_text = render_text
         layer.glyph_overrides = overrides
+        # Font 4 等字体末尾改用独立实心爱心：显式置位（非该字体则清零，便于切字体时去掉爱心）。
+        layer.ending_heart = bool(wants_ending_heart)
         if applied:
             self.current_glyph_overrides = dict(overrides)
             self.status_var.set("已自动应用字形")
@@ -4223,6 +4680,8 @@ class BirthFlowerApp:
         layer.bold_strength = layout.bold_strength
         layer.letter_spacing = layout.letter_spacing
         self._apply_auto_glyph_rules_to_layer(layer)
+        # 新建即按字号定框（字号=真实大小、框随字号长大，§58；ending_heart 已由自动字形规则置位）。
+        self._resize_text_box_to_font(layer)
         self.selected_preview_item = layer.id
         self._sync_layer_properties(layer)
         self._refresh_layers_panel()
@@ -4442,10 +4901,12 @@ class BirthFlowerApp:
         return fallback_width, fallback_height
 
     def _ruler_interval_mm(self, px_per_mm: float) -> float:
-        """根据当前缩放选择易读的 mm 主刻度间隔；单位固定 mm。"""
+        """根据当前缩放选择易读的 mm 主刻度间隔；单位固定 mm。
+        target_px = 主刻度在屏幕上的目标间距：越小 → 选中的 mm 间隔越小 → 刻度越密越详细。
+        取 40px（原 72px）让“缩小/看全板”时刻度更密；放大时本就够细，间隔不再变化。"""
         if px_per_mm <= 0:
             return 10.0
-        target_px = 72.0
+        target_px = 40.0
         for interval in (1, 2, 5, 10, 20, 50, 100, 200, 500):
             if interval * px_per_mm >= target_px:
                 return float(interval)
@@ -4811,14 +5272,6 @@ class BirthFlowerApp:
             return -1
         return 0
 
-    def _wheel_horizontal_pan_requested(self, event) -> bool:
-        """Alt/Shift + wheel: horizontal pan, matching common editor/CAD shortcuts."""
-        state = int(getattr(event, "state", 0) or 0)
-        shift_pressed = bool(state & 0x0001)
-        # Alt is usually Mod1 (0x0008) on Tk/X11; Windows Tk may report extended high bits.
-        alt_pressed = bool(state & 0x0008 or state & 0x20000)
-        return shift_pressed or alt_pressed
-
     def _on_canvas_motion(self, event) -> None:
         self.preview_pointer = (float(event.x), float(event.y))
         try:
@@ -4853,20 +5306,15 @@ class BirthFlowerApp:
         if direction == 0:
             return "break"
 
-        if self._wheel_horizontal_pan_requested(event):
-            # Shift/Alt + 滚轮只移动视口，不改变缩放；方向保持“滚轮向上→内容向右”。
-            self.preview_pan_x += direction * PREVIEW_WHEEL_PAN_STEP
-            canvas.focus_set()
-            self._redraw_preview()
-            return "break"
-
+        # 滚轮只负责缩放；平移由鼠标拖动负责，避免修饰键误判把缩放吞掉。
         old_scale, old_offset_x, old_offset_y = self._preview_transform(layout)
         if old_scale <= 0:
             return "break"
 
         old_zoom = self.preview_zoom
-        factor = PREVIEW_ZOOM_STEP if direction > 0 else 1 / PREVIEW_ZOOM_STEP
-        new_zoom = max(PREVIEW_ZOOM_MIN, min(PREVIEW_ZOOM_MAX, old_zoom * factor))
+        # 线性步进：上滚 +5%、下滚 -5%，保证 100→105→110→115 这样的整齐刻度。
+        new_zoom = old_zoom + direction * PREVIEW_ZOOM_STEP
+        new_zoom = max(PREVIEW_ZOOM_MIN, min(PREVIEW_ZOOM_MAX, new_zoom))
         if abs(new_zoom - old_zoom) < 1e-9:
             return "break"
 
@@ -4959,6 +5407,11 @@ class BirthFlowerApp:
         self.document.selected_layer_id = layer.id
         self.inline_text_layer_id = layer.id
         self.inline_text_original_text = layer.text
+        # 快照框几何：编辑中框随墨迹变动，Esc 取消时据此还原。
+        self.inline_text_original_box = (
+            layer.x, layer.y, layer.width, layer.height,
+            layer.text_box_width, layer.text_box_height,
+        )
         self.floating_text_editor = FloatingTextEditor(layer.id, layer.text)
         self.inline_text_is_closing = False
 
@@ -5015,6 +5468,11 @@ class BirthFlowerApp:
             else:
                 layer.render_text = new_text
             self.layer_text_var.set(layer.original_text)
+            # 固定字号，文本框随墨迹实时长大/缩小且不封顶（可越出画布安全区）；以框中心为锚重定位，
+            # 编辑器随之贴合 → 内容从中心展开，大字号不再被窗口裁切。
+            exceeds_safe_area = self._resize_text_box_to_font(layer, clamp_to_safe_area=False)
+            self._place_inline_text_editor()
+            self.status_var.set("文本框已超出画布安全区，雕刻时可能被裁切" if exceeds_safe_area else "")
             self._schedule_canvas_render()
         return "break"
 
@@ -5032,7 +5490,8 @@ class BirthFlowerApp:
         self._redraw_preview()
 
     def _place_inline_text_editor(self) -> None:
-        """按当前缩放/平移把覆盖编辑器放到文本图层 bounding box 附近。"""
+        """把覆盖编辑器**以文本框中心为锚**贴合到（随墨迹实时长大的）文本框上：
+        窗口尺寸跟随文本框、文字水平居中 → 内容从中心向四周展开，大字号也不会被窗口裁切。"""
         canvas = self.preview_canvas
         editor = self.inline_text_entry
         layer = self.document.layer_by_id(self.inline_text_layer_id)
@@ -5044,20 +5503,25 @@ class BirthFlowerApp:
             layout = EngravingLayout()
         scale, offset_x, offset_y = self._preview_transform(layout)
         left, top, right, bottom = layer.bounds
-        x = offset_x + left * scale
-        y = offset_y + top * scale
-        width = max(160, int((right - left) * scale))
-        height = max(44, int((bottom - top) * scale))
+        center_x = offset_x + (left + right) / 2 * scale
+        center_y = offset_y + (top + bottom) / 2 * scale
+        font_px = max(8, round(layer.font_size * scale))
+        # 窗口贴合实时文本框；留至少一个字高/字宽，保证空文本/小字号时光标仍可见。
+        width = max(int((right - left) * scale), font_px)
+        height = max(int((bottom - top) * scale), int(font_px * 1.4))
         try:
-            editor.configure(font=(self._selected_preview_font_family(), max(8, round(layer.font_size * scale))))
+            editor.configure(font=(self._selected_preview_font_family(), font_px))
+            # 文字水平居中：tk.Text 仅支持按 tag 设 justify，新输入需重新覆盖整段。
+            editor.tag_configure("center_layout", justify="center")
+            editor.tag_add("center_layout", "1.0", "end")
         except tk.TclError:
             pass
         if self.inline_text_window is None:
             self.inline_text_window = canvas.create_window(
-                x,
-                y,
+                center_x,
+                center_y,
                 window=editor,
-                anchor="nw",
+                anchor="center",
                 width=width,
                 height=height,
                 tags=("inline_text_editor",),
@@ -5065,7 +5529,7 @@ class BirthFlowerApp:
             if self.floating_text_editor is not None:
                 self.floating_text_editor.window_id = self.inline_text_window
         else:
-            canvas.coords(self.inline_text_window, x, y)
+            canvas.coords(self.inline_text_window, center_x, center_y)
             canvas.itemconfigure(self.inline_text_window, width=width, height=height)
         canvas.tag_raise(self.inline_text_window)
 
@@ -5101,6 +5565,10 @@ class BirthFlowerApp:
             else:
                 layer.render_text = self.inline_text_original_text
             self.layer_text_var.set(layer.original_text)
+            # 还原编辑前的框几何（编辑中框随墨迹变动过）。
+            if self.inline_text_original_box is not None:
+                (layer.x, layer.y, layer.width, layer.height,
+                 layer.text_box_width, layer.text_box_height) = self.inline_text_original_box
         self._destroy_inline_text_editor()
         self._refresh_layers_panel()
         self._redraw_preview()
@@ -5126,6 +5594,7 @@ class BirthFlowerApp:
         self.inline_text_window = None
         self.inline_text_layer_id = None
         self.inline_text_original_text = ""
+        self.inline_text_original_box = None
         self.floating_text_editor = None
         self.inline_text_is_closing = False
 
@@ -5151,28 +5620,20 @@ class BirthFlowerApp:
             self._drag_mode = "resize"
         else:
             layer = hit_test(self.document, doc_x, doc_y)
-            self._drag_target = layer.id if layer and not layer.locked else None
-            self._drag_mode = "move"
+            if layer is None:
+                # 空白处按下：左键拖动平移视图，不选中也不移动任何图层。
+                self._drag_target = None
+                self._drag_mode = "pan"
+                self._set_preview_cursor("fleur")
+            else:
+                self._drag_target = layer.id if not layer.locked else None
+                self._drag_mode = "move"
         self.document.selected_layer_id = layer.id if layer else None
         self.selected_preview_item = self.document.selected_layer_id
         self._drag_start = (event.x, event.y)
         canvas.focus_set()
         self._refresh_layers_panel()
         self._redraw_preview()
-
-    def _on_canvas_pan_press(self, event) -> str:
-        """鼠标中键按住后拖动平移画板；不改变图层选择和导出坐标。"""
-        canvas = self.preview_canvas
-        if canvas is None:
-            return "break"
-        if self.inline_text_entry is not None:
-            self._commit_inline_text_edit()
-        self._drag_target = None
-        self._drag_mode = "pan"
-        self._drag_start = (event.x, event.y)
-        self._set_preview_cursor("fleur")
-        canvas.focus_set()
-        return "break"
 
     def _set_preview_cursor(self, cursor: str) -> None:
         canvas = self.preview_canvas

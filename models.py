@@ -32,6 +32,10 @@ class ParseResult:
     material_key: str = ""
     font_library_id: str = ""
     font_key: str = ""
+    # 多订单批量识别：一次粘贴可含多笔订单，每笔带订单号 / 数量 / 礼品留言（见 gpt_parser.parse_orders_with_gpt）。
+    order_number: str = ""
+    quantity: int = 1
+    gift_message: str = ""
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,9 @@ class AIParseConfig:
     provider: str = "openai"
     base_url: str | None = None
     timeout: float = 20.0
+    # 前台「提取 / 背景提示词」：非空时作为发给 API 的系统提示词，驱动识别（见 gpt_parser.build_orders_system_prompt）。
+    system_prompt: str | None = None
+    background_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +210,9 @@ class TextLayer(Layer):
     underline: bool | None = None
     italic: bool | None = None
     bold_strength: float | None = None
+    # Font 4 等字体：末行末尾追加独立实心爱心符号（见 heart_symbol / glyph_service.font_uses_symbol_heart）。
+    # 由 ui_app/批量在套用自动字形规则时按字体置位；预览与导出据此追加爱心，保持字体无感知。
+    ending_heart: bool = False
 
     def __post_init__(self) -> None:
         """兼容旧 TextLayer：旧数据只有 text 时，迁移出 original_text/render_text。"""

@@ -555,6 +555,14 @@ def _text_layer_paths(
             underline_path = _polygon_ezpath(rect, matrix)
             if underline_path is not None:
                 paths.append(underline_path)
+    # Font 4 等：末尾独立实心爱心（desktop_export 已烘成 box 本地闭合 path，含 scale+translate）。
+    # 经同一图层 matrix → _parse_path_objects → SPLINE/POLYLINE，Z 闭合、无 HATCH，EzCad 自填实心。
+    raw_layout = layer.get("textLayout")
+    ending_heart = raw_layout.get("endingHeart") if isinstance(raw_layout, dict) else None
+    if isinstance(ending_heart, dict) and ending_heart.get("pathData"):
+        paths.extend(
+            _parse_path_objects(str(ending_heart["pathData"]), matrix, str(layer.get("id", "text")))
+        )
     return paths
 
 

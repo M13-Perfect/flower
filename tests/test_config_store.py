@@ -178,3 +178,23 @@ def test_with_product_prompts_allows_empty_and_isolates_other_products(tmp_path)
     product = active_product(load_config(path))
     assert product.extraction_prompt == ""
     assert product.background_prompt == ""
+
+
+def test_save_and_load_config_keeps_inbox_settings(tmp_path):
+    """收件夹路径与自动解析开关随配置往返持久化（automation 一期）。"""
+    path = tmp_path / "config.json"
+    config = AppConfig(inbox_folder=tmp_path / "inbox", inbox_autoparse=False)
+
+    save_config(config, path)
+    loaded = load_config(path)
+
+    assert loaded.inbox_folder == tmp_path / "inbox"
+    assert loaded.inbox_autoparse is False
+
+
+def test_load_config_defaults_inbox_off(tmp_path):
+    """旧配置无 inbox 键：收件夹为空（功能关），自动解析默认开。"""
+    config = load_config(tmp_path / "missing.json")
+
+    assert str(config.inbox_folder) in ("", ".")
+    assert config.inbox_autoparse is True

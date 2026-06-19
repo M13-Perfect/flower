@@ -67,10 +67,11 @@ class LibraryBundle:
 
 # ---------------------------------------------------------------------- 解析输出富化
 def enrich_parse_result(result: ParseResult, bundle: LibraryBundle) -> ParseResult:
-    """把 ParseResult 落到具体素材/字体：填 library_id + key + 资产路径，并回填旧 month/flower。
+    """把 ParseResult 落到具体素材/字体：填 library_id + key + 资产路径，并回填 month/flower。
 
-    解析优先级（素材）：已有 material_key（动态枚举校验）→ 旧 month+flower 标签反查 → flower_name 模糊。
-    字体同理：font_key → font 编号标签 → font_design 模糊。命中不了不臆造，只在 key 非法时记 warning。
+    解析优先级（素材）：已有 material_key（动态枚举校验）→ flower_name 模糊匹配。
+    **不再用出生月份+序号挑素材**：素材只按 key / 花名定位，月份不参与选素材（按需求 2026-06-18 调整）。
+    字体仍按业务编号：font_key → font 编号标签 → font_design 模糊。命中不了不臆造，只在 key 非法时记 warning。
     幂等：重复富化结果不变（catalog GPT 路径内部已富化一次，pipeline 再富化一次也安全）。
     """
     warnings = list(result.warnings)
@@ -87,8 +88,7 @@ def enrich_parse_result(result: ParseResult, bundle: LibraryBundle) -> ParseResu
         if found is None:
             warnings.append(f"素材 key「{material_key}」不在当前产品素材库中，已忽略")
             material_key = ""
-    if found is None and month is not None and flower is not None:
-        found = bundle.resolve_material_by_tags(month=month, flower=flower)
+    # 只按花名匹配：月份不再参与选素材（旧的 resolve_material_by_tags(month,flower) 已移除）。
     if found is None and result.flower_name:
         found = bundle.resolve_material(result.flower_name)
     if found is not None:

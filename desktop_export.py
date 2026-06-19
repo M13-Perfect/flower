@@ -17,8 +17,9 @@ from typing import Any
 from xml.etree import ElementTree
 
 from glyph_service import rebuild_render_text
+from heart_symbol import HEART_ASPECT, HEART_VIEW_H, HEART_VIEW_W, heart_path_d_transformed
 from models import Document, ImageLayer, Layer, TextLayer, layer_text_style
-from text_layout import fit_text_box
+from text_layout import ENDING_HEART_ADVANCE_RATIO, fit_text_box, place_ending_heart
 
 # services/api(导出权威所在)未必已安装为包,确保它在 sys.path 上,
 # 这样下面函数里惰性 import app.domain.exports.* 一定可用(否则按钮点击会 ImportError 崩溃)。
@@ -249,6 +250,9 @@ def _text_layer(layer: TextLayer) -> dict[str, Any]:
         )
     except Exception:
         render_text = layer.render_text or source_text
+    # Font 4 等：末尾缀独立爱心时在末行预留推进量，名字+爱心一起适配字号（与预览同一套）。
+    wants_heart = bool(getattr(layer, "ending_heart", False))
+    ending_advance_ratio = ENDING_HEART_ADVANCE_RATIO if wants_heart else 0.0
     fit = fit_text_box(
         render_text,
         box_width,
@@ -260,6 +264,7 @@ def _text_layer(layer: TextLayer) -> dict[str, Any]:
         vertical_align=vertical_align,
         line_spacing=line_spacing,
         letter_spacing=letter_spacing,
+        ending_advance_ratio=ending_advance_ratio,
     )
     # 字体样式（加粗/下划线）解析后烘进 style，供 svg/dxf 矢量端消费（与预览同一套 layer_text_style）。
     tstyle = layer_text_style(layer)
@@ -281,6 +286,21 @@ def _text_layer(layer: TextLayer) -> dict[str, Any]:
         "lines": list(fit.lines),
         "origins": [[float(origin_x), float(origin_y)] for (origin_x, origin_y) in fit.origins],
     }
+    # Font 4 等：把末尾独立实心爱心烘成 box 本地的闭合矢量 path（已 scale+translate），
+    # svg/dxf 端原样消费、套图层矩阵即可，导出服务保持通用（不感知“爱心”概念）。
+    if wants_heart:
+        placement = place_ending_heart(fit, layer.font_path)
+        if placement is not None:
+            hx, hy, hscale = placement
+            schema["textLayout"]["endingHeart"] = {
+                "pathData": heart_path_d_transformed(hx, hy, hscale),
+                "x": float(hx),
+                "y": float(hy),
+                "scale": float(hscale),
+                "aspect": float(HEART_ASPECT),
+                "viewW": float(HEART_VIEW_W),
+                "viewH": float(HEART_VIEW_H),
+            }
     overrides = _glyph_overrides(layer)
     if overrides:
         schema["glyphOverrides"] = overrides

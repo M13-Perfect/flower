@@ -938,6 +938,17 @@ def _font_key(font_design: str) -> str:
     return text or "Unknown"
 
 
+# 这些字体的“末尾爱心”改用独立实心爱心符号（heart_symbol.HEART_PATH_D），
+# 而不是字体 PUA 区的“字母+爱心”合体字形。命中时跳过 end_char_rules，
+# 由渲染/导出端在末行末尾追加爱心。键为 _font_key 归一后的值。
+SYMBOL_HEART_FONTS = frozenset({"Font 4"})
+
+
+def font_uses_symbol_heart(font_id: str | None) -> bool:
+    """该字体是否以独立实心爱心符号收尾（目前仅 Font 4）。"""
+    return _font_key(font_id or "") in SYMBOL_HEART_FONTS
+
+
 def _letter_key(letter: str) -> str:
     clean = str(letter or "").strip().casefold()
     return clean if re.fullmatch(r"[a-z]", clean) else ""
@@ -1339,17 +1350,24 @@ def remove_glyph_override(original_text: str, glyph_overrides: Mapping[int, Mapp
     return rebuild_render_text(original_text, overrides, font_path=font_path, text_layer_id=text_layer_id)
 
 
-def apply_automatic_glyph_rules(original_text: str, font_id: str, font_path: str | Path | None, glyph_overrides: Mapping[int, Mapping[str, Any]] | None = None, rules: GlyphRulesConfig | None = None, *, order_id: str = "") -> tuple[str, dict[int, dict[str, Any]], list[str], bool]:
+def apply_automatic_glyph_rules(original_text: str, font_id: str, font_path: str | Path | None, glyph_overrides: Mapping[int, Mapping[str, Any]] | None = None, rules: GlyphRulesConfig | None = None, *, order_id: str = "") -> tuple[str, dict[int, dict[str, Any]], list[str], bool, bool]:
+    """返回 (render_text, overrides, warnings, applied, wants_ending_heart)。
+
+    wants_ending_heart=True 表示该字体（目前仅 Font 4）应在末行末尾追加独立实心爱心；
+    此时本函数不再用 end_char_rules 替换末字（名字保持原样），爱心由渲染/导出端补。
+    """
     rules_config = rules or GlyphRulesConfig.load()
     overrides = {int(k): dict(v) for k, v in (glyph_overrides or {}).items()}
     warnings: list[str] = []
+    # 仅当系统启用 + 文本非空时才会真正追加爱心；否则一律 False（空文本无处可缀）。
+    uses_symbol_heart = font_uses_symbol_heart(font_id)
     if not rules_config.enabled:
         render_text, clean, rebuild_warnings = rebuild_render_text(original_text, overrides, font_path=font_path)
-        return render_text, clean, rebuild_warnings, False
+        return render_text, clean, rebuild_warnings, False, False
     font_rules = rules_config.font_rules(font_id)
     if not font_rules or not (original_text or "").strip():
         render_text, clean, rebuild_warnings = rebuild_render_text(original_text, overrides, font_path=font_path)
-        return render_text, clean, rebuild_warnings, False
+        return render_text, clean, rebuild_warnings, False, False
     applied = False
 
     def add_rule(index: int, codepoint: str, usage: str, rule_name: str) -> None:
@@ -1411,16 +1429,19 @@ def apply_automatic_glyph_rules(original_text: str, font_id: str, font_path: str
             cp = start_rules.get(original_text[first_index]) or start_rules.get(original_text[first_index].casefold())
             if cp:
                 add_rule(first_index, str(cp), "start", "start_char_rules")
-        end_index = len(stripped) - 1
-        while end_index >= 0 and not stripped[end_index].isalnum():
-            end_index -= 1
-        if end_index >= 0:
-            ch = stripped[end_index]
-            cp = end_rules.get(ch) or end_rules.get(ch.casefold())
-            if cp:
-                add_rule(end_index, str(cp), "end", "end_char_rules")
+        # Font 4 等“独立爱心”字体跳过 end_char 合体字形替换——末字保持原样，
+        # 末尾爱心改由渲染/导出端按 wants_ending_heart 追加独立符号。
+        if not uses_symbol_heart:
+            end_index = len(stripped) - 1
+            while end_index >= 0 and not stripped[end_index].isalnum():
+                end_index -= 1
+            if end_index >= 0:
+                ch = stripped[end_index]
+                cp = end_rules.get(ch) or end_rules.get(ch.casefold())
+                if cp:
+                    add_rule(end_index, str(cp), "end", "end_char_rules")
     render_text, clean, rebuild_warnings = rebuild_render_text(original_text, overrides, font_path=font_path)
-    return render_text, clean, [*warnings, *rebuild_warnings], applied
+    return render_text, clean, [*warnings, *rebuild_warnings], applied, uses_symbol_heart
 
 
 def candidate_to_variant(glyph: GlyphCandidate, *, font_id: str, font_path: str | Path, base_char: str = "", usage: str = "any") -> GlyphVariant:

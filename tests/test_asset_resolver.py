@@ -44,40 +44,53 @@ def test_scan_font_assets_accepts_single_ttf_file(tmp_path):
     assert assets[0].path == Path(font_path)
 
 
-def test_scan_font_assets_maps_birth_flower_business_fonts_by_name_and_size(tmp_path):
-    small_malovely = tmp_path / "Malovely Script.otf"
-    large_malovely = tmp_path / "Malovely Script.ttf"
-    small_adora = tmp_path / "AdoraBella.otf"
-    large_adora = tmp_path / "AdoraBella.ttf"
-    small_malovely.write_bytes(b"m" * 10)
-    large_malovely.write_bytes(b"m" * 20)
-    small_adora.write_bytes(b"a" * 30)
-    large_adora.write_bytes(b"a" * 40)
+def test_scan_font_assets_splits_each_business_font_into_regular_and_ending(tmp_path):
+    # 新规则：每个家族只需 1 个字体文件，同一文件同时承载「常规 / 带末尾装饰」两个编号。
+    malovely = tmp_path / "Malovely Script.ttf"
+    adora = tmp_path / "AdoraBella.ttf"
+    malovely.write_bytes(b"m" * 20)
+    adora.write_bytes(b"a" * 40)
 
     assets = scan_font_assets(tmp_path)
 
     assert [(asset.index, asset.name, asset.path.name) for asset in assets[:4]] == [
-        (1, "Malovely Script", "Malovely Script.otf"),
+        (1, "Malovely Script", "Malovely Script.ttf"),
         (2, "Malovely Script", "Malovely Script.ttf"),
-        (3, "AdoraBella", "AdoraBella.otf"),
+        (3, "AdoraBella", "AdoraBella.ttf"),
         (4, "AdoraBella", "AdoraBella.ttf"),
     ]
+    # 1&2 同源、3&4 同源：区别只在末尾装饰，不再靠第二个文件。
+    assert assets[0].path == assets[1].path
+    assert assets[2].path == assets[3].path
+    assert assets[0].has_ending_glyphs is False
     assert assets[1].font_design == "Font 2"
-    assert assets[1].file_size == 20
     assert assets[1].has_ending_glyphs is True
+    assert assets[2].has_ending_glyphs is False
     assert assets[3].font_design == "Font 4"
     assert assets[3].has_ending_glyphs is True
 
 
-def test_scan_font_assets_keeps_other_fonts_after_business_fonts(tmp_path):
-    (tmp_path / "Other.otf").write_bytes(b"x" * 5)
+def test_scan_font_assets_picks_ttf_representative_when_legacy_otf_lingers(tmp_path):
+    # 家族内仍残留旧 .otf 时，取 .ttf 为代表文件，.otf 被忽略（不再编号）。
     (tmp_path / "Malovely Script.otf").write_bytes(b"m" * 10)
     (tmp_path / "Malovely Script.ttf").write_bytes(b"m" * 20)
 
     assets = scan_font_assets(tmp_path)
 
     assert [(asset.index, asset.path.name) for asset in assets] == [
-        (1, "Malovely Script.otf"),
+        (1, "Malovely Script.ttf"),
+        (2, "Malovely Script.ttf"),
+    ]
+
+
+def test_scan_font_assets_keeps_other_fonts_after_business_fonts(tmp_path):
+    (tmp_path / "Other.otf").write_bytes(b"x" * 5)
+    (tmp_path / "Malovely Script.ttf").write_bytes(b"m" * 20)
+
+    assets = scan_font_assets(tmp_path)
+
+    assert [(asset.index, asset.path.name) for asset in assets] == [
+        (1, "Malovely Script.ttf"),
         (2, "Malovely Script.ttf"),
         (3, "Other.otf"),
     ]
@@ -89,7 +102,7 @@ def test_scan_flower_assets_adds_general_asset_metadata(tmp_path):
 
     assets = scan_flower_assets(tmp_path)
 
-    assert assets[0].asset_key == "june-rose"
+    assert assets[0].asset_key == "rose"  # key 取纯花名（已去月份）
     assert assets[0].display_name == "Rose"
     assert assets[0].category == "birth_flower"
     assert assets[0].is_vector_safe is True
@@ -115,5 +128,5 @@ def test_match_asset_by_name_prefers_asset_key_then_display_name(tmp_path):
     assets = scan_flower_assets(tmp_path)
 
     assert match_asset_by_name(assets, "rose").display_name == "Rose"
-    assert match_asset_by_name(assets, "april daisy").display_name == "Daisy"
+    assert match_asset_by_name(assets, "daisy").display_name == "Daisy"
     assert match_asset_by_name(assets, "unknown") is None

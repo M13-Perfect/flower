@@ -80,7 +80,7 @@ def test_screenshot_openai_catalog_mode(tmp_path: Path):
                     "content": [
                         {
                             "type": "output_text",
-                            "text": '{"text":"V","material_key":"march-daffodil","font_key":"malovelyscript","warnings":[],"confidence":0.9}',
+                            "text": '{"text":"V","material_key":"daffodil","font_key":"malovelyscript","warnings":[],"confidence":0.9}',
                         }
                     ]
                 }
@@ -88,7 +88,7 @@ def test_screenshot_openai_catalog_mode(tmp_path: Path):
         }
 
     result = parse_order_screenshot_with_gpt(img, bundle=bundle, api_key="sk-test", http_post=fake)
-    assert result.material_key == "march-daffodil"
+    assert result.material_key == "daffodil"
     assert result.selected_flower_asset  # 富化到具体素材路径
 
 

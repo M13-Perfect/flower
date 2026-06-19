@@ -21,13 +21,49 @@ ORDER_REMARK_SCHEMA: dict[str, Any] = {
     "properties": {
         "text": {"type": "string"},
         "month": {"type": ["integer", "null"], "minimum": 1, "maximum": 12},
-        "font": {"type": ["integer", "null"], "minimum": 1, "maximum": 8},
+        "font": {"type": ["integer", "null"], "minimum": 1, "maximum": 4},
         "flower": {"type": ["integer", "null"], "minimum": 1, "maximum": 2},
         "warnings": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
     "required": ["text", "month", "font", "flower", "warnings", "confidence"],
 }
+
+# 多订单 schema：一次粘贴可能含多笔订单（每块第一行=订单号），模型输出 orders 数组，每条一笔。
+ORDER_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "order_number": {"type": "string"},
+        "quantity": {"type": ["integer", "null"], "minimum": 1},
+        "month": {"type": ["integer", "null"], "minimum": 1, "maximum": 12},
+        "flower_name": {"type": "string"},
+        "flower": {"type": ["integer", "null"], "minimum": 1, "maximum": 2},
+        "font": {"type": ["integer", "null"], "minimum": 1, "maximum": 4},
+        "text": {"type": "string"},
+        "gift_message": {"type": "string"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": [
+        "order_number", "quantity", "month", "flower_name", "flower",
+        "font", "text", "gift_message", "warnings", "confidence",
+    ],
+}
+
+ORDERS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"orders": {"type": "array", "items": ORDER_ITEM_SCHEMA}},
+    "required": ["orders"],
+}
+
+# 【已删除·本地业务规则提示词】原 ORDERS_PROMPT_SCAFFOLD（角色定义＋订单块格式＋输出字段＋warnings 规则）
+# 与 DEFAULT_EXTRACTION_RULES 兜底文案曾写死在此处。按要求「解析不携带任何本地业务规则」已彻底删除：
+# 多订单系统提示词现在 **100% 来自前台**（字段区规则 + 背景提示词框，见 ui_app._assemble_field_rules）。
+# 机器 I/O 约定（让模型输出 orders 数组/字段名）不属于业务规则、按要求保留：
+#   - OpenAI：由 ORDERS_SCHEMA（json_schema strict）强约束输出结构；
+#   - DeepSeek：由 _parse_orders_with_deepseek 追加的「顶层 orders + 字段列表」提醒兜底。
 
 HttpPost = Callable[[str, dict[str, Any], dict[str, str], float], dict[str, Any]]
 
@@ -67,16 +103,9 @@ def parse_order_remark_with_gpt(
         "store": False,
         # GPT-5 nano 会消耗推理预算；过低时可能只返回 reasoning 而没有结构化文本。
         "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+        # 【已删除·本地业务规则】原 system 提示词（text/month/font/flower 语义、warnings 规则）已删除。
+        # 单订单 OpenAI 路径输出结构由 ORDER_REMARK_SCHEMA（json_schema strict）保证，本地不再注入业务规则。
         "input": [
-            {
-                "role": "system",
-                "content": (
-                    "你是 Birth Flower 订单备注解析器。只提取客户要雕刻的信息，"
-                    "输出 JSON。字段：text=姓名或要雕刻文字，month=1-12，"
-                    "font=字体编号，flower=同月份第几个花朵素材 1-2。"
-                    "缺失或不确定时填 null 并写入中文 warnings。"
-                ),
-            },
             {"role": "user", "content": remark},
         ],
         "text": {
@@ -102,7 +131,7 @@ def parse_gpt_payload(payload: dict[str, Any]) -> ParseResult:
     """校验并转换 GPT JSON 为 ParseResult，避免 UI 直接信任模型输出。"""
     text = str(payload.get("text") or "").strip()
     month = _bounded_int(payload.get("month"), 1, 12)
-    font = _bounded_int(payload.get("font"), 1, 8)
+    font = _bounded_int(payload.get("font"), 1, 4)
     flower = _bounded_int(payload.get("flower"), 1, 2)
     raw_warnings = payload.get("warnings", [])
     warnings = [str(item) for item in raw_warnings if str(item).strip()] if isinstance(raw_warnings, list) else []
@@ -116,6 +145,163 @@ def parse_gpt_payload(payload: dict[str, Any]) -> ParseResult:
         month=month,
         font=font,
         flower=flower,
+        warnings=warnings,
+        confidence=round(max(0.0, min(1.0, confidence_number)), 2),
+    )
+
+
+def build_orders_system_prompt(
+    rules: str | None = None, background_prompt: str | None = None
+) -> str:
+    """组装多订单系统提示词：**只拼接前台内容**（字段区规则 + 背景提示词），本地不再注入任何脚手架/业务规则。
+
+    `rules` 来自前台字段区（ui_app._assemble_field_rules），`background_prompt` 来自背景提示词框；
+    两者都为空时返回空串——此时输出结构仍由 OpenAI 的 ORDERS_SCHEMA / DeepSeek 的字段提醒保证。
+    """
+    prompt = (rules or "").strip()
+    extra = (background_prompt or "").strip()
+    if extra:
+        prompt = f"{prompt}\n\n【背景】{extra}" if prompt else f"【背景】{extra}"
+    return prompt
+
+
+def parse_orders_with_gpt(
+    remark: str,
+    api_key: str | None = None,
+    model: str | None = None,
+    project: str | None = None,
+    organization: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
+    system_prompt: str | None = None,
+    background_prompt: str | None = None,
+    http_post: HttpPost | None = None,
+    timeout: float = 20,
+) -> list[ParseResult]:
+    """多订单版：一次解析含多笔订单的文本，返回 ParseResult 列表（每笔一条）。
+
+    系统提示词来自前台「提取/背景提示词」（system_prompt/background_prompt），为空时回落默认提示词。
+    """
+    selected_provider = _normalize_provider(provider)
+    prompt = build_orders_system_prompt(system_prompt, background_prompt)
+    if selected_provider == "deepseek":
+        return _parse_orders_with_deepseek(
+            remark, prompt, api_key=api_key, model=model, base_url=base_url,
+            http_post=http_post, timeout=timeout,
+        )
+    if selected_provider != "openai":
+        raise ValueError(f"不支持的 AI provider：{selected_provider}")
+
+    key = api_key or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("未配置 OPENAI_API_KEY，无法调用 GPT 解析")
+    selected_model = model or os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
+    payload = {
+        "model": selected_model,
+        "store": False,
+        "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+        "input": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": remark},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "birth_flower_orders_parse",
+                "strict": True,
+                "schema": ORDERS_SCHEMA,
+            }
+        },
+    }
+    if _supports_reasoning(selected_model):
+        payload["reasoning"] = {"effort": "minimal"}
+    headers = _build_headers(key, project=project, organization=organization)
+    try:
+        response = (http_post or _http_post)(OPENAI_RESPONSES_URL, payload, headers, timeout)
+    except error.HTTPError as exc:
+        raise RuntimeError(_format_http_error(exc, "OpenAI")) from exc
+    return parse_orders_payload(_extract_structured_payload(response))
+
+
+def _parse_orders_with_deepseek(
+    remark: str,
+    system_prompt: str,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    http_post: HttpPost | None = None,
+    timeout: float = 20,
+) -> list[ParseResult]:
+    key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        raise RuntimeError("未配置 DEEPSEEK_API_KEY，无法调用 DeepSeek 解析")
+    selected_model = model or os.environ.get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
+    payload = {
+        "model": selected_model,
+        "messages": [
+            {
+                "role": "system",
+                # DeepSeek 不支持 json_schema，只能要 json_object；显式叮嘱顶层 orders 数组与字段。
+                "content": system_prompt
+                + ' 必须输出 JSON：{"orders":[...]}，每个元素含 order_number, quantity, month, '
+                "flower_name, flower, font, text, gift_message, warnings, confidence。",
+            },
+            {"role": "user", "content": remark},
+        ],
+        "response_format": {"type": "json_object"},
+        "thinking": {"type": "disabled"},
+        "stream": False,
+        "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+    }
+    headers = _build_headers(key)
+    try:
+        response = (http_post or _http_post)(_deepseek_chat_url(base_url), payload, headers, timeout)
+    except error.HTTPError as exc:
+        raise RuntimeError(_format_http_error(exc, "DeepSeek")) from exc
+    return parse_orders_payload(_extract_chat_payload(response, "DeepSeek"))
+
+
+def parse_orders_payload(payload: dict[str, Any]) -> list[ParseResult]:
+    """校验并转换多订单 JSON 为 ParseResult 列表；兼容模型偶尔直接返回单条对象。"""
+    if not isinstance(payload, dict):
+        return []
+    raw_orders = payload.get("orders")
+    if isinstance(raw_orders, list):
+        return [_parse_order_item(item) for item in raw_orders if isinstance(item, dict)]
+    # 容错：模型未包 orders 直接给了单条结果。
+    if "text" in payload or "order_number" in payload or "flower" in payload:
+        return [_parse_order_item(payload)]
+    return []
+
+
+def _parse_order_item(item: dict[str, Any]) -> ParseResult:
+    """单条订单字段校验：越界数字裁成 None，字符串去空白，绝不信任模型原样输出。"""
+    # 刻字内容：去首尾 + 把中间连续多空格/换行合并成单个空格（多余空格无效、不影响生产）。
+    text = " ".join(str(item.get("text") or "").split())
+    month = _bounded_int(item.get("month"), 1, 12)
+    font = _bounded_int(item.get("font"), 1, 4)
+    flower = _bounded_int(item.get("flower"), 1, 2)
+    order_number = str(item.get("order_number") or "").strip()
+    quantity = _bounded_int(item.get("quantity"), 1, 100000) or 1
+    flower_name = str(item.get("flower_name") or "").strip()
+    gift_message = str(item.get("gift_message") or "").strip()
+    raw_warnings = item.get("warnings", [])
+    warnings = (
+        [str(w) for w in raw_warnings if str(w).strip()] if isinstance(raw_warnings, list) else []
+    )
+    try:
+        confidence_number = float(item.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence_number = 0.0
+    return ParseResult(
+        text=text,
+        month=month,
+        font=font,
+        flower=flower,
+        flower_name=flower_name or None,
+        order_number=order_number,
+        quantity=quantity,
+        gift_message=gift_message,
         warnings=warnings,
         confidence=round(max(0.0, min(1.0, confidence_number)), 2),
     )
@@ -261,12 +447,9 @@ def _deepseek_chat_url(base_url: str | None) -> str:
 
 
 def _order_remark_system_prompt() -> str:
-    return (
-        "你是 Birth Flower 订单备注解析器。只提取客户要雕刻的信息，输出 JSON。"
-        "字段：text=姓名或要雕刻文字，month=1-12，font=字体编号，"
-        "flower=同月份第几个花朵素材 1-2。缺失或不确定时填 null 并写入中文 warnings。"
-        "必须输出字段：text, month, font, flower, warnings, confidence。"
-    )
+    # 【已删除·本地业务规则】原本写死 month=1-12 / flower=同月第几个花朵 / font 语义 / warnings 规则，已删除。
+    # DeepSeek 单订单无 json_schema，这里**仅保留机器 I/O 约定**（输出 JSON 及字段名），不含任何业务规则。
+    return "只输出 JSON，不要解释。必须包含字段：text, month, font, flower, warnings, confidence。"
 
 
 def _response_output_types(response: dict[str, Any]) -> list[str]:

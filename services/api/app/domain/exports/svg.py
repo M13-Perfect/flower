@@ -301,6 +301,15 @@ def _render_text_layer(layer: dict[str, Any]) -> str:
             paths.append(
                 f'<path d="{_attr(rect)}" fill="{_attr(fill)}" data-layer-id="{_attr(str(layer.get("id") or ""))}"/>'
             )
+    # Font 4 等：末尾独立实心爱心（desktop_export 已烘成 box 本地闭合 path，含 scale+translate）。
+    # 单条闭合 <path>，nonzero 缠绕 → 实心；与字形 path 同处图层 <g>，自动套图层变换。
+    raw_layout = layer.get("textLayout")
+    ending_heart = raw_layout.get("endingHeart") if isinstance(raw_layout, dict) else None
+    if isinstance(ending_heart, dict) and ending_heart.get("pathData"):
+        paths.append(
+            f'<path d="{_attr(str(ending_heart["pathData"]))}" fill="{_attr(fill)}" '
+            f'data-layer-id="{_attr(str(layer.get("id") or ""))}"/>'
+        )
     return "\n".join(paths)
 
 

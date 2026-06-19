@@ -22,6 +22,27 @@ MONTH_NAME_TO_NUMBER = {
     "december": 12,
 }
 
+# 月份缩写（订单与文件名里常见 Jun/Jul 等）。只用于「按 camelCase 拆出的整词」匹配，
+# 不做子串扫描，避免误伤花名（如 Marigold 里的 "mar"、May 不会切走 "Marigold"）。
+MONTH_ABBR_TO_NUMBER = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "sept": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+# 整词月份集合（全名 + 缩写），用于从花名里剔除月份整词。
+MONTH_TOKENS = set(MONTH_NAME_TO_NUMBER) | set(MONTH_ABBR_TO_NUMBER)
+
 PREFERRED_FLOWER_ORDER = {
     1: ("snowdrop", "carnation"),
     2: ("violet", "primrose"),
@@ -77,7 +98,7 @@ def scan_flower_assets(directory: Path | str) -> list[FlowerAsset]:
                     month=month,
                     flower=index,
                     path=path,
-                    asset_key=_asset_key(path.stem),
+                    asset_key=_asset_key(display_name),
                     display_name=display_name,
                     category="birth_flower",
                     is_vector_safe=not raster_warnings,
@@ -112,31 +133,50 @@ def match_asset_by_name(assets: list[FlowerAsset], query: str) -> FlowerAsset | 
 
 
 def scan_font_assets(source: Path | str) -> list[FontAsset]:
-    """字体源可为单个字体文件，也可为字体目录，方便后期扩展到 3-8 个字体。"""
+    """字体源可为单个字体文件，也可为字体目录。
+
+    业务字体家族（Malovely Script / AdoraBella）每家族仅 1 个字体文件，同一文件同时
+    对应「常规 / 带末尾装饰」两个编号（见 :func:`_ordered_font_paths`）。
+    """
     path = Path(source)
     if path.is_file() and path.suffix.casefold() in FONT_EXTENSIONS:
-        return [_font_asset(path, 1)]
+        return [_font_asset(font, index) for index, font in _ordered_font_paths([path])]
     if not path.exists() or not path.is_dir():
         return []
 
-    fonts = list(
-        (item for item in path.iterdir() if item.is_file() and item.suffix.casefold() in FONT_EXTENSIONS),
-    )
+    fonts = [
+        item for item in path.iterdir() if item.is_file() and item.suffix.casefold() in FONT_EXTENSIONS
+    ]
     return [_font_asset(font, index) for index, font in _ordered_font_paths(fonts)]
 
 
 def _ordered_font_paths(fonts: list[Path]) -> list[tuple[int, Path]]:
-    """按业务字体规则编号；同名字体中大文件是带字形版本。"""
+    """按业务字体规则编号。
+
+    每个字体家族只需 1 个字体文件，同一文件同时对应「常规 / 带末尾装饰」两个编号：
+    Malovely Script → 字体 1（常规）、字体 2（末尾字符映射字形）；
+    AdoraBella      → 字体 3（常规）、字体 4（末尾追加爱心 SVG 矢量）。
+    末尾装饰的具体形态由 ``glyph_service`` 决定（end_char_rules / SYMBOL_HEART_FONTS），
+    与字体文件无关，故同一文件按「基准编号」与「基准+1」各产出一个字体选项。
+    家族内若仍有多个文件（如遗留 .otf），取代表文件（优先 .ttf），其余忽略。
+    """
     used: set[Path] = set()
     ordered: list[tuple[int, Path]] = []
     for group_key, start_index in BUSINESS_FONT_GROUPS:
         group = sorted(
             (font for font in fonts if _compact_name(font.stem) == group_key),
-            key=lambda font: (_font_size(font), font.suffix.casefold(), font.name.casefold()),
+            key=lambda font: (
+                0 if font.suffix.casefold() == ".ttf" else 1,
+                _font_size(font),
+                font.name.casefold(),
+            ),
         )
-        for offset, font in enumerate(group[:2]):
-            ordered.append((start_index + offset, font))
-            used.add(font)
+        if not group:
+            continue
+        representative = group[0]
+        used.update(group)
+        ordered.append((start_index, representative))
+        ordered.append((start_index + 1, representative))
 
     next_index = 1
     used_indexes = {index for index, _font in ordered}
@@ -199,10 +239,21 @@ def _font_family_name(path: Path) -> str:
 
 def _month_from_name(name: str) -> int | None:
     normalized = _compact_name(name)
+    # 先用月份全名做子串匹配（兼容无大小写分词的命名，如 Waterlilyjuly 里的 july）。
     for month_name, month in MONTH_NAME_TO_NUMBER.items():
         if month_name in normalized:
             return month
+    # 再用月份缩写做整词匹配（如 JunHoneysuckle 里的 Jun）；整词避免误伤花名子串。
+    for word in _name_words(name):
+        month = MONTH_ABBR_TO_NUMBER.get(word.casefold())
+        if month is not None:
+            return month
     return None
+
+
+def _name_words(name: str) -> list[str]:
+    """按 camelCase / 分隔符拆词，供月份识别与花名清洗共用。"""
+    return re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)", name.replace("_", " ").replace("-", " "))
 
 
 def _sort_flower_paths(month: int, paths: list[Path]) -> list[Path]:
@@ -225,8 +276,8 @@ def _display_name(name: str) -> str:
     for token, display in DISPLAY_NAMES.items():
         if token in compact:
             return display
-    words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)", name.replace("_", " ").replace("-", " "))
-    words = [word for word in words if word.casefold() not in MONTH_NAME_TO_NUMBER]
+    # 去掉所有月份整词（全名 + 缩写），只留纯花名；如 AsterSeptember→Aster、JunHoneysuckle→Honeysuckle。
+    words = [word for word in _name_words(name) if word.casefold() not in MONTH_TOKENS]
     return " ".join(words).strip() or name.strip()
 
 

@@ -5,6 +5,18 @@
 > **当前事实来源**：`PROJECT_INDEX.md` + `CURRENT_TASKS.md`（已校正本文件 Architecture 段）。导出/EzCad 细节见 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
 >
 > **2026-06-17 决策（新对话先读）**：继续开发**纯桌面端**（Tkinter），web 迁移**暂缓**（仅当出现**远程/多地操作员**才重启）。**操作员默认全权**（粘单/解析/画布编辑/加删图层/换素材/资源库/输出/新建产品/生成），**启动无登录页直接进操作员态**；**唯一上锁** = 「**提示词配置**」（背景词 + 提取/字段规则 + 校验规则，驱动 AI 识别那块），进它才要**管理员密码**。换素材**只在图层已绑定的变体内换**。复用现有配置锁机制（`self._locked_widgets`/`_ctk_card(locked=True)`/`config_locked`，原无密码=P4，本轮**只给「提示词配置」那张卡补密码存 hash**）。**红线：锁只盖提示词配置、不盖画布。** 设计/边界/已定项详见 `docs/superpowers/plans/2026-06-17-operator-admin-role-split.md`。
+>
+> **2026-06-18 决策（新对话先读，覆盖下方「追加（同会话…）」段里关于 `ORDERS_PROMPT_SCAFFOLD` 的旧描述）**：用户要求**解析层不携带任何本地业务规则**，提示词 **100% 来自前台**。本轮在 `gpt_parser.py` **真删除**了所有写死的业务规则提示词：① `ORDERS_PROMPT_SCAFFOLD`（角色/订单块格式/输出字段/warnings 规则脚手架）+ `DEFAULT_EXTRACTION_RULES` 兜底 → 删除；`build_orders_system_prompt(rules, background)` 改为**只拼接前台内容**（字段规则 + `【背景】`），空入参返回空串。② 单订单 OpenAI（`parse_order_remark_with_gpt`）删除业务规则 system 消息（输出靠 `ORDER_REMARK_SCHEMA`）。③ `_order_remark_system_prompt`（DeepSeek 单订单）删业务语义、仅留 I/O 字段约定。**机器 I/O 约定按用户要求保留**：OpenAI `ORDERS_SCHEMA`(json_schema strict) + DeepSeek `_parse_orders_with_deepseek` 的「顶层 orders+字段列表」提醒（line 261-263）原样不动，故解析不会坏。catalog 链（`order_catalog.build_catalog_system_prompt`）本轮**未动**（桌面主链路不走它）。测试：`test_orders_multi.py` 改导入(去 `DEFAULT_EXTRACTION_RULES`)+2 处断言（脚手架→「只含前台内容/空串」），解析层全绿。已知：`test_ui_app.py::test_field_instructions_drive_ai_system_prompt` 红，是**旧测试 vs 现默认字段**不符（默认字段已无 month/Narcissus 月→花表），**非本轮引入**，需后续对齐 `_default_field_defs` 与该测试。
+>
+> **web 分支暂挂(2026-06-17 体检后)**：`claude/web-editor`(worktree `.worktrees\web-editor`)脚手架完整(React19+**Fabric7**+真 FastAPI),但 `services/api` 引擎落后根目录几个月(无 `text_layout`/`material_library`/`order_catalog`/`config_store`/`gpt_parser`/`screenshot_parser`/`glyph_service`),且 **SVG/PNG 是前端 `exportPipeline.ts` TS 渲染、绕开 Python WYSIWYG**(只有 DXF 走 Python)。**复工第一步=引擎归一**(根模块搬进 services/api + 暴露 Python svg/png 接口 + 删 TS 渲染),不是堆 UI。详见该设计文档 §12。
+
+> **2026-06-19 · 「订单自动化与排版系统」增量方案——flower 核心承担的切片（新对话先读）**
+> 三仓大方案权威设计 = `C:\Users\Administrator\.claude\plans\ezcad2-7-6-flower-c-users-administrator-staged-wren.md`（基线 A=增量扩展现有代码，不重写）。**契约已冻结**：店小秘订单 JSON 现可带 `items[]`（多盒子/多件/其他商品，每项 is_target_box/quantity/personalization_raw）+ `refund_status`（见 `automation/contracts/order.schema.json`，automation 侧已落地，向后兼容）。
+>
+> **flower 核心待做**：① **解析消费多件**——`order_importer.py` / `models.py ParseResult` 读 `items[]`；"数量 vs 定制条数"三种买法（A 一条备注 N 名字 / B N 个行项目 / C ×N 同一定制）在 `gpt_parser.py`/`parse_pipeline.py` 做**语义拆分 + 件数校验**，不一致→人工审核（扩展只抓结构，**拆分在 flower GPT 层**，边界待真单调优）。② **多件→多文件生成**：一单两盒子出 `订单号-1`/`订单号-2` 不互相覆盖（命名/映射 = 计划 P0-6；**动 flower 生产关键路径，动手前先与用户敲定**）。③ **解析页可观测性**：点「解析」按序刷新 ①原始内容 ②本次提示词全文 ③结构化结果（提示词随本次操作自动刷新、不用再点一次）。④ **人工审核闭环**（查看原文/触发原因、改结构化数据、放行/驳回/转客服/重解析、审计；通过=**新版本不覆盖**原解析=计划 D2）。⑤ **编辑器组合图层**（Phase 5）：把"文字层/素材层"合成"一个图层内 文字+间距(px)+素材+文字"（现 `models.py` TextLayer/ImageLayer 分离，这是方案里**唯一允许的有限重构**；护栏 `tests/test_text_wysiwyg_consistency.py` 必须全绿才合并）。⑥ **文字 x-height/视觉中线精细对齐**（Phase 6，**阻塞**于用户手绘样例，先别硬猜算法，仅预留每图层上下偏移参数）。
+>
+> **已是现状、别重做**（需求文档曾误判为"待建"）：字体二(PUA 合体字形替末字母)/字体四(保留全名、末尾加独立爱心)已实现且预览/SVG/DXF 三端一致（`glyph_service.py`/`heart_symbol.py`/`text_layout.py`）；可见边界缩放 `visual_layout.fit_content_bbox_to_target_rect`；基线对齐 `text_layout.fit_text_box`；画布/图层 XY 配置。这些降级为「真机演示验收」。
+> **纪律**：`automation/contracts/order.schema.json` 只走计划/协调线程改。
 
 ## 背景（这个项目在做什么）
 
@@ -26,6 +38,161 @@
 5. **人工复审工作台**：截图 + 可编辑字段 + 实时预览，对低置信/超框项人工介入。
 6. 桌面文本输入框加**右键复制/粘贴**菜单。
 > **2026-06-14 新需求（已出 ExecPlan，待实现）**：把「单产品 + 全局单素材库 + month/flower 定位 + 全局生产参数」演进为 **Product → 素材库 → 素材(key/别名/标签/默认参数) → 图层(可挂库+生产参数 override)**。素材/字体不再单一；月份字段→「素材库+素材」选择器；订单解析改为把库 catalog 注入 GPT、动态枚举校验 material_key（本地不写死）。演进兼容（birth-flower=产品0，month/flower 降为标签，金标/批量不破）；后期左侧加产品切换器（每窗口=一个产品）。**设计与分阶段计划见 `docs/superpowers/plans/2026-06-14-layer-material-library-system.md`**。本轮只出文档未改代码。
+
+## 本会话改动（2026-06-18 · 功能区锁范围调整 + info 结果框只读接 AI，仅改 ui_app.py）
+
+承 2026-06-17「锁只盖提示词配置、不盖画布/操作员日常」红线，本轮两处 UI 调整，**只改 `ui_app.py`**：
+- **「图层」卡 + 「字体库 / 素材库」卡移出配置锁定区**：两卡 `_ctk_card(..., locked=True)` 改回不带 `locked`（标题不再带 🔒）；`_build_production_panel` 的「+ 文字图层 / + 图片图层」与 `_build_library_panel` 的「点击上传」**不再 `_register_lock`**。效果：配置锁定态下操作员仍可增删/编辑图层、上传字体/素材。（动态图层行本来就没入锁。）
+- **info「字段」卡右侧结果框改只读 + 接 AI 解析回填（混合语义匹配）**：`_render_fields` 里 `result` Entry 改 `state="readonly"` 且**移出 `_register_lock`**（本就不可手输，`readonly` 不挡程序 `set()`，锁开合都保持只读）。`_apply_parse_result` 末尾调 `_apply_results_to_fields(result)`：对每个字段用 `_field_result_target(instruction)` 决定它指向 `ParseResult` 的哪个字段——**① 先认显式「填 <schema字段>」声明**（默认提示词写法，取「填」到首个冒号/句号前声明区，正则 `(?<!\w)key(?!\w)`，按 `_RESULT_FILL_PRIORITY = flower_name>text>font>month>flower` 取一）；**② 没写「填X」则按 `_RESULT_SEMANTIC_KEYWORDS` 中文/英文语义关键词回退**（`花/花名/出生花→flower_name`、`字体/font→font`、`刻字/文本/文字/名字→text`、`月份/月→month`，元组顺序即优先级）。命中后 `_result_attr_display(key, result)` 取值（None→空串；**`font` 特判成 `font{N}` 格式**，如 4→`font4`，对齐用户提示词「font1/font2/font3」写法）写进 `result_var` + `field_results`。
+- **为什么是混合而非纯「填X」**：用户**实际持久化的字段提示词是自然语言中文**（field1`提取花朵的名称`、field2`顾客想要的字体编号…font1;font2,font3`、field3`顾客需要定制的文本内容…超过20字符输出error`），**不含「填X」**，纯「填X」全部落空→框空。混合匹配后用户实测路由正确：**field1→`flower_name`、field2→`font`(显示`font4`)、field3→`text`**。注意 field1 name 叫「刻字内容」但 instruction 是「提取花名」（name 是旧标签，按 instruction 路由才对，与用户预期一致）。
+- **架构澄清（易误解）**：框里显示的值 **100% 来自 AI 返回的 `ParseResult`**（`text/flower_name/font/...`，固定 schema 见 `models.py:14`）；本地代码只做「路由」=读提示词文字决定哪个 AI 字段进哪个框，**不映射本地内容**。
+- **背景**：之前 info 结果框是**可编辑且从不被 AI 填充**的占位控件（`field_results` 只在 `__init__` 设过、`_apply_parse_result` 只写旧字段 `name_var/month_var/font_var/flower_var`）；本轮接成「只读显示 AI 解析值」。这些框仍**不参与生成**（生成走旧字段 + 图层），纯展示给操作员确认。
+- **已知风险（未真机端到端验）**：路由按「AI 把花名填进 `flower_name`、刻字文本填进 `text`」假设；若某些自定义提示词导致 AI 把值塞进了别的 schema 字段（如花名进了 `text`），框会错位/空。用户已口头确认上面三字段路由对，但**未核对真实 API 原始返回**。语义关键词表是启发式，新字段措辞刁钻可能误命中，按需在 `_RESULT_SEMANTIC_KEYWORDS` 调词/优先级。真正稳的解法仍是方案 C（解析器按字段 key 返回，跨 `gpt_parser/parse_pipeline/models`，本轮未做）。
+- **验证**：`py_compile` 过；混合匹配逻辑**对用户真实持久化的 3 个提示词**独立脚本验过（field1→flower_name、field2→font→`font4`、field3→text）。`pytest tests/test_ui_app.py` = **65 过 / 8 失**，8 失全是**本轮之前就存在**的失败：6× 预览画板 zoom/pan/ruler（根因是工作区既有 WIP `PREVIEW_ZOOM_STEP 1.25→0.05`，非本轮）、`test_text_case_toggle...`（`self.case_button` 未创建，WIP 改名未完）、`test_field_instructions_drive_ai_system_prompt`（本文件上方 2026-06-18 段已记为「旧测试 vs 现默认字段」非本轮引入）。**无法 git stash 复验基线**——分支 test 与 ui_app.py 是 WIP 纠缠（stash 单文件即触发 ImportError）。**未真机点测**（需用户在 App 里验：①锁定后图层/库卡仍可操作；②解析后 info1/2/3 框显示对应 AI 值[字体为 `font4`]、不可编辑）。
+
+## 本会话改动（2026-06-18 · 「文件名」框接线：导出按订单号/手填名命名，仅改 ui_app.py + test）
+
+「输出设置」卡里的「文件名」框（`filename_template_var`）**此前是死控件**——只在 `__init__`(851) 定义 + `_build_output_settings_panel`(1838) 绑定，**任何导出逻辑都不读它**；导出名一直只取「输出目录」`output_var` 路径的 stem，故用户填了不生效。本轮按用户拍板（语义：**纯文本所见即所得**；**留空→自动用订单号**）接线，**只动 `ui_app.py` + `tests/test_ui_app.py`**：
+- 新增模块级 `sanitize_filename_stem(name)`：去 Windows 非法字符 `<>:"/\|?*`+控制符、首尾空格/点，保留设备名(CON/NUL/COM1…)前缀 `_` 避让，清空→`""`。
+- 新增 `BirthFlowerApp._resolve_output_basename(base_output_path)`：优先级回退 **①「文件名」框（清洗后） → ②订单号（`current_order_number`，回退 `_inbox_active.stem`=inbox JSON 文件名） → ③`output_var` 原 stem（旧行为，名字永不为空）**。
+- `confirm_and_generate`：`target_path` 由 `output_path_for_format(base,fmt)` 改 `base_output_path.with_name(f"{stem}.{fmt}")`（保留目录、不走 with_suffix，避免主干含点被截断）；`output_path_for_format` 函数保留（仍有单测）。
+- 测试：`test_sanitize_filename_stem_*` + `test_resolve_output_basename_priority`（用 `SimpleNamespace` 当 fake self，免构整套 headless UI）共 2 条新增全过。
+- 验证：`py_compile` 过；`pytest tests/test_ui_app.py tests/test_config_store.py` = **76 过 / 7 失**，7 失全是**本轮之前就存在**的 headless 画板/`case_button`/初始化菜单断言（已 `git stash` 基线复验确认与本轮无关）。**未真机点测**（需用户在 App 里验：填名/留空两种导出名）。
+
+**仍未做（本轮只接文件名、没接 metadata）**：`desktop_export.py:119` 的 `metadata.orderId` 仍硬编码 `""`——「按订单号写 metadata」与本轮「按订单号命名文件」是两件事，后者已做、前者待接。
+**~~已知 foot-gun（未处理）~~ → 已消除（2026-06-18，见下「收件夹订单号接线」会话）**：原问题=inbox 放行下一单时手填的文件名会沿用。现 `_auto_load_order` **每单载入都把 `filename_template_var` 设为当前 order_id**，旧值被覆盖，foot-gun 不再存在。
+
+## 本会话改动（2026-06-18 · 收件夹订单号接线：order_id 进订单信息首行 + 文件名框）
+
+需求：店小秘抓单 JSON（`outputs/inbox/`，形如 `{order_id}.json`，含 `order_id`+`remark`）自动载入时，除已实现的 `remark`→订单信息框外，**订单号也要进订单信息框第 1 行（订单号在前、备注在后），并写进「文件名」框**。
+- `order_importer.py`：新增 `OrderImport(order_id, remark)` NamedTuple + `load_order_from_file()`（**同时取 order_id 与 remark**，JSON/CSV 按 `ORDER_ID_KEYS`/`REMARK_KEYS` 找，纯文本→order_id 空串）；`load_order_remark_from_file()` 保留并改为 `load_order_from_file().remark`（向后兼容，手动导入路径不变）。`_find_remark` 泛化为 `_find_value(value, keys)`。
+- `ui_app.py` `_auto_load_order`：改用 `load_order_from_file`；订单信息框 = `f"{order_id}\n{remark}"`（订单号置顶，对齐解析器「订单块首行=订单号」约定），并 `self.filename_template_var.set(order_id)`。手动「导入备注」`import_remark_file` **未动**（仍走 `load_order_remark_from_file`，处理任意 txt/csv）。
+- 测试：`test_order_importer.py` +2（JSON 取 order_id 而非 spec、txt 空 order_id）；`test_inbox_poller.py` fake app 加 `filename_template_var`、断言改「订单号\n备注」+ 文件名框=order_id。`pytest tests/ --ignore=test_document_vector_export.py` = **344 过 / 8 失 / 7 skip**，8 失全是本轮之前就有的 headless GUI 失败（与本轮无关）。**未真机点测**（需用户在 App 里验：自动载单后订单信息框首行=订单号、文件名框=订单号）。
+
+## 本会话改动（2026-06-18 · 画布内联编辑：从中心展开 + 文本框随墨迹实时变动、不封顶）
+
+**需求**：双击文本图层进画布内联编辑时，①内容从**文本框中心**展开（避免字号过大被编辑器窗口裁切显示不全）；②编辑过程中**固定字号，文本框随字体墨迹实时变大/变小**。用户拍板：顶到画布安全区也**不封顶、不缩字号**（框可越界，仅给非阻塞提示）；编辑器居中精度=**窗口锚框中心 + 文字水平居中**即可（不做多行精确垂直居中）。
+
+**⚠️ 踩到的现实矛盾（已订正）**：动手时发现**工作区 `ui_app.py` 被回退成旧版**，下文 §「文本字号=真实大小」描述的 `_resize_text_box_to_font` 方法**整个不存在**，连 `from text_layout import text_box_size_for_font/SAFE_MARGIN_*/ENDING_HEART_ADVANCE_RATIO` 都没 import；而 `text_layout.py`（`text_box_size_for_font` 等）与本文档 §53-58 仍是新版 → 文档/排版层比工作区 ui_app 新。
+
+**本会话改了 `ui_app.py`**（仅此一文件 + 两处测试）：
+- **补回** `text_layout` 的 4 个导入 + 新增模块常量 `UNBOUNDED_BOX_SIZE=1e7`。
+- **重建** `_resize_text_box_to_font(layer, *, clamp_to_safe_area=True)`：按字号+墨迹反推框（`text_box_size_for_font`）、同步 `text_box_width/height` 与 `width/height`、以原框中心为锚重定位防跳。`clamp_to_safe_area=True`(默认)=封顶画布安全区+返回 clamped；`=False`(内联编辑)=给 `UNBOUNDED_BOX_SIZE` 上限→永不封顶、字号守恒，返回「是否越出安全区」仅作提示。
+- **内联编辑接线**：`_on_inline_text_modified` 每次输入→`_resize_text_box_to_font(layer, clamp_to_safe_area=False)`→`_place_inline_text_editor()`，越界则 status 提示「文本框已超出画布安全区，雕刻时可能被裁切」。`_place_inline_text_editor` 改为**锚框中心**(`anchor="center"`)+窗口贴合实时框(去掉 160/44 固定下限、留≥1 字高宽)+`tk.Text` 加 `center_layout` tag(`justify="center"`)水平居中。
+- **Esc 取消还原框几何**：`_start_inline_text_edit` 快照 `inline_text_original_box`（x/y/width/height/text_box_w/h），`_cancel_inline_text_edit` 还原，`_destroy` 清空（编辑中框会随墨迹变动过，取消须连框一起回退）。
+- 测试：`test_text_layout.py` +1（同字号、文字变长→框变宽）；`test_ui_app.py` +2（用「假 self+解绑方法」headless 测 resize：随墨迹变宽+中心不动；不封顶越界 vs 封顶到安全区）。**3 个新测试 + 16 个原 text_layout 全过**；`py_compile` 通过。`test_ui_app.py` 余 8-9 个失败=**预存环境性**（headless Tk「main thread is not in main loop」线程污染、缺 `pydantic`、控制台 GBK 对 CJK 乱码），与本轮无关（如 glyph_menu 单独跑即过）。
+
+**§58 接线已按用户决定恢复**（回退后曾整体丢失）：用户拍板「**功能区图层属性面板**跟随字号/框变化；**左上角菜单栏全局设置不覆盖**」。本会话据此把 `_resize_text_box_to_font(layer)`（默认 `clamp_to_safe_area=True`=封顶画布安全区+告警）接回：
+- `_apply_text_layer_properties`（图层属性面板改字号即生效、框随字号长大，clamped 时 status 提示「字号过大：已按画布安全区可雕刻范围封顶」）；
+- `_add_text_layer_from_fields`（新建文字图层即按字号定框）。
+- **刻意不接**：菜单栏全局设置（`layout_vars`，仅初始化新图层、不覆盖现有，护栏 `test_global_layout_defaults_only_initialize_new_layers`）；手动「宽/高」走 `_apply_layer_production`（生产参数，最后操作生效，不被字号覆盖）；字体下拉 `_add_selected_font_to_canvas`（只换 font_path、不重排，留作后续——换字体后需在面板再点应用才会按新字体重排）。
+
+**已知 / 未做（不许当已完成）**：
+- ① 编辑器垂直方向为近似居中（`tk.Text` 内容顶对齐于「锚中心、贴框高」的窗口），按用户决定未做多行精确垂直居中。
+- ② 字体下拉换字体不会即时重排框（见上「刻意不接」），需面板再点一次「应用文本属性」。
+- ③ **未真机点测**：需在 App 验证——（内联）双击打字框随墨迹实时变大/变小、内容居中不被裁、超大字号给越界提示、Esc 连框还原；（面板）改字号文字实时变大/变小且不消失、超大封顶提示；新建图层即按字号定框；导出尺寸与预览一致。
+
+## 本会话改动（2026-06-18 · 文本字号=真实大小、文本框随字号长大）
+
+**修的 bug**：「文本属性」改字号在编辑框/预览看不见。根因=`font_size` 原本只当**上限 cap**，真实字号由「自适应铺满文本框」算出（[text_layout.py](text_layout.py) `_fit_name_layout`/`_fit_name_font_size`，`text_renderer.py:112` 注释明示），所以改大无效、改小到一定程度墨迹塌成透明（`text_renderer.py` 返回透明图层）。
+- 用户拍板：**字号=真实大小、所见即所得、文本框随字号长大**；断行=**宽高都长 + 保留自动断行（≤NAME_MAX_LINES=2）**；超出固定画布(1732×1280)安全区=**封顶 + 警告**。
+- 方案（**`fit_text_box` 本体不动**，护栏零冲击）：`text_layout.py` 新增 `text_box_size_for_font(text, font_size, font_path, *, max_width, max_height, ending_advance_ratio, personalization_type)`——与自适应比例（NAME_HEIGHT_RATIO=0.62 / NAME_BLOCK_HEIGHT_RATIO=0.86 / NAME_SIDE_PAD_RATIO）**互逆**反推出文本框 (w,h,clamped)，框放大 `_BOX_FONT_SLACK=1.04` 使 `fit_text_box(box, font_size_cap=fs)` 渲染真实字号**恰等于 fs**（cap 精确封顶）；单行墨迹超 max_width 自动均衡断 2 行；任一维超上限则封顶到画布安全区并置 clamped。
+- `ui_app.py`：新增 `_resize_text_box_to_font(layer)`（按字号反推框 + 同步 `text_box_width/height` 与 `width/height` + 以中心为锚重定位防跳 + 返回 clamped）；在 `_apply_text_layer_properties`（改字号即生效，clamped 时 status 提示「已按画布安全区可雕刻范围封顶」）与 `_add_text_layer_from_fields`（新建即按字号定框）调用。max=画布 − 2×SAFE_MARGIN(X120/Y70)=1492×1140。预览/导出共读 `text_box_width/height`，所见即所得。
+- 测试：`test_text_layout.py` +4（**round-trip 真实字号==目标字号** fs∈{60,120,240,360}、随字号生长、超宽断行、超界封顶），全过。`pytest tests/ --ignore=test_document_vector_export.py` = **348 过 / 8 失 / 7 skip**，8 失同前（headless GUI，与本轮无关）；ruff clean。
+- **已知/未做**：① 祝福语(message)路径字号本就硬封顶 160（`_fit_message_box`），helper 对 message 仅按行高堆框、未深做；② 重定位按 scale=1 近似（文本图层默认 scale 1）；③ **未真机点测**（需用户在 App 验：改字号文字实时变大/变小且不消失、超大字号封顶提示、导出尺寸与预览一致）。
+
+## 本会话改动（2026-06-18 · Font 4 末尾改用「独立实心爱心符号」替换 PUA 合体字形）
+
+**背景/动机**：旧逻辑里 Font 4 的“末尾爱心”是把名字**最后一个字母替换成字体 PUA 区（U+E034–E04D）的「字母+爱心」合体字形**（`glyph_service.apply_automatic_glyph_rules` 的 end_char_rules）。用户要求改成：末行末尾**追加一颗独立实心爱心**（用户提供的固定手绘形状），行内紧贴末字右侧、基线对齐、**大小随字号自适应**；**只 Font 4、自动加**；三端（PNG 预览 / SVG / DXF）一致，DXF 为闭合矢量让 EzCad 自填实心。设计/决策见 `~/.claude/plans/jazzy-twirling-thompson.md`。
+
+**关键事实**：爱心源 SVG 的 path 全是 SVG 圆弧 `a` 命令，而矢量端 `_parse_path_objects` 只认 `M/L/H/V/Q/C/Z`（圆弧/`S`/`T` 都会抛 `SVG_UNSUPPORTED_PATH_COMMAND`）。故 author-time 用 `fontTools` 归一化成全贝塞尔 `M/C/Q/Z`、零基化，固化成常量（重生成脚本 `tmp_out/gen_heart.py`）。渲染/导出对“爱心”无字体感知——由 `TextLayer.ending_heart` 布尔标志驱动。
+
+**改了哪些文件 / 为什么**：
+- **新增** `heart_symbol.py`（几何唯一真源：`HEART_PATH_D`/`HEART_VIEW_W/H`/`HEART_ASPECT` + `heart_svg_markup(fill)` + `heart_path_d_transformed(x,y,scale)`）；**新增** `assets/symbols/heart.svg`（归档原始源文件）。
+- `glyph_service.py`：加 `font_uses_symbol_heart(font_id)`（暂只 `Font 4`）；`apply_automatic_glyph_rules` 对 Font 4 **跳过 end_char 替换**、返回**新增第 5 个布尔** `wants_ending_heart`。
+- `models.py`：`TextLayer` 加 `ending_heart: bool = False`。
+- `text_layout.py`：常量 `ENDING_HEART_SIZE_RATIO=0.62`/`GAP_RATIO=0.12`/`ADVANCE_RATIO`；`place_ending_heart(fit, font_path)`（单一大脑算 box 本地 (x,y,scale)）；`fit_text_box(..., ending_advance_ratio=0.0)` 在**名字分支**预留爱心推进量（名字+爱心一起 contain-fit、末行整体居中）。**ratio=0 与原逻辑字节一致**（非 Font 4 零回归）。
+- `text_renderer.py`：预览端把爱心 cairosvg 栅格化后**缀到最后一行图像右侧**（走现有 compose/居中，单行/多行都与导出末行整体居中一致）；cairosvg 失败只告警不崩。
+- `desktop_export.py`：`_text_layer` 把爱心烘成 `textLayout.endingHeart={pathData(已 scale+translate 的 box 本地闭合 d), x,y,scale,...}`（不带爱心则**整 key 省略**，其它文字 schema 零变化）。
+- `services/api/app/domain/exports/{svg,dxf}.py`：消费 `endingHeart` —— svg 追加一条实心 `<path>`；dxf 经 `_parse_path_objects` 出**闭合 SPLINE/POLYLINE，无 TEXT/无 HATCH**，EzCad 自填实心。
+- 调用方：`ui_app._apply_auto_glyph_rules_to_layer` 解 5 元组并置 `layer.ending_heart`（非该字体清零）；`order_batch.py:108`（校验，丢弃结果）解包加宽。
+
+**验证**：全量 `pytest` = **424 passed / 7 failed（全部预存，与本次无关）/ 1 skipped**；ruff clean。7 个失败均为 **2026-06-18 未提交的预览交互重做**遗留（`PREVIEW_ZOOM_STEP` 1.25→0.05、删中键/Shift+Alt 平移→`<B2-Motion>`/zoom/ruler/pan 测试未更新）+ 文档已记的 `case_button` 死代码；`git diff HEAD -- ui_app.py` 可见这些删除非本次所为。新增护栏：`tests/test_heart_symbol.py`（**守住“无圆弧命令”地基**）、`tests/test_ending_heart_vector.py`（svg 多 1 条实心 path / dxf 无 TEXT 无 HATCH、爱心闭合）、`tests/test_text_layout.py`（place_ending_heart + 预留不溢出 + ratio=0 字节一致）、`tests/test_text_wysiwyg_consistency.py`（预览 vs 矢量爱心右缘一致）、`tests/test_glyph_application.py`（Font 4 不再写 PUA、wants_heart=True）。**已视觉核对**：预览（Ammy/Lily/Emma/Sophia/Anna Marie）+ SVG 导出渲染与预览逐像素一致（`tmp_out/heart_preview_sheet.png`、`heart_export_svg.png`）。
+
+**已知未解决 / 待办**：
+- **真机手测仍待用户**：在 App 里把字体选成 Font 4 看预览爱心观感、导 DXF 进 EzCad 确认爱心闭合可填实心且位置紧贴字末、同名导 SVG/PNG 三端一致。
+- **尺寸/间距是目测初值**（`text_layout.ENDING_HEART_SIZE_RATIO`/`ENDING_HEART_GAP_RATIO`），如真机偏大/偏小改这两个常量即可（一处改，三端同步）。
+- 迁移：旧会话内已写入 PUA override 的 Font 4 图层，要重新套用字体规则（切字体/重解析）才会改成独立爱心；无磁盘文档持久化，重启即清。
+- Font 4 = `BirthMonth flowers/AdoraBella.ttf`（字体编号 4；该家族现仅此 1 个 `.ttf`）。
+
+### 追加（2026-06-18 · 字体编号映射订正，本次 `asset_resolver` 改动）
+
+旧规则「每家族 2 个文件按大小分常规/带字形版」已废弃——用户清理后**每家族仅 1 个有效 `.ttf`**（`Malovely Script.ttf`、`AdoraBella.ttf`，旧 `.otf` 已删）。原 `asset_resolver._ordered_font_paths` 仍按「每家族 2 文件」编号，导致**只生成字体 1、3，字体 2/4 丢失**（`order_batch`/UI 按 `asset.index` 选字体会匹配失败）。
+
+- **改法**：`_ordered_font_paths` 改为**同一文件产出常规(基准号)+带末尾装饰(基准+1)两个编号**：`Malovely Script.ttf`→字体 1/2，`AdoraBella.ttf`→字体 3/4。`scan_font_assets` 单文件分支也走同一逻辑。`has_ending_glyphs={2,4}` 不变。
+- **末尾装饰来源（既有 `glyph_service` 逻辑已对，未动）**：字体 2=字体内 PUA 末尾合体字形（`glyph_rules` end_char_rules E068–E081）；字体 4=独立爱心 SVG 矢量（`SYMBOL_HEART_FONTS`，跳过字体字形，即上文本块逻辑）。
+- **key 冲突非本次引入**：Font 1/2 同家族 → `material_library._scan_font_entries` 同 key，旧「4 文件」时代即如此；主选字体走 `resolve_font_by_tags(index=)` 按 index 匹配不受影响，故 `material_library` 未动。
+- **验证**：`tests/test_asset_resolver.py` 已同步新规则（9 passed）；`test_material_library`/`test_order_catalog`/`test_ending_heart_vector`/`test_glyph_application` 全过。文档 `docs/ai-recognition-static-mapping.md §5.1/§5.2` 已订正。
+- **文案 + 提示词同步订正（2026-06-18，已完成）**：
+  - `ui_app.format_font_asset_label` 末尾后缀由「含字形/普通」两态改为「常规 / 末尾字形 / 末尾爱心」三态，用 `glyph_service.font_uses_symbol_heart(design)` 区分 Font 4（独立爱心 SVG，无字形映射）与 Font 2（字体内末尾字形）；测试 `tests/test_ui_app.py::test_format_font_asset_label_distinguishes_ending_decoration` 三态全锁。
+  - 前台字体字段 `ui_app._default_field_defs` field3（=AI 提示词的字体规则唯一来源）同款订正：`4=AdoraBella 带结尾字形` → `4=AdoraBella 末尾爱心（非字体字形）`，并补「字体名/外观 → 编号」语义（让 AI 把「Malovely/带爱心」口语描述映射到编号）。
+  - `gpt_parser` 两处 schema `font maximum 8→4` + 两处 `_bounded_int(font,1,4)`：**AI 路径**字体收紧到实际素材 1–4（越界裁 null）。注意**本地/legacy 解析仍留 1–8**（`parser.py._parse_font`/`_font_number_from_design`，给后期加字体留位；`test_parse_pipeline.py:43` 用「Font 8」走本地路径仍断言 font==8）——AI 严于本地是有意的。
+  - 文档 `docs/ai-recognition-static-mapping.md §5.1/§5.2` 已同步。
+
+### 追加（2026-06-18 · 全局 AI 对齐：编排层停用本地解析规则）
+
+承接「多订单 `parse_orders_auto` 已 AI-only」，本次把**单订单 `parse_pipeline._resolve_order_remark` 也改成 AI-only**，至此本地解析在编排层全局停用：
+
+- **改法**：`_resolve_order_remark` 始终走 GPT（不再看「AI 优先」开关），AI 异常直接上抛、AI 不完整返回低置信 + `["AI解析不完整：…"]`，**不回退本地**；旧的 prefer-AI 门控 + 本地回退、以及 `from local_order_parser import parse_order_remark_local` 都**注释保留可恢复**。`_local_orders/split_order_blocks/_should_prefer_ai/_combined_failure/_local_failure` 留作存档（`split_order_blocks` 仍被 `test_orders_multi` 直接测）。
+- **不删本地模块**：`local_order_parser.py`/`parser.py`/`birth_flower_parser.py` 仍在、`test_local_order_parser.py` 仍跑（直接测模块）；只是编排层不再调用。
+- **测试**：`tests/test_parse_pipeline.py` 里 7 个覆盖「本地/回退」的旧用例改 `@pytest.mark.skip(reason=本地停用…)` 保留可恢复，新增 3 个 AI-only 用例（始终调 GPT / 不完整→低置信不回退 / 异常上抛）；`tests/test_order_catalog.py` 两处 `local_parser=` 改 `gpt_parser=`。全量（除并发重构的 `test_ui_app.py`）**285 passed / 7 skipped**。
+- **UI 收尾（已做）**：「AI 优先」开关此前已被换成 AI 识别页一行只读说明；本次按用户要求把该说明也**注释移除**（`ui_app._build_ai_settings_tab` 内，row 0 空行自动塌缩，保留可恢复）。`build_ai_parse_config` 的 `prefer_ai` 恒为 True。
+- 文档 `docs/ai-recognition-static-mapping.md §0` 已加停用说明。
+
+## 本会话改动（2026-06-18 · AI 提示词接进 API + 多订单识别接线）
+
+承接用户需求「现在的 AI 提示词规则放在了前台，请把完善的提示词写好，使通过 API 提取正确参数传入后端」。**两个核对到的硬事实**：①前台 `extraction_prompt/background_prompt` 只存配置、**从不被 parse_pipeline/gpt_parser 读取**（真正发出去的是 `gpt_parser` 写死的系统提示词）；②旧 schema 一次只出**单条** `{text,month,font,flower}`，但真实订单一次粘贴含**多笔**（每块第一行=订单号 + 出生花/字体/Personalization[/GiftMessage]）。本轮把两条都接通。
+
+- **模型**（`models.py`）：`ParseResult` 加 `order_number/quantity/gift_message`；`AIParseConfig` 加 `system_prompt/background_prompt`（均带默认值，旧调用零影响）。
+- **解析层**（`gpt_parser.py`，**新增、不动旧单订单路径**）：`DEFAULT_EXTRACTION_PROMPT`（完善的提取提示词，**内置「月→花名→序号」「字体编号」对照表**，地面真相来自 `asset_resolver`）；`ORDER_ITEM_SCHEMA/ORDERS_SCHEMA`（多订单 strict json_schema）；`build_orders_system_prompt`（前台提取词为空→回落默认；背景词作【附加背景】附加）；`parse_orders_with_gpt`（OpenAI Responses + DeepSeek，返回 `list[ParseResult]`）；`parse_orders_payload`/`_parse_order_item`（越界数字裁 None、字符串去白、容错单条对象）。
+- **管线**（`parse_pipeline.py`，新增）：`parse_orders_auto(remark,*,ai_config,bundle,...)`→`list[ParseResult]`。**全局只用 AI 解析（用户 2026-06-18 拍板）**：始终调多订单 GPT、不受「AI 优先」开关影响，**AI 失败直接抛错由 UI 提示、不再回退本地**。本地兜底（`_local_orders`/`split_order_blocks`/`_should_prefer_ai` 门控）**已注释停用、保留可恢复**（其单测仍在，函数仍可调）。传 bundle 时每条富化落素材/字体 key。`_call_orders_gpt` 把 `ai_config.system_prompt/background_prompt` 透传给 GPT（=接线关键）。
+  - 注：legacy 单订单路径 `parse_order_remark_auto`/`_resolve_order_remark`（批量/旧测试用，桌面已不走）**未动**，仍保留本地规则。`split_order_blocks` 等本地兜底代码与单测保留，恢复只需取消 `parse_orders_auto` 里的注释。
+- **前台**（`ui_app.py`）：`_current_ai_config` 注入「当前产品 extraction_prompt（空→默认）+ background_prompt」到 `AIParseConfig` → **提示词真正发给 API**；`parse_remark` 改调 `parse_orders_auto`；新增 `_apply_parsed_orders`（存队列、载入第 1 笔、状态「识别到 N 笔」）+ 队列导航 `‹上一笔/下一笔›`（单笔隐藏）；`_apply_parse_result` 记 `current_order_number`；新增**「提取提示词（发给 API）」管理员锁卡**（`_build_extract_prompt_panel`，seed=默认提示词，FocusOut 存盘；与默认一致则存空串=用默认）；`_persist_prompts/_load_prompts_into_widgets/_show_generated_prompt` 改为含提取词、预览=真实发送内容。**已移除「AI 优先」勾选框**（`ai_prefer_var` 连同 `_build_ai_settings_tab` 里的 Checkbutton 删除，改为一行只读说明；`_settings_ai_profile` 恒传 `prefer_ai=True`）——解析全局走 AI、开关已无意义。
+- **测试**：新增 `tests/test_orders_multi.py`(12) 全过（schema/payload 校验、提示词回落+背景附加、OpenAI 路径 fake http 验 schema+prompt、自定义提示词、块切分+数量后缀、AI/本地两路 + 透传 system/background_prompt）；改 `tests/test_ui_app.py::test_parse_remark_reads_current_text_widget_content`（patch `parse_orders_auto`、返回列表）。全量 **424 过 / 7 失**，7 失全是**本轮之前就存在**的画板交互（`_on_canvas_pan_press`/滚轮 1.05vs1.25/刻度 5vs10/`<B2-Motion>`，皆 2026-06-18 画板未提交改动遗留的旧断言）+ `case_button` 死代码，与本轮无关。ruff clean。
+
+**已知未做 / 待用户**：
+- **order_number 部分接好**：「按订单号生成文件名」✅ **已接**（2026-06-18，见顶部「『文件名』框接线」会话，`_resolve_output_basename`）；但 **`desktop_export.py:119` 的 `metadata.orderId` 仍硬编码 `""` 未接**（写 metadata 与命名文件是两件事，后者已做、前者待接）。
+- **多订单仍是「逐笔队列」不是一键批量**：操作员点「下一笔」逐笔确认+生成；一键批量生成 N 笔属后续。
+- **真机未点测**：Tkinter 字段编辑/队列导航交互、真 key 下 GPT 多订单实际返回，需用户在 App 里验（改完 Python 务必关掉 App 重开）。
+
+### 追加（同会话 · 用户拍板：提示词规则全部移到前台可编辑的「字段+背景」区，删「提取提示词」框）
+用户澄清原意：提示词规则要**全在前台可编辑区域**（即「字段」卡的提取规则 + 背景提示词），不是单独的提示词框、更不是写死在 `gpt_parser`。本轮重构：
+- **删** `_build_extract_prompt_panel` / `extract_prompt_text` / `_current_extraction_prompt`（连同卡片）。
+- **gpt_parser**：`DEFAULT_EXTRACTION_PROMPT`（含月→花表/字体表的整段写死提示词）**删除**，拆成 `ORDERS_PROMPT_SCAFFOLD`（纯 I/O 契约：订单块格式 + 输出 JSON 字段，含 `{rules}` 占位）+ 极简兜底 `DEFAULT_EXTRACTION_RULES`。`build_orders_system_prompt(rules, background)` 改为**把 rules 填进脚手架**（rules 来自前台字段）。**业务规则（对照表/字体编号）不再写死在 gpt_parser**。
+  - ⚠️ **已被 2026-06-18 决策取代（见顶部）**：`ORDERS_PROMPT_SCAFFOLD` 与 `DEFAULT_EXTRACTION_RULES` 已**彻底删除**，`build_orders_system_prompt` 现在**只拼前台内容、不再有脚手架**。本行保留仅作历史。
+- **ui_app**：模块级 `_default_field_defs()` 持有完整默认规则（月→花对照表/字体编号表写在字段 instruction 里，前台可改）；`_assemble_field_rules()` 把各字段 `名称（类型）：规则` 拼成【提取规则】正文；`_current_ai_config` 的 `system_prompt = _assemble_field_rules()`（**提示词唯一规则来源=前台字段**）、`background_prompt=背景框`。
+- **持久化**：字段定义按产品序列化成 JSON 存 `product.extraction_prompt`（`_serialize_field_defs`/`_load_field_defs_into_self`，非 JSON/空→回落默认，向后兼容旧文本）；字段 instruction 编辑器由单行 Entry 改**多行 CTkTextbox**（`<KeyRelease>` 同步进 `inst_var`、`<FocusOut>`/增删 `_on_field_changed` 落盘）。`_show_generated_prompt` 预览=真实发送内容（`build_orders_system_prompt(字段规则,背景)`+订单）。
+- 卡片顺序：订单 → **字段（提取规则）** → 背景提示词 → 图层 → 库 → 生成预览 → 输出。
+- **测试**：`test_orders_multi.py` 改 3 处（`DEFAULT_EXTRACTION_PROMPT`→`DEFAULT_EXTRACTION_RULES`、断言改「脚手架含 rules」）；`test_ui_app.py` 加 `test_field_instructions_drive_ai_system_prompt`（字段→system_prompt、编辑即生效）+ `test_field_defs_persist_and_reload`（序列化往返）。全量 **426 过 / 7 失**（7 失同前，皆画板交互/`case_button` 预存，与本轮无关）；ruff clean。
+- 注：原「mock 字段卡 Info1/2/3」即此「字段」卡——现已成为**真正驱动 API 的提示词规则区**（不再是 mock，名称改 刻字内容/出生花/字体）；字段的 `result_var` 显示值仍是占位（P3 接 GPT 回填真实每字段结果）。
+
+### 追加（同会话 · 规则适配：无效空格 + 可选字段不报警）
+用户反馈解析弹出两条 warning（GiftMessage 缺失、Personalization 多余空格）。本轮按「连续无效空格忽略、不必要字段忽略」适配：
+- **刻字文本去多余空格**（确定性兜底，无视模型是否照做）：`gpt_parser._parse_order_item` 把 `text` 由 `.strip()` 改 `" ".join(...split())` —— 去首尾 + 中间连续多空格/换行合并成单空格（`#1 Mom␣␣␣␣␣␣Kicking` → `#1 Mom Kicking`）。护栏 `test_parse_orders_payload_collapses_internal_spaces_in_text`。
+- **可选字段缺失不报警**：`ORDERS_PROMPT_SCAFFOLD` 明确「warnings 只对必填 text/month/flower/font 缺失或不确定写；gift_message/quantity 等可选字段为空、或多余空格等不影响识别/生产的情况，一律不写 warning」。
+- **前台字段同步**：`_default_field_defs` 的「刻字内容」instruction 加「中间连续多空格合并成一个、不为此写 warning」。
+- 健壮性：空格合并 + 可选字段不报警分别落在 `_parse_order_item`（代码）和 scaffold（始终生效），**即便用户已持久化过旧字段规则也照样生效**（持久化只覆盖字段 instruction 文本，不覆盖 scaffold 与代码兜底）。全量 **427 过 / 7 失**（同前预存），ruff clean。
+
+## 本会话改动（2026-06-18 · 画板交互：滚轮缩放修复 + 平移改左键，仅改 ui_app.py）
+
+预览画板 `preview_canvas` 三处交互调整：
+1. **滚轮只缩放，且改线性 5% 步进**。`PREVIEW_ZOOM_STEP` 由乘除 `1.25` 改为**加减 `0.05`**（`_on_canvas_mousewheel` 里 `new_zoom = old_zoom + direction * STEP`），上滚 +5%、下滚 -5%，刻度整齐（100→105→110）。乘除步进做不到等百分点（`1.10×1.05≠1.15`、`÷1.05=-4.76%`），故改线性。
+2. **删掉滚轮的横向平移分支**（原 Shift/Alt+滚轮平移）。该分支靠 `event.state` 位判断修饰键，在 Windows 上**误判后会 `return "break"` 把缩放整段吞掉**——这是「滚轮变左右平移、缩放失效」的根因。连带删除死代码 `_wheel_horizontal_pan_requested`、常量 `PREVIEW_WHEEL_PAN_STEP`。
+3. **平移从中键改到左键空白处拖动**。`_on_canvas_press`：命中图层→移动/缩放图层（不变）；**空白处→ `_drag_mode="pan"`** 左键拖动平移视图。**移除中键（Button-2）平移**绑定与 `_on_canvas_pan_press` 方法（画布上 Button-2 不再绑定；图层列表/控件/内联编辑器的 Button-2 右键菜单与此无关，保留）。平移落地仍走 `_on_canvas_drag` 的 `pan` 分支 → `_pan_preview_by`，释放复位光标。
+
+红线：以上全是**视图层**变换，不动 Document/导出坐标。`python -c ast.parse` 语法校验通过；**未真机点测**（Tkinter 交互需用户在 App 里验滚轮缩放方向/左键平移/中键已失效）。
+
+**4. 刻度尺密度**：`_ruler_interval_mm` 的 `target_px` 由 72→**40**（主刻度目标屏幕间距，越小越密）。原逻辑本就随 zoom 自适应（`px_per_mm` 越小选越大 mm 间隔），用户反馈「缩小看全板时刻度太稀」——本 App **zoom=1.0 即适配铺满(看全板)**，调小 target 后该区间主刻度翻倍变密（800mm 板：fit 时 100→50mm、0.5x 时 200→100mm），放大区(2x+)本就够细、间隔不变，方向不反转。`minor=major/5` 未动。
 
 ## 本会话改动（2026-06-16 · 功能区「字段引擎」第 10 节 A+B：布局重排 + 图层变真实，仅改 ui_app.py）
 

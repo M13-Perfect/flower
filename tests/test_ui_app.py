@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from config_store import AIProfile
+from config_store import AIProfile, active_product
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult, GlyphVariant
 from models import Document, FlowerAsset, FontAsset, ImageLayer, TextLayer, add_image_layer, add_text_layer
@@ -31,6 +31,7 @@ from ui_app import (
     layout_from_values,
     output_path_for_format,
     run_background,
+    sanitize_filename_stem,
     validate_output_formats,
 )
 
@@ -53,6 +54,40 @@ def test_build_design_from_manual_values_accepts_user_edits():
     assert design.flower_asset_path == Path("flowers/DaisyApril.svg")
     assert design.font_path == Path("font.ttf")
     assert design.flower_name == "Daisy"
+
+
+def test_sanitize_filename_stem_strips_illegal_and_trailing():
+    assert sanitize_filename_stem("a/b:c*?.svg") == "abc.svg"
+    assert sanitize_filename_stem("  order  ") == "order"
+    assert sanitize_filename_stem("name. ") == "name"
+    assert sanitize_filename_stem("") == ""
+    assert sanitize_filename_stem(None) == ""
+    # 保留设备名前缀下划线避让（大小写不敏感）。
+    assert sanitize_filename_stem("CON") == "_CON"
+    assert sanitize_filename_stem("nul") == "_nul"
+
+
+def _fake_filename_app(typed="", order_no="", inbox=None):
+    """只喂 _resolve_output_basename 用到的三个属性，免去构建整套 UI（headless 易碎）。"""
+    return SimpleNamespace(
+        filename_template_var=SimpleNamespace(get=lambda: typed),
+        current_order_number=order_no,
+        _inbox_active=inbox,
+    )
+
+
+def test_resolve_output_basename_priority():
+    resolve = BirthFlowerApp._resolve_output_basename
+    base = Path("C:/out/原始名.svg")
+    # 1) 「文件名」框非空 → 纯文本所见即所得（清洗后）。
+    assert resolve(_fake_filename_app(typed="贺卡A"), base) == "贺卡A"
+    assert resolve(_fake_filename_app(typed="a/b:c"), base) == "abc"
+    # 2) 框留空 → 解析到的订单号优先。
+    assert resolve(_fake_filename_app(order_no="29972194015"), base) == "29972194015"
+    # 3) 框空且无解析订单号 → 回退 inbox 收件夹 JSON 文件名 stem。
+    assert resolve(_fake_filename_app(inbox=Path("inbox/2997.json")), base) == "2997"
+    # 4) 全空 → 回退「输出目录」原文件名（旧行为），名字永不为空。
+    assert resolve(_fake_filename_app(), base) == "原始名"
 
 
 def test_build_design_from_manual_values_accepts_extended_asset_and_font_indexes_when_paths_exist():
@@ -1204,7 +1239,8 @@ def test_parse_remark_reads_current_text_widget_content(monkeypatch):
         def fake_parser(remark, ai_config=None, bundle=None):
             calls.append(remark)
             received_bundle.append(bundle)
-            return SimpleNamespace(text="Lacey", month=9, font=3, flower=1, warnings=[])
+            # 多订单接口返回列表；单笔时 _apply_parsed_orders 载入第一笔。
+            return [SimpleNamespace(text="Lacey", month=9, font=3, flower=1, warnings=[])]
 
         def run_immediately(_root, work, on_success, on_error):
             try:
@@ -1215,7 +1251,7 @@ def test_parse_remark_reads_current_text_widget_content(monkeypatch):
                 on_success(result)
             return SimpleNamespace()
 
-        monkeypatch.setattr(ui_app_module, "parse_order_remark_auto", fake_parser)
+        monkeypatch.setattr(ui_app_module, "parse_orders_auto", fake_parser)
         monkeypatch.setattr(ui_app_module, "run_background", run_immediately)
         monkeypatch.setattr(ui_app_module.messagebox, "showwarning", lambda *_args, **_kwargs: None)
 
@@ -1228,6 +1264,69 @@ def test_parse_remark_reads_current_text_widget_content(monkeypatch):
         assert app.month_var.get() == "9"
         assert app.font_var.get() == "3"
         assert app.flower_var.get() == "1"
+    finally:
+        root.destroy()
+
+
+def test_field_instructions_drive_ai_system_prompt(monkeypatch):
+    # 提示词规则来自前台「字段」区，不来自写死常量。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        app = BirthFlowerApp(root)
+        rules = app._assemble_field_rules()
+        assert "month" in rules  # 默认出生花字段规则进了提示词
+        assert "Narcissus" in rules  # 含月→花对照表
+        cfg = app._current_ai_config()
+        assert cfg.system_prompt == rules  # system_prompt 直接是字段拼出的规则
+        # 编辑某字段 instruction → 立即反映进发给 API 的提示词
+        app.field_defs[0]["inst_var"].set("只提取顾客名字 XYZ")
+        assert "只提取顾客名字 XYZ" in app._current_ai_config().system_prompt
+    finally:
+        root.destroy()
+
+
+def test_field_defs_persist_and_reload(monkeypatch):
+    # 字段（=提示词规则）编辑后按产品落盘，重载恢复。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        monkeypatch.setattr(ui_app_module, "save_config", lambda _cfg: None)
+        app = BirthFlowerApp(root)
+        app.field_defs[1]["inst_var"].set("自定义出生花规则")
+        app._persist_prompts()
+        assert active_product(app.config).extraction_prompt  # 序列化进 extraction_prompt
+        app._load_field_defs_into_self()
+        assert any(f["instruction"] == "自定义出生花规则" for f in app.field_defs)
+    finally:
+        root.destroy()
+
+
+def test_add_field_key_stays_unique_after_delete(monkeypatch):
+    # 加字段编号基于现有字段、key 取最大序号+1：删中间字段后再加不撞已有 key。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        monkeypatch.setattr(ui_app_module, "save_config", lambda _cfg: None)
+        app = BirthFlowerApp(root)
+        # 用固定 3 字段铺底，避免依赖磁盘上持久化的产品配置。
+        app.field_defs = [
+            {"key": "field1", "name": "a", "type": "文本", "instruction": ""},
+            {"key": "field2", "name": "b", "type": "文本", "instruction": ""},
+            {"key": "field3", "name": "c", "type": "文本", "instruction": ""},
+        ]
+        app._add_field()  # → field4
+        app._delete_field("field2")  # 删中间字段，存活 field1/field3/field4
+        app._add_field()  # 旧 bug 会按数量(3)+1=field4 撞车；应取 max+1=field5
+        keys = [f["key"] for f in app.field_defs]
+        assert len(keys) == len(set(keys)), f"key 出现重复: {keys}"
+        assert "field5" in keys
     finally:
         root.destroy()
 
@@ -1552,21 +1651,28 @@ def test_format_glyph_detail_shows_chinese_status_and_review_reason():
     assert detail["reason"] == "长文本，建议人工确认"
 
 
-def test_format_font_asset_label_shows_font_design_size_and_glyph_status(tmp_path):
+def test_format_font_asset_label_distinguishes_ending_decoration(tmp_path):
     path = tmp_path / "Malovely Script.ttf"
     path.write_bytes(b"font")
-    label = format_font_asset_label(
-        FontAsset(
-            name="Malovely Script",
-            index=2,
-            path=path,
-            font_design="Font 2",
-            file_size=105944,
-            has_ending_glyphs=True,
-        )
-    )
 
-    assert label == "Font 2 - Malovely Script - Malovely Script.ttf - 103.5 KB - 含字形"
+    def label(index: int, design: str, ending: bool) -> str:
+        return format_font_asset_label(
+            FontAsset(
+                name="Malovely Script",
+                index=index,
+                path=path,
+                font_design=design,
+                file_size=105944,
+                has_ending_glyphs=ending,
+            )
+        )
+
+    # Font 2：字体内末尾字形（PUA 合体字形）。
+    assert label(2, "Font 2", True) == "Font 2 - Malovely Script - Malovely Script.ttf - 103.5 KB - 末尾字形"
+    # Font 4：独立爱心 SVG（无字形映射），文案须区别于「字形」。
+    assert label(4, "Font 4", True) == "Font 4 - Malovely Script - Malovely Script.ttf - 103.5 KB - 末尾爱心"
+    # 常规字体无末尾装饰。
+    assert label(1, "Font 1", False) == "Font 1 - Malovely Script - Malovely Script.ttf - 103.5 KB - 常规"
 
 
 def test_run_background_returns_before_slow_work_finishes():
@@ -1851,3 +1957,53 @@ def test_layer_effective_production_resolves_override_over_slot(tmp_path):
         assert effective.y == slot.y  # 未 override → 回落槽位默认
     finally:
         root.destroy()
+
+
+# ---- 内联编辑：固定字号、文本框随墨迹实时变动、以框中心为锚 ----
+# _resize_text_box_to_font 只依赖 self.document.canvas_width/height，故用「假 self + 解绑方法」
+# 直接测，免建整套 Tk UI（headless 易碎）。
+
+def _resize_fake_app(canvas_width=1492, canvas_height=1140):
+    return SimpleNamespace(document=SimpleNamespace(canvas_width=canvas_width, canvas_height=canvas_height))
+
+
+def test_resize_text_box_to_font_widens_with_ink_and_keeps_center():
+    # 固定字号下，更长文字 → 框更宽（框随墨迹）；且以原框中心为锚（文字中心不跳）。
+    pytest.importorskip("PIL")
+    app = _resize_fake_app()
+    layer = TextLayer(
+        original_text="Al", font_size=120, x=500, y=400,
+        width=200, height=120, text_box_width=200, text_box_height=120,
+    )
+    cx0 = layer.x + layer.text_box_width / 2
+    cy0 = layer.y + layer.text_box_height / 2
+    BirthFlowerApp._resize_text_box_to_font(app, layer, clamp_to_safe_area=False)
+    short_w = layer.text_box_width
+    assert abs((layer.x + layer.text_box_width / 2) - cx0) < 1
+    assert abs((layer.y + layer.text_box_height / 2) - cy0) < 1
+
+    layer.original_text = "Alexandria"
+    BirthFlowerApp._resize_text_box_to_font(app, layer, clamp_to_safe_area=False)
+    assert layer.text_box_width > short_w
+
+
+def test_resize_text_box_to_font_unbounded_overflows_safe_area_while_clamped_caps():
+    # clamp=False（内联编辑）：大字号下框越过画布安全区、返回 True、不缩框到安全区；
+    # clamp=True（默认/新建/属性面板）：封顶到安全区、返回 True。
+    pytest.importorskip("PIL")
+    from text_layout import SAFE_MARGIN_X, SAFE_MARGIN_Y
+
+    app = _resize_fake_app(canvas_width=600, canvas_height=400)
+    safe_w = 600 - 2 * SAFE_MARGIN_X
+
+    free = TextLayer(original_text="Patty", font_size=2000, x=0, y=0,
+                     width=10, height=10, text_box_width=10, text_box_height=10)
+    exceeds = BirthFlowerApp._resize_text_box_to_font(app, free, clamp_to_safe_area=False)
+    assert exceeds is True
+    assert free.text_box_width > safe_w  # 不封顶：框自由越界，字号守恒
+
+    capped = TextLayer(original_text="Patty", font_size=2000, x=0, y=0,
+                       width=10, height=10, text_box_width=10, text_box_height=10)
+    clamped = BirthFlowerApp._resize_text_box_to_font(app, capped, clamp_to_safe_area=True)
+    assert clamped is True
+    assert capped.text_box_width <= safe_w + 1  # 封顶到安全区

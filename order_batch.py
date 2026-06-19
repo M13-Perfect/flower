@@ -105,7 +105,7 @@ def validate_parsed_order(
             red.append("字体文件不存在")
     if glyph_rules is not None and order.personalization and order.font_design is not None:
         try:
-            _render_text, _overrides, rule_warnings, _applied = apply_automatic_glyph_rules(
+            _render_text, _overrides, rule_warnings, _applied, _wants_heart = apply_automatic_glyph_rules(
                 order.personalization,
                 f"Font {order.font_design}",
                 None,

@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -c \"import customtkinter, PIL; from PIL import ImageGrab; print\\('ctk', customtkinter.__version__, '| PIL ok'\\)\")",
+      "Bash(.venv-win/Scripts/python.exe _debug_fmt_row.py)",
+      "PowerShell(python -m pytest tests/test_ui_app.py tests/test_config_store.py -q 2>&1)",
+      "PowerShell(foreach \\($p in @\\(\".venv-win\\\\Scripts\\\\python.exe\", \".venv\\\\Scripts\\\\python.exe\", \".venv-win\\\\Scripts\\\\pytest.exe\"\\)\\) { if \\(Test-Path $p\\) { Write-Output \"FOUND: $p\" } })",
+      "PowerShell(& \".venv-win\\\\Scripts\\\\python.exe\" -m pytest tests/test_ui_app.py tests/test_config_store.py -q 2>&1)",
+      "PowerShell(git stash push ui_app.py 2>&1)",
+      "PowerShell(& \".venv-win\\\\Scripts\\\\python.exe\" -m pytest \"tests/test_ui_app.py::test_text_case_toggle_controls_render_content_case\" \"tests/test_ui_app.py::test_birth_flower_app_initializes_desktop_ui_state\" -q 2>&1)",
+      "PowerShell(git stash pop 2>&1)",
+      "PowerShell(& \".venv-win\\\\Scripts\\\\python.exe\" -m pytest \"tests/test_ui_app.py::test_sanitize_filename_stem_strips_illegal_and_trailing\" \"tests/test_ui_app.py::test_resolve_output_basename_priority\" -q 2>&1)",
+      "PowerShell(& \".venv-win\\\\Scripts\\\\python.exe\" -m ruff check ui_app.py tests/test_ui_app.py 2>&1)",
+      "Bash(PYTHONPATH=\".;services/api\" ./.venv-win/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('ui_app.py',encoding='utf-8'\\).read\\(\\)\\); print\\('ui_app.py parses OK'\\)\")",
+      "Bash(PYTHONPATH=\".;services/api\" ./.venv-win/Scripts/python.exe -m pytest tests/test_ui_app.py -k \"field\" -q)",
+      "Bash(PYTHONPATH=\".;services/api\" ./.venv-win/Scripts/python.exe -m ruff check ui_app.py tests/test_ui_app.py)",
+      "Bash(python -m pytest tests/test_text_layout.py -q)",
+      "Bash(./.venv/Scripts/python.exe -c \"import pytest, PIL; print\\('venv OK pytest', pytest.__version__, 'PIL', PIL.__version__\\)\")",
+      "PowerShell(& py -3.12 -c \"import PIL; print\\('312 PIL', PIL.__version__\\)\")",
+      "PowerShell(& py -3.12 -c \"import sys; mods=['PIL','customtkinter','ezdxf','svgwrite']; [print\\(m, '->', __import__\\(m\\).__name__\\) for m in mods if __import__\\('importlib'\\).util.find_spec\\(m\\)]\" 2>&1)",
+      "Bash(python -m pytest tests/test_ui_app.py -q)",
+      "Bash(.venv-win/Scripts/python.exe -m pytest tests/test_ui_app.py -q)",
+      "Bash(.venv-win/Scripts/python.exe -m pytest \"tests/test_ui_app.py::test_field_instructions_drive_ai_system_prompt\" \"tests/test_ui_app.py::test_birth_flower_app_initializes_desktop_ui_state\" \"tests/test_ui_app.py::test_text_case_toggle_controls_render_content_case\" -q)",
+      "Bash(grep -vE \"tracemalloc|ResourceWarning|capture-warnings|warnings.warn|Docs:|^\\\\s*$\")",
+      "Bash(git stash *)",
+      "Bash(.venv-win/Scripts/python.exe -m pytest tests/test_ui_app.py::test_birth_flower_app_initializes_desktop_ui_state tests/test_ui_app.py::test_text_case_toggle_controls_render_content_case tests/test_ui_app.py::test_field_instructions_drive_ai_system_prompt tests/test_ui_app.py::test_preview_ruler_interval_uses_readable_mm_steps_without_display -q)",
+      "Bash(git diff *)",
+      "Bash(.venv-win/Scripts/python.exe -)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv-win/Scripts/python.exe -)"
+    ]
+  }
+}

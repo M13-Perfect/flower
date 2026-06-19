@@ -28,11 +28,11 @@ def test_zero_config_birth_flower_keeps_month_tags(tmp_path: Path):
     assert library.id == "birth-flowers"
     assert library.kind == "image"
     keys = {entry.key for entry in library.entries}
-    assert "march-daffodil" in keys
+    assert "daffodil" in keys  # key 取纯花名（已去月份）
 
-    daffodil = library.by_key("march-daffodil")
+    daffodil = library.by_key("daffodil")
     assert daffodil is not None
-    assert daffodil.tags.get("month") == 3  # 兼容旧 month/flower 定位
+    assert daffodil.tags.get("month") == 3  # month/flower 仅作上下文标签保留
     assert daffodil.tags.get("flower") == 1  # daffodil 在三月排第一
 
 
@@ -41,7 +41,7 @@ def test_zero_config_birth_flower_catalog(tmp_path: Path):
     library = MaterialLibrary.from_folder(tmp_path, kind="image")
     catalog = library.catalog()
     assert isinstance(catalog, Catalog)
-    assert "january-snowdrop" in catalog.keys()
+    assert "snowdrop" in catalog.keys()  # key 取纯花名（已去月份）
     item = next(iter(catalog.items))
     assert item["tags"].get("month") == 1
 

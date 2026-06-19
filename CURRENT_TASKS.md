@@ -1,7 +1,23 @@
 # CURRENT_TASKS — flower
 
 > 配 `PROJECT_INDEX.md` 一起读。导出/EzCad 细节看 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
-> 更新：2026-06-17。
+> 更新：2026-06-18。
+
+## 本轮（2026-06-18）素材映射改为「按花名」（不再用月份选花）
+
+需求：素材文件名都含花名，匹配不再经「出生月份+序号」，直接按花名匹配。涉及 `asset_resolver.py` + `order_catalog.py` + 4 个测试文件。
+
+- **asset_resolver.py**
+  - 新增 `MONTH_ABBR_TO_NUMBER` / `MONTH_TOKENS`（月份全名+缩写）。
+  - `_month_from_name` 兼容月份缩写**整词**匹配（整词避免误伤 `Marigold` 里的 `mar` 等）→ 修复 `JunHoneysuckle` 原先识别不到 month 被整个跳过的 BUG：现已纳入 June 组（Rose=1、Honeysuckle=2）。
+  - `_display_name` 去掉所有月份整词（全名+缩写）得纯花名：`AsterSeptember→Aster`、`HollyDecemberJune→Holly`、`JunHoneysuckle→Honeysuckle`。
+  - `scan_flower_assets` 的 `asset_key` 改 `_asset_key(display_name)` → 库内 key 是纯花名 slug（`aster`/`holly`/`cherry-blossom`/`morning-glory`…），不再带月份。
+- **order_catalog.py**：`enrich_parse_result` 删除 `resolve_material_by_tags(month,flower)` 这步（**仅素材**；字体仍按 index）。素材匹配优先级：`material_key` → `flower_name` 模糊。**月份不再参与选素材**。
+- **向后兼容**：旧存档里带月份的 `material_key`（如 `asterseptember`）经 `MaterialEntry.matches()` 双向子串仍能反查到新 key，不会丢图层素材引用。
+- **保留**：每个素材的 `tags={month,flower}` 仍在（catalog 给 GPT 的上下文 + 命中后回填 month/flower），只是不再用于选素材。
+- **测试**：更新 `test_asset_resolver`/`test_material_library`/`test_order_catalog`/`test_screenshot_parser` 中写死的月份 key 为纯花名；两个 month+flower 桥接测试改为按花名。直接相关 **49 passed**；`tests/` 整体 **350 passed**。`test_ui_app.py` 跑前未改字面量的手写对象（`ImageLayer/FlowerAsset` 任意字符串）不受影响。
+- ⚠️ **既有失败（非本轮）**：`tests/test_ui_app.py` 7 个失败（`case_button` 缺失、preview 缩放/平移等），属进行中的 `claude/desktop-tkinter` UI 重构（`ui_app.py`/`test_ui_app.py` 工作树已被那边改过）；stash 掉本轮源码改动后这些仍失败 → 与本轮无关。
+- ⏳ **真机未验**：UI 里「换素材 / 解析订单 → 落具体素材路径」建议真机抽验一笔（尤其 **Honeysuckle** 本轮才变为可选）。
 
 ## 测试基线
 
@@ -18,6 +34,13 @@
 - **实现**：复用现有配置锁 `self._locked_widgets`/`_ctk_card(locked=True)`/`config_locked`（原无密码=P4），本轮**只给「提示词配置」那张卡补密码**（存 hash）；其余控件/画布不入锁。
 - **红线**：锁只盖提示词配置、不盖画布；预览==导出走 `fit_text_box` 不破；改完关 App 重开。
 - 注：若日后想把图层模板默认几何/绑定/输出规则也收回管理员，再收窄即可（低成本）。
+
+### 开发分支布局（2026-06-17 建，均已推 origin）
+- **桌面端（Tkinter）**：分支 `claude/desktop-tkinter`，主工作树 `C:\Users\Administrator\Documents\flower`。先做提示词配置密码门（A 包）。
+- **web 端（⚠️ 已暂挂）**：分支 `claude/web-editor`，独立工作树 `.worktrees\web-editor`。基线 = 最新 main（=`85f172e`），含 Electron 脚手架 `apps/desktop`(React19+Fabric7) + 真 FastAPI `services/api` + `packages/design-core`。**体检发现**：services/api 引擎落后根目录几个月、SVG/PNG 是前端 TS 渲染(绕开 Python)。**复工第一步=引擎归一,不是堆 UI**。详见 `docs/superpowers/plans/2026-06-17-operator-admin-role-split.md` §12。
+- 两条线**并行,不用 `git switch`**：桌面在主目录改，web 在 `.worktrees\web-editor` 改。
+- ⚠️ 新 worktree 无 `node_modules`/`.venv-win`（gitignored）：web 工作树跑前需 `npm install`；调 Python 引擎用主工作树的 `.venv-win` 或自建。
+- 注：本地 `main` 指针过期（df201a5，落后 origin/main 27）；真正最新 main = origin/main = `85f172e`。可 `git branch -f main origin/main` 同步（未做，待点头）。
 
 ## 本轮（2026-06-14）已完成：Phase 4 产品切换器（方案2 可收/展）
 

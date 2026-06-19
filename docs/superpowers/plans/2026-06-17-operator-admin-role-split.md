@@ -89,11 +89,30 @@
 - **启动无登录页**：直接进操作员态；只有进「提示词配置」才要管理员密码。
 - 锁范围 = **仅提示词配置**；其余操作全归操作员。
 
-## 12. 与 web 的关系（留档）
+## 12. web 分支现状与决策（2026-06-17 体检后存档 —— **web 暂挂**）
 
-- Python 是**导出权威**：DXF（R2018 / 净轮廓 / pyclipper）、字形保真、`fit_text_box` 都不重写。
-- 将来若迁 web（远程操作员触发）：前端只画 UI（React + Konva），导出全部回调 Python（in-process 或 FastAPI）。**严禁** JS 重写 Export Worker Pool。
-- 估时（届时）：P0 去风险 ~1 周 / P1 操作员可编辑画布 ~3–5 周 / P2 管理员配置 ~2–3 周 / P3 打包+认证 ~1–2 周。
+**状态：web 暂挂**,专注桌面端。分支 `claude/web-editor`（独立 worktree `.worktrees\web-editor`,已推 origin）,起点 = 最新 main(`85f172e`)。
+
+**体检结论：脚手架完整,但是一条落后桌面端几个月、且已部分"用 JS 重写引擎"的支线。**
+
+已有（比预期完整）：
+- 前端 `apps/desktop`：React 19 + **Fabric 7**(不是 Konva) + Vite 7 + Electron 39 + Vitest；`FabricCanvas` + `canvasViewport`(缩放平移已起步) + `canvasConstraints` + `layerFabricModel` + typed `client` + `exportPipeline` + `orderWorkflow` + `GlyphPicker`,多数带 `.test.ts`。
+- 后端 `services/api`：真 FastAPI(`main.py`)：`/health` `/fonts*` `/settings/paths` `/orders/parse` `/templates/apply` `/exports/dxf` `/outputs/save`,CORS + 错误信封 + pytest。
+- `npm run dev`(`tools/dev.mjs`) 同起 FastAPI + Vite；前端默认连 `127.0.0.1:8765`。（**未实跑验证**,需 `npm install` + python 依赖。）
+
+**两个硬伤（决定 web 复工第一步不是画 UI、而是"引擎归一"）：**
+1. **SVG/PNG 是前端 TS 渲染的,绕开 Python**：`exportPipeline.ts` 用 `<text font-family/font-size>` 靠浏览器排版、再用 canvas 栅格化 PNG；**只有 DXF 发去 Python**。→ 完全绕过 `fit_text_box`/字形轮廓/镂空/加粗,web 的 SVG/PNG 必和桌面对不上、且是字体依赖而非雕刻轮廓。✅ 但 `services/api/app/domain/exports/{svg,png}.py` 已存在,只是 `main.py` 没暴露、前端没调 → 修法 = 加 `/exports/svg` `/exports/png` 接口、前端弃 `exportPipeline.ts` 的 TS 渲染改调 Python。
+2. **`services/api` 引擎落后根目录几个月**：根目录这些桌面在用的模块,`services/api` 下**全无**：`text_layout.py`(fit_text_box)、`material_library.py`、`order_catalog.py`、`config_store.py`、`production.py`、`gpt_parser.py`、`screenshot_parser.py`、`glyph_service.py`。web 的 `/orders/parse` 是旧本地解析,无素材库枚举/GPT/截图。
+
+**web 复工时的正确第一步 = 引擎归一（不是堆 UI）：**
+- 把根目录那批功能搬进 `services/api`,让**桌面与 web 共用同一套 Python 引擎**（顺带消除当前根目录 vs services/api 的双轨重复）。
+- 暴露并改用 Python 的 svg/png 导出,删 `exportPipeline.ts` 的 TS 渲染路径。
+- 之后才是 web 端 UI（角色分离同样适用：共享画布 + 仅提示词配置上锁）。
+- 前端是 **Fabric**(非 Konva)；缩放/平移/视图变换在 web 端近乎白送(`canvasViewport` 已起步)。
+
+估时（届时,引擎归一**之后**）：P0 去风险 ~1 周 / P1 操作员可编辑画布 ~3–5 周 / P2 管理员配置 ~2–3 周 / P3 打包+认证 ~1–2 周。**外加引擎归一本身的工作量(8 个根模块搬进 services/api + svg/png 接口化 + 删 TS 渲染),这是 web 复工的前置。**
+
+> 注：本节存于桌面线(`claude/desktop-tkinter`/主工作树)。web 分支自身的工作树是 `85f172e` 旧版、看不到本次更新；web 复工时需把这几份 handoff 文档同步/cherry-pick 过去。
 
 ## 13. Milestones（桌面端本方向）
 

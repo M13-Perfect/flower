@@ -68,6 +68,11 @@ class AppConfig:
     active_product_id: str = ""
     # 左侧产品切换列默认收起（方案2 可收/展），收/展状态随配置持久化。
     products_panel_collapsed: bool = True
+    # 自动取单收件夹（automation/ 一期）：扩展→本地服务→写 {order_id}.json 到此目录；
+    # Flower 用 Tk .after 轮询，自动载入备注+解析、停在生成前。空=功能关（默认），对现有用户零影响。
+    inbox_folder: Path = Path("")
+    # 收件夹来单后是否自动解析（始终停在生成前，绝不自动生成）。
+    inbox_autoparse: bool = True
 
     def __post_init__(self) -> None:
         if not self.products:
@@ -108,6 +113,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         products=_products_from_payload(payload.get("products")),
         active_product_id=_string_value(payload, "active_product_id", ""),
         products_panel_collapsed=_bool_value(payload, "products_panel_collapsed", True),
+        inbox_folder=Path(_optional_string_value(payload, "inbox_folder", "")),
+        inbox_autoparse=_bool_value(payload, "inbox_autoparse", True),
     )
 
 
@@ -127,6 +134,8 @@ def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Pa
         "products": [_product_to_payload(product) for product in config.products],
         "active_product_id": active_product(config).id,
         "products_panel_collapsed": bool(config.products_panel_collapsed),
+        "inbox_folder": str(config.inbox_folder),
+        "inbox_autoparse": bool(config.inbox_autoparse),
     }
     config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return config_path
