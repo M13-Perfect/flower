@@ -1,5 +1,32 @@
 # AGENTS.md
 
+> **2026-06-22 · 操作员端「订单信息框」改由库驱动载单（FIFO 最旧『待生成』先做），停用文件轮询 ✅逻辑+测试 / ⬜真机（新对话先读）**
+> **背景/决策（用户拍板，跨 flower + automation）**：操作员端「订单信息」框原来源=**收件夹文件轮询**（`_poll_inbox_once` 扫 `outputs/inbox/*.json`）。改成**库驱动载单**：后台每 `DB_ORDER_POLL_INTERVAL_MS=3000ms` 轮询 inbox-service，取「**库中最旧的待生成订单**」（未软删 + `ai_status=pending`＝FIFO 队首）载入订单信息框+文件名框。① 触发=**持续轮询**、队首变了才覆盖（不每轮清空、不冲掉操作员正在编辑的单）；② 「队首」=**FIFO 最旧先做**（`received_at` 升序）；③ **文件轮询对订单信息框停用**，来源统一为库。
+> **关键：生成后如何「放行下一单」（用户最终拍板）——不删除，打「AI已生成」标（DB+店小秘）**：生成成功**早已**走 `_enqueue_mark_done_after_generate → request_mark(mark_done)` → 服务端 routes.py `set_ai_status(RECOGNIZED)`（DB 权威态）+ 入队 mark_done（扩展给店小秘打「AI已处理」）。**本轮不加删除**：生成完的单 `ai_status→recognized` **自动掉出「待生成」队列**（仍留在订单表里带「AI已处理」标），队首前进到下一条 pending → 轮询 ≤3s 内载入它。recognized/conflict/locked/软删都不算待生成、不会被取到。
+> **实现 A（automation/inbox-service，新增只读端点，非契约改动）**：`repository.oldest_pending_order(session)`（`WHERE deleted=False AND ai_status='pending' ORDER BY received_at ASC LIMIT 1`，eager-load items+mark_jobs；`ai_status` 列本有索引）；路由 `GET /inbox/orders/next` → `{"order": {...}|null}`，**必须声明在 `/{order_id}` 之前**否则 `next` 被当 order_id。顺手删了 repository.py 一个既有 dead import `AI_STATUS_RECOGNIZED`（ruff）。测试 `tests/test_next_pending_order.py` ×4（最旧 pending/跳过 recognized 前进/排除软删+conflict/无 pending 回 null）。inbox-service 全量 **183 passed**。
+> **实现 B（flower）**：`inbox_service_client.fetch_next_pending_order()`（GET `/inbox/orders/next`，取 `{"order"}`，无单/不可达回 None；**取代**本会话早先写的 `fetch_oldest_order` 那套 count→offset，已删）。`order_importer.order_from_payload(dict)`：库订单 dict→`OrderImport(order_id, remark)`，**只看顶层键**（避免递归误命中 items/mark_jobs），顶层 `remark` 优先空则回退 `items[].personalization_raw`。`ui_app.py`：`__init__` 加 `_db_order_active_id`(队首守卫,reload-on-change)/`_db_order_after_id`；启动用 `_start_db_order_poller()` **取代** `_start_inbox_poller()`；`_on_app_close` 加 `_stop_db_order_poller()`；新增 `_poll_db_order_once`(work=`fetch_next_pending_order`)/`_schedule_next_db_poll`/`_load_db_order`。`_load_db_order` 对齐旧 `_auto_load_order`（订单号置顶第1行、写 `current_order_number`+文件名框、按 `inbox_autoparse` 决定是否自动解析、**绝不自动生成**）。`_render_fetch_status`「当前单」改取 `_db_order_active_id`；`_resolve_output_basename`/`_enqueue_mark_done_after_generate` 加 `_db_order_active_id` 兜底。**首轮 poll 延后一个间隔**（`_start` 调 `_schedule_next_db_poll` 而非同步 `_poll_once`）：不在构造期同步起后台线程，headless 测试不跑 mainloop 不泄漏线程。
+> - 旧 `_start_inbox_poller`/`_poll_inbox_once`/`_auto_load_order`/`_advance_inbox_after_generate` 代码**保留但启动不再调**（`_inbox_active` 恒 None，相关兜底无害）；手动「导入备注」`import_remark_file` 未动。
+> **测试（flower）**：client `fetch_next_pending_order` ×3、importer `order_from_payload` ×4、ui_app `_load_db_order` ×2 + 文件名优先级补 db_order 档。全量 `pytest tests services/api/tests` = **525 passed / 8 failed / 7 skipped**；8 failed 全是既有 baseline（6×预览 `<B2-Motion>`/zoom/pan/ruler + case_button + field_instructions，与本轮无关，`test_ui_app.py:447` 等）。`ruff`/`py_compile` 我的源文件 clean（test_ui_app.py 的 `SAFE_MARGIN_Y` F401 是既有 WIP，非本次）。
+> **排序口径**：FIFO 按 `received_at`（入库到达顺序）升序，**非** `paid_at`（付款时间）。若要严格按付款时间排，改 `oldest_pending_order` 的 `order_by` 为 `paid_at`（注意 paid_at 可空，需 NULLS 处理）。
+> **⬜ 真机待验**（须关 App 重开）：起 inbox-service(8770) + 库里有 pending 单 → 进操作员端，订单信息框自动载入最旧 pending（订单号置顶）、文件名框=订单号；点「生成」成功后约 3s 内**自动前进**到下一条 pending，且原单仍在订单表里、标签变「AI已处理」（DB ai_status=recognized + 店小秘打标经扩展回写）；服务未起/无 pending 时不报错、不清空当前内容。
+
+> **2026-06-22 · 统一打包聚合（flower+Ezcad+inbox-service → 一个绿色包，新对话先读）**
+> 新增顶层 `packaging/`：把三端聚合成**一个 PyInstaller onedir 包**（产物 `dist/Workbench/app.exe`），双击=总启动器→后台拉起 inbox-service→两按钮开「开花桌面」「扫码导入」。**不合并 git 仓**，三端代码各自独立。
+> **打包手法**：一方代码全部作 **loose data** 装入（`_internal/srcflower/`、`_internal/srcezcad/`），`app_dispatcher.py` 按角色（`launcher`/`flower`/`ezcad`/`serve`/`check`，缺省 launcher）运行时把对应目录插到 sys.path——两个同名 `app` 包（services/api 与 inbox-service）靠 **per-role sys.path + 子进程隔离**永不同进程共存。第三方依赖靠 `Workbench.spec` 的 `collect_submodules`/`collect_all`（**loose data 的依赖不会被 PyInstaller 自动分析，必须整树 collect**；曾漏 `fastapi.middleware.cors`）。inbox/services 收纳**只收 `app/` 子包**（排除两仓根的 `.venv`/`inbox.db*`(PII)/`.bak`/缓存）。
+> **数据根契约（关键）**：launcher 算 `DATA_ROOT`（exe 同级 `data\`，不可写回落 `%APPDATA%\BirthFlower`），用 env 统一注入子进程：inbox 读 `FLOWER_INBOX_*`、flower 自身配置读 `BIRTHFLOWER_DATA_DIR`、**services/api 导出端读 `FLOWER_PROJECT_ROOT`（=DATA_ROOT，既是输出根又是资源根）**。launcher 首启把字体/花材（`Birthmonth_font.ttf`、`BirthMonth flowers/`）从 bundle **播种**到 DATA_ROOT，否则导出 `FONT_LOAD_FAILED`。`FLOWER_PROJECT_ROOT` 缺注入则报告落 `_internal`、与 inbox ReportWatcher（读 `FLOWER_REPORTS_DIR`）错位→状态回写断链（已修）。Ezcad 配置落 exe 同级 `config\settings.json`（自带 frozen-aware）。**升级=换 `Workbench\` 但保留 `data\`+`config\`**。
+> **代码改动**：flower `config_store.py` 加 `_data_root()`/`_default_config_path()`/`_default_inbox_folder()`（env+frozen 分支；**源码态行为不变**）。Ezcad `ezcad_auto_layout/config.py` `load_settings` 加损坏容错（try/except + utf-8-sig）。其余全在 `packaging/`（app_dispatcher/launcher/Workbench.spec/build_release.ps1/templates/docs），不污染三仓现有结构。
+> **构建**：`powershell -ExecutionPolicy Bypass -File packaging\build_release.ps1`（复用 `.venv-win`+补 sqlalchemy/alembic/pyinstaller；Ezcad 源默认同级 `..\Ezcad2.7.6`，可 `-EzcadSrc`/`EZCAD_SRC`；**暂用路径而非 git submodule**，因 Ezcad 有未提交 WIP，待其提交+推送后可平滑切 submodule）。**⚠️ 不带 `-SkipTests` 会被 8 个既有 headless UI 测试失败卡死 gate**（test_ui_app.py，AGENTS 本就记为既有失败）——出包前用 `-SkipTests` 或先修这 8 个。`build_release.ps1` **必须 UTF-8 BOM**（WinPS 5.1 否则按 GBK 乱码致解析失败；Edit 工具保存会去 BOM，改后须 `[System.IO.File]::WriteAllText(... new UTF8Encoding($true))` 重加）。
+> **已验证**：冻结态四角色 `check` 全过、serve `/healthz` 通、总启动器自动起服务+播种、flower/ezcad 开窗、PII/.venv 已剔除、包体 ~123MB；inbox 130/Ezcad 124 测试全绿。**⬜ 真机待验**：完整批量生成（`.xlsx` 导入→DXF/SVG/PNG+report→inbox watcher 回写）需真实素材目录+EzCad 跑一单，确认产物落配置的输出目录、报告被 watcher 消费。
+> **后续**：扩展现「随包 `extension-dist/` + Chrome 手动加载已解压」，注册 Google 开发者后切「未上架 Web Store」（代码不变只换渠道）。完整规划/取舍 = `C:\Users\Administrator\.claude\plans\flower-c-users-administrator-documents-wiggly-karp.md`；本次另有一份 5 维对抗审计（13 findings，blocker 已全修）。
+
+> **2026-06-22 · 「自动识别」改由 GUI 显式控制（默认关，新对话先读）✅逻辑+测试 / ⬜真机**
+> **背景/根因**：收件夹来单后是否自动 `parse_remark()` 由 `config.inbox_autoparse` 决定（`ui_app._auto_load_order`），原**默认 True 且无独立 GUI 开关**——容易在用户没要求时就自动解析。
+> **改动**：① `config_store.AppConfig.inbox_autoparse` 默认改 **False**；新增 `inbox_autoparse_user_set`（bool）。`load_config` **安全迁移**：仅当 `inbox_autoparse_user_set=True`（用户经新版 GUI 显式设过）才采信存储的 `inbox_autoparse`，否则（旧配置遗留 True / 全新 / 缺字段）**一律回落 False**；`save_config` 同时持久化两键。② `ui_app._build_fetch_panel`「抓取订单」区在「自动抓取」旁加并列**「自动识别」开关**（纯本地、不发 HTTP，与自动抓取语义/状态完全独立），新 `_on_autoparse_switch_toggle` 拨动即 `dataclasses.replace`+`save_config`（记 user_set=True）并即时生效；`_auto_load_order` 仍读 `self.config.inbox_autoparse`，手动「解析」不受影响。
+> **语义对照**：自动抓取＝是否从店小秘自动抓单（驱动 inbox-service `/scrape/control`，远程）；自动识别＝新订单进 GUI 后是否自动解析（本地 config，默认关）。两者独立。
+> **测试**：`tests/test_config_store.py`（默认关 / 旧 True 回落 / 显式开关往返）、`tests/test_inbox_poller.py`（默认不解析 / 开则解析既有用例 + 新 toggle 持久化即时生效 + 与抓取控制互不影响）→ **31 passed**；`ruff` 干净。test_ui_app.py 的 8 个失败是既有 headless/重构期 drift（preview/ruler/zoom/`case_button`/`_on_canvas_pan_press`/AI prompt），与本改动无关。
+> **⬜ 真机**：开 App→「操作员配置端·抓取订单」拨「自动识别」开/关，确认来单时分别自动解析 / 仅载入；重启后开关状态保持。
+> **配套扩展侧修复（automation）**：同日修「自动抓取关闭时手动上传不打标」，建独立手动 force 打标路径——详见 `automation/AGENTS.md` 2026-06-22 块。
+
 > ⚠️ **当前事实（2026-06-14，新对话先读这段）**：本文件下方「Architecture / Frontend / Test Commands(pnpm)」描述的是**暂缓的 Electron 目标架构，不是现状**。
 > **生产现实**：用户实际在用的是 **Tkinter 桌面 App**（`birth_flower_mvp.py` + `ui_app.py`）+ **共享后端** `services/api`（桌面以 in-process import 调用，不走 HTTP）。包管理是 **npm 不是 pnpm**。
 > **当前事实来源**：`PROJECT_INDEX.md` + `CURRENT_TASKS.md`（已校正本文件 Architecture 段）。导出/EzCad 细节见 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
@@ -9,6 +36,20 @@
 > **2026-06-18 决策（新对话先读，覆盖下方「追加（同会话…）」段里关于 `ORDERS_PROMPT_SCAFFOLD` 的旧描述）**：用户要求**解析层不携带任何本地业务规则**，提示词 **100% 来自前台**。本轮在 `gpt_parser.py` **真删除**了所有写死的业务规则提示词：① `ORDERS_PROMPT_SCAFFOLD`（角色/订单块格式/输出字段/warnings 规则脚手架）+ `DEFAULT_EXTRACTION_RULES` 兜底 → 删除；`build_orders_system_prompt(rules, background)` 改为**只拼接前台内容**（字段规则 + `【背景】`），空入参返回空串。② 单订单 OpenAI（`parse_order_remark_with_gpt`）删除业务规则 system 消息（输出靠 `ORDER_REMARK_SCHEMA`）。③ `_order_remark_system_prompt`（DeepSeek 单订单）删业务语义、仅留 I/O 字段约定。**机器 I/O 约定按用户要求保留**：OpenAI `ORDERS_SCHEMA`(json_schema strict) + DeepSeek `_parse_orders_with_deepseek` 的「顶层 orders+字段列表」提醒（line 261-263）原样不动，故解析不会坏。catalog 链（`order_catalog.build_catalog_system_prompt`）本轮**未动**（桌面主链路不走它）。测试：`test_orders_multi.py` 改导入(去 `DEFAULT_EXTRACTION_RULES`)+2 处断言（脚手架→「只含前台内容/空串」），解析层全绿。已知：`test_ui_app.py::test_field_instructions_drive_ai_system_prompt` 红，是**旧测试 vs 现默认字段**不符（默认字段已无 month/Narcissus 月→花表），**非本轮引入**，需后续对齐 `_default_field_defs` 与该测试。
 >
 > **web 分支暂挂(2026-06-17 体检后)**：`claude/web-editor`(worktree `.worktrees\web-editor`)脚手架完整(React19+**Fabric7**+真 FastAPI),但 `services/api` 引擎落后根目录几个月(无 `text_layout`/`material_library`/`order_catalog`/`config_store`/`gpt_parser`/`screenshot_parser`/`glyph_service`),且 **SVG/PNG 是前端 `exportPipeline.ts` TS 渲染、绕开 Python WYSIWYG**(只有 DXF 走 Python)。**复工第一步=引擎归一**(根模块搬进 services/api + 暴露 Python svg/png 接口 + 删 TS 渲染),不是堆 UI。详见该设计文档 §12。
+
+> **2026-06-19 · 三端 UI 落地 + 操作员配置端订单表 + 定时抓取选择器（新对话先读）**：把「操作员配置端」从"资源库配置+强塞画板"重定位为**抓取调度+订单监控控制台**——中心区**画板换成实时订单表**（`_apply_center_for_view`；数据=`GET /inbox/orders`，inbox-service 接口本就存在，flower 加 `inbox_service_client.list_orders` + `_build_orders_table_panel`；件数/退款/其他商品由纯函数 `order_row_view` 从 `items[]`/`refund_status` 聚合，扩展暂只抓列表页时件数显「—」，文件数待 Phase 1），右侧功能区去掉图层卡（`_VIEW_CARD_ORDER[operator_config]=("fetch","library")`）。**「定时锁」改名「定时抓取」**、手填框换成 `datetime_picker.CTkDateTimePicker`（月历+时分；仍写回 `scrape_from_var`，restart_from 逻辑不变）。管理员端三张 IP 卡（字段/背景提示词/本次提示词）经 `_ctk_card(badge=)` 加「仅管理员·IP」标、切端控件管理员端染琥珀；**密码门不加（靠分端隔离）**。**搁置**：操作员端图层行图标/解析结果上色（避动 WYSIWYG/金标）、定时规则 A/B/C（Phase 2 调度器未建、不出 dead 控件）。单测全绿（`test_datetime_picker.py`、`test_ui_app.py` 的 view 映射/`order_row_view`/`_short_dt`、`test_inbox_service_client.py::test_list_orders_*`）。**真机手测待做（须重开 App）**。详见 `docs/superpowers/plans/2026-06-19-three-end-ui-and-orders-table.md`。
+>
+> **2026-06-20 · 订单数据源澄清 + 删除/保留功能（新对话先读）**：订单**持久化在 SQLite `automation/inbox-service/inbox.db`**（扩展抓单→inbox-service 写库行 + 落 `outputs/inbox/*.json` 临时交接文件；**删 JSON 不删库行**，这是用户踩过的困惑点）。新增订单删除/清理：后端 `DELETE /inbox/orders/{id}` + `POST /inbox/orders/purge {older_than_days>=1}` + `repository.delete_order`/`purge_orders_older_than`；**保留天数**=`ScrapeControl.retention_days`（迁移 `0006`，**0=关默认**），`RefundScheduler.tick_once` 每轮按它**无人值守删旧单**（纯按 `received_at` 年龄，会删未完成单，默认关+UI 强确认）。flower 客户端 `delete_order`/`purge_orders`/`put_scrape_control(retention_days=)` + 订单表行删除/清理栏。测试：服务端 `test_order_cleanup.py`（107 passed）、flower 客户端（10 passed）。详见同一计划文档 §7。
+>
+> **2026-06-20 · 订单表状态列修正 + 三套状态澄清（重要，新对话先读）**：① `Order.status`=内部流水线状态（当前库 173 单几乎全 WRITTEN_TO_INBOX，单一常量）；② **`Order.refund_status` 名为 refund 实为店小秘"订单状态"原文**（已审核/已发货/待打单(有货)/已退款/已忽略；扩展抓 `.orderState`），退款拦截 refund_gate 用它做关键词分类——**别当退款布尔**；③ 店小秘"自定义标记"(AI未识别/AI已处理/…)——扩展原只读「AI未识别」(→`extras.ai_unrecognized`)，**2026-06-20 已加「写标记」能力**（见下「标记回写」块）。订单表"状态"列已改为显示**店小秘状态(refund_status)**（`ui_app.py` `shop_status_style()` 上色）、**删掉"退款"列**、内部状态挪进详情；`order_row_view` 重构(status_label=店小秘状态, 新增 shop_status/internal_label, 去掉 refund 键)；测试 `test_shop_status_style_*`/`test_order_row_view_*`（86 passed）。**「标记回写店小秘」✅ 2026-06-20 已实现**（见下方「标记回写」块；店小秘无 API，扩展模拟网页操作）。
+
+> **2026-06-20 · 标记回写店小秘（扩展打自定义标记）✅逻辑+测试 / ⬜真机（新对话先读）**
+> 新单入库→扩展给店小秘订单打「**AI未识别**」(待处理)；flower 生成成功→打「**AI已处理**」+清「AI未识别」。
+> 跨 flower/automation；**权威 = `automation/docs/2026-06-20-mark-writeback.md`（冻结契约 + 真实 DOM 勘查 + ExecPlan）**。
+> **flower 侧改动**：`inbox_service_client.py`+`request_mark(order_id, action)`（POST /inbox/mark/request）；`ui_app.py` `confirm_and_generate` 成功 → `_enqueue_mark_done_after_generate`（run_background best-effort 入队 mark_done，**须在 _advance_inbox_after_generate 清 _inbox_active 前取订单号**=current_order_number→回退 inbox 文件名 stem；服务未起/手输无订单号则静默不入队、仅副提示行轻提示）。测试：`test_inbox_service_client.py`(+2)、`test_ui_app.py`(+3)。**pytest 395 passed**（8 既有 headless 失败不变）。
+> **automation 侧**（扩展打标 DOM + inbox-service mark_jobs 队列 + 迁移 0007）见 `automation/AGENTS.md` 同名块。
+> **2026-06-20 追加（标准1/标准2 + 标签列）**：① 上传门控=传 JSON 前看店小秘标记，AI已处理不传、否则查库 diff 才传（手动按钮 + 自动抓都遵守）；② 上传成功后打 AI未识别（除非已 AI已处理）、生成成功打 AI已处理+清未识别；③ **配置端实时订单表加「标签」列**（`ui_app.mark_status_style` 由订单 `mark_jobs` 摘要派生：AI未识别/AI已处理 + 待写/已写/失败），操作员据此核对回写是否生效。详见 `automation/docs/2026-06-20-mark-writeback.md` §八。
+> **⬜ 真机待用户**：起 8770 + 扩展 dist 加载店小秘列表页 + 开启抓取开关 + 测试单走全链；3 个真机校准点（添加按钮选择器/click vs hover/点击即生效 vs 须确定）见计划文档。
 
 > **2026-06-19 · 「订单自动化与排版系统」增量方案——flower 核心承担的切片（新对话先读）**
 > 三仓大方案权威设计 = `C:\Users\Administrator\.claude\plans\ezcad2-7-6-flower-c-users-administrator-staged-wren.md`（基线 A=增量扩展现有代码，不重写）。**契约已冻结**：店小秘订单 JSON 现可带 `items[]`（多盒子/多件/其他商品，每项 is_target_box/quantity/personalization_raw）+ `refund_status`（见 `automation/contracts/order.schema.json`，automation 侧已落地，向后兼容）。
@@ -38,6 +79,117 @@
 5. **人工复审工作台**：截图 + 可编辑字段 + 实时预览，对低置信/超框项人工介入。
 6. 桌面文本输入框加**右键复制/粘贴**菜单。
 > **2026-06-14 新需求（已出 ExecPlan，待实现）**：把「单产品 + 全局单素材库 + month/flower 定位 + 全局生产参数」演进为 **Product → 素材库 → 素材(key/别名/标签/默认参数) → 图层(可挂库+生产参数 override)**。素材/字体不再单一；月份字段→「素材库+素材」选择器；订单解析改为把库 catalog 注入 GPT、动态枚举校验 material_key（本地不写死）。演进兼容（birth-flower=产品0，month/flower 降为标签，金标/批量不破）；后期左侧加产品切换器（每窗口=一个产品）。**设计与分阶段计划见 `docs/superpowers/plans/2026-06-14-layer-material-library-system.md`**。本轮只出文档未改代码。
+
+## 本会话改动（2026-06-22 · 素材库/字体库「统一导入」+ 修字体库选目录后要关窗口才能再选；改 ui_app.py/material_library.py + 测试）
+
+**问题**：① 字体库在设置窗口里选目录后，要关窗口/程序才能再选（交互不合理）；② 素材库与字体库导入规则不统一。
+
+**根因**：① 「字体库/素材库」卡片的「点击上传」按钮实为 `open_settings`（开模态设置窗口），而设置窗口里 `choose_font_source` 走「先弹选文件、取消再弹选文件夹」的嵌套对话框，在 `grab_set()` 模态窗口里会卡住→需关窗口。② 字体走 `choose_font_source`（文件或目录、嵌套对话框），素材走 `choose_flower_dir`（只目录），规则各异。
+
+**与用户敲定（本轮拍板）**：入口位置不变、只改逻辑；选择方式=**只选文件夹**（库=文件夹）；重复/文件夹导入=**累加并入、按路径去重**。
+
+**改动（统一流程：选路径 → 判断文件/文件夹 → 过滤有效 → 注册 → 刷新）**：
+- `ui_app.py` 新增模块级纯函数 `collect_importable_files(root, suffixes, *, recursive=False)`：文件或文件夹统一展开成 `(受支持文件, 跳过的不支持文件)`；只看后缀、大小写不敏感、**永不因坏文件抛异常**。配套 `_paths_equal`（规范化路径去重）。
+- `_build_library_panel` 改为稳定容器 + `_render_library_rows()`（字体库一行/素材库一行，各显文件数 + 「点击上传」），导入后就地刷新、不重建整卡。
+- 新增 `upload_into_library(kind)`（卡片「点击上传」入口，`askdirectory` 选文件夹）+ `_add_library_folder(kind, folder)`：累加并入当前产品 `image_library_dirs`/`font_library_dirs`（去重）→ `with_product_library_dirs` 落盘 → `_scan_assets` 重扫 → 刷新；汇总「已导入 N / 跳过 M / 已在库中」。复用既有多库机制，天然持久化。导入数按「真正进入候选的增量」算。
+- `choose_font_source`（设置窗口）去掉嵌套对话框，改纯 `askdirectory`，与素材目录 `choose_flower_dir` 口径统一、消除卡死源头。
+- `material_library.py` `IMAGE_EXTENSIONS` 补 `.bmp`（与 `IMPORTABLE_ASSET_SUFFIXES` 口径一致，零配置文件夹扫描也收 bmp；向后兼容）。
+- **未动**：菜单「导入素材...」单文件路径（`_import_asset_path`/`_import_font_file`/`_import_flower_file`，验收「单文件导入」仍走它）、DXF/SVG/PNG 导出链、现有单文件导入测试。
+
+**验证**：`py_compile` + `ruff` 我的文件全 clean；新增 6 个测试（`collect_importable_files` ×3：单文件按后缀/文件夹分流+大小写+递归/不存在路径空；`_add_library_folder` ×3：素材文件夹批量并入+去重、字体文件夹导入+跳过不支持、空文件夹只提示不改配置）全过。`pytest tests/test_ui_app.py` = **92 passed / 8 failed**，8 失败 = AGENTS 既记的 headless 基线（6× preview 缩放/平移/标尺 + case_button + field_instructions），与本次无关；`test_material_library/order_catalog/product_switcher/screenshot_parser` = 37 passed。
+**未真机点测**（需关 App 重开，进操作员配置端验）：① 字体库/素材库「点击上传」选文件夹即导入、下拉立刻出新字体/素材、卡片文件数刷新；② 连续多次选不同文件夹不用关窗口、累加去重；③ 含杂项文件的文件夹跳过不支持项不崩；④ 空文件夹给提示不改配置；⑤ DXF/SVG/PNG 导出仍正常。
+
+## 本会话改动（2026-06-20 · 选端页门厅重做 + 管理员密码门 + line_icons 图标管线；改 ui_app/config_store + 新增 line_icons.py/assets/icons + 测试）
+
+承「用 JTBD 做选端页设计」一路敲定到落代码（用户全程拍板）。**关键产品决策（新对话先读）**：① 后续要拓展**多产品**（生日花 / 眼镜 / 吉他拨片…），但**一人混处理多产品**（共享收件夹、订单混着来）→ **选端页门口只选角色、不选产品**；产品在操作员端内部走现有左侧产品栏（`product_rail`）随单切换。② 管理员端**真做密码门**（推翻 2026-06-19「现在不用账号」那条）。③ 图标走 **Tabler Icons（MIT）**，不装任何新 pip 依赖。
+
+- **新增 `line_icons.py` + `assets/icons/`（14 个 Tabler outline SVG）**：图标染色（替 `currentColor`）→ **已装的 cairosvg→PIL** 栅格化 → `CTkImage`，同 `text_renderer._rasterize_heart` 管线。缺依赖时优雅返回 None（调用方退化为只显文字）。**零新依赖**（保真度审计结论：customtkinter 5.2.2 / Pillow 12.2.0 / cairosvg 2.9.0 现成就够，全程无新 pip 包、无运行时下载）。
+- **`config_store.py` 加管理员密码**：`admin_password_hash` 字段（load/save 持久化，向后兼容旧配置）+ `hash_password/verify_password/has_admin_password/verify_admin_password/with_admin_password`（**PBKDF2-SHA256，纯标准库**，只存哈希）。
+- **`ui_app.py` 选端页重写**（`_show_view_chooser` 一带，方向 = B「精炼深空」+ C 门口状态条）：门厅专属深色皮肤 `ENTRY_COLORS`（#101218/teal-blue-amber，比内部 `APP_COLORS` 更黑，**门厅↔内部有意色差**）+ `_blend_hex`（无 widget 透明度→预混不透明 hex，底色纯平时像素级一致）+ `ENTRY_ROLE_META`。布局：**操作员端=hero 大卡**（图标+标题+描述+待处理数+进入，整卡可点、回车直达）、**配置端/管理员端=两张次端小卡**、**门口实时状态条**（服务/抓取/积压，`_refresh_entry_status` 后台 best-effort 探活 inbox-service，没起则显未连/—，不阻塞不抛）、**多产品页脚**（取真实 `config.products` 名，眼镜/拨片等上线后自动出）。hover=描边/底色变（`_bind_card_hover` 用 winfo_containing 沿 master 链判离开，避免子控件误触发）。
+- **管理员密码门**（`_show_admin_gate`）：scrim 暗幕（`_blend_hex("#08090c",bg,0.72)`）+ 居中模态卡；**首次进=设密码（双输入，≥4 位）**、之后=校验；`_admin_authed` 本次运行级，过一次后切端不再问。**门厅入口与顶部「切端」下拉两条路径都过同一把关**（`_enter_admin_view`）。
+- **修了审查发现的真 bug**：`_on_switch_view` 切管理员端原用 `_needs_admin_gate()`（=有密码且未鉴权），**未设密码时会让下拉直接进管理员端、绕过设密码**；改为 `not self._admin_authed` 统一交 `_enter_admin_view`，堵住鉴权绕过。（审查另两条「CTkImage 没实例级强引用」「image=None 传参不一致」经核实是把 PhotoImage 常识误套到 CTkImage 上的**误报**：CTkImage 由 live CTkLabel 持有、image=None 是其默认值，未改。）
+
+**验证**：`py_compile`+`ruff` 我的文件 clean（test_ui_app 里 `SAFE_MARGIN_Y` F401 是既有 WIP，非本次）；新增测试 **12+2 个全过**（config_store 密码 ×4 round-trip/持久化、line_icons ×3、门厅 `_blend_hex`/`ENTRY_ROLE_META`/gating ×5、下拉鉴权护栏 ×2）。`pytest tests/test_{config_store,line_icons,ui_app}.py` = **109 passed / 8 failed**（8 失败经 `git stash` 基线确认全是本分支既有 WIP：preview 缩放平移/`case_button`/`field_instructions` 旧字段断言/headless `__init__` 网络线程，**与本次无关**）。**门厅真渲染 headless 冒烟过**（`__new__` 绕开坏 `__init__` + 真 ctk root：overlay/chips/hero/密码门 开合/gating 全绿）。
+**已知 / 未做（不许当已完成）**：① **未真机点测**（GUI 跑不了，须用户重开 App 验：门厅观感、hover、整卡可点、回车进操作员端、首次进管理员端设密码→重进校验、下拉切管理员端也要密码、状态条连上 inbox-service 后显真实积压/抓取态）。② 门厅是 B 配色、App 内部仍 `APP_COLORS` 深蓝，有「门厅 vs 内部」色差（本轮范围内有意取舍，若要统一是后续活）。③ 进入动效（淡出+缩放）、hover 2px 上浮未做（避免 grid 重排抖动，只做描边/底色变；都无依赖、属后续打磨）。④ 多产品（眼镜/拨片）目前只是页脚信号位 + 产品栏占位，真正接产品是另一条线（见 2026-06-14 素材库计划）。⑤ 密码门「忘记密码」无找回（改 `birth_flower_config.json` 清 `admin_password_hash` 即重置）。
+
+## 本会话改动（2026-06-19 · 三端选端架构骨架 + 解析可观测性②③；改 models/gpt_parser/parse_pipeline/ui_app + 测试）
+
+承「订单自动化与排版」增量方案 flower 核心待做 ③（解析页可观测性），与用户敲定后**演进 2026-06-17 单视图方案为「三端选端」**（用户拍板：照此拆 3 端、无账号、入口选端、顶部可切端；解析结果用只读常驻框、异常才弹）。
+
+**① 后端：解析「实际发出的提示词」可回传（零漂移）**
+- `models.py` 新增 `ParsePromptTrace`（可变 dataclass，作出参）：provider/model/system_prompt/user_content/filled。
+- `gpt_parser.py`：抽常量 `DEEPSEEK_ORDERS_JSON_SUFFIX`（DeepSeek 的「顶层 orders+字段」JSON 约定后缀，原内联字符串）；`parse_orders_with_gpt`/`_parse_orders_with_deepseek` 加 `trace` 出参，把**真正发出的** system 全文（DeepSeek 含后缀）+ 用户内容 + 解析到的 provider/model 就地写回。**保证「界面显示的提示词 == 真发出的内容」逐字一致**。不传 trace 时行为零变化。
+- `parse_pipeline.py`：`parse_orders_auto`/`_call_orders_gpt` 透传 trace；trace=None 时不放进 kwargs（对旧 fake 解析器零侵入）。
+- 测试 `test_orders_multi.py` +4（openai/deepseek trace 逐字一致、不传 trace 零变化、管线透传）。
+
+**② UI：三端选端骨架 + 删配置锁（仅 ui_app.py）**
+- 模块级 `VIEW_OPERATOR/VIEW_OPERATOR_CONFIG/VIEW_ADMIN` + `view_cards_for_role(role)`（纯函数，端↔卡片映射，可单测）。端↔卡片（2026-06-19 用户二次拍板后）：**操作员端**=order/result/production/output；**操作员配置端**=production/library；**管理员端**=order/result/production/fields/background/prompt_obs/output。**「画布」(实时画板 + 图层面板 production) 对三端开放**（production 进三端、预览画布常驻右栏不随端隐藏）；**输出（输出设置+生成）在操作员+管理员两端都挂**（管理员调规则后可直接生成验证端到端）；订单信息/解析结果(①③)在操作员+管理员两端共用同一 widget。
+- `_build_function_panel` 改为**所有卡片建一次存进 `self._function_cards`（key→widget）**，按端 `grid/grid_remove`（不重建、不丢状态）。新增 `_apply_view`/`_enter_view`/`_on_switch_view`/`_show_view_chooser`。
+- 启动弹**选端遮罩页**（`place` 覆盖全窗，三端卡片任选其一进入，无账号）；菜单条右侧加**「切端」CTkOptionMenu** 随时切。
+- **配置锁已整体删除**（用户 2026-06-19 拍板）：移除 `config_locked_var`/`lock_button`/`_locked_widgets` 状态、`_register_lock`/`_prune_locked`/`_toggle_config_lock` 方法、`_ctk_card` 的 `locked`/🔒 参数、订单信息卡上的 🔒 按钮，并把各处 `_register_lock(...)` 调用就地拆掉。**IP 隔离改由三端分离承担**（提示词配置/字段/背景词只在管理员端显示）。无控件再被禁用。这条**取代** 2026-06-17 的「仅提示词配置上锁」方案。
+
+**③ UI：解析可观测性②③挂到对应端**
+- **③ 结构化结果**：新增「解析结果」卡（`_build_parse_result_panel` + `parse_result_box` 只读框）。`_apply_parse_result` 末尾调 `_render_parse_result_box`，显示本单 ParseResult 人读摘要（订单号/数量/刻字/月/花(名)/字体/留言/置信度/⚠warnings）；`_format_parse_result` 用 getattr 容错（部分字段 stub 不崩）。**异常单仍走现有「需人工确认」弹窗**（量产不被每单弹窗打断）。
+- **② 本次提示词全文**：原「生成的提示词（开发期）」面板改名「本次提示词（实际发出）」，**解析后随本次操作自动刷新**（`_refresh_prompt_obs_from_trace` 在 `_apply_parsed_orders` 调，显示 `[provider·model] [system]… [user]…`）；解析失败也刷（便于排错）。「预览」按钮保留（解析前按当前字段拼一版）。本卡只在管理员端显示。
+- **① 原始内容** = 现有「订单信息」备注框本身，无需新控件。
+- `parse_remark` 建空壳 trace 传入 `parse_orders_auto`、存 `self._last_parse_trace`。
+
+**验证**：`py_compile`+`ruff` 我的 4 个源文件全 clean；全量 `pytest tests/` = **365 passed / 8 failed（全部预存：6×预览 zoom/pan/ruler 的 `<B2-Motion>` WIP、`case_button` WIP、`test_field_instructions…` 旧测试 vs 现默认字段，均与本轮无关，已 `git stash` 复验基线确认）/ 7 skip**。新增护栏测试 `test_view_cards_for_role_splits_three_ends`、`test_format_parse_result_renders_structured_summary` + 4 个 trace 测试。**headless 集成冒烟过**：构造真 App→切三端 grid 卡片正确→选端遮罩显隐→切端下拉→②trace 刷新→③结果框渲染，全绿。修了 2 个本轮自引入的回归（`_format_parse_result` 对 stub 用 getattr；`test_parse_remark…` 的 fake_parser 加 `trace=None`）。
+
+**已知 / 未做（不许当已完成）**：
+- **未真机点测**：需在 App 验①启动选端页能进三端、②顶部切端、③操作员端解析后看「解析结果」框、④管理员端解析后「本次提示词」自动刷新且==真发出内容、⑤异常单仍弹「需人工确认」。
+- **未做文件拆分**（ui_app.py 仍单文件）：本轮用「按端 grid 现有卡片」实现端分离（最小风险），未抽 `operator_view.py/config_view.py/admin_view.py`。用户提过单文件臃肿，文件拆分留作后续**纯重构**（护栏绿后再合）。
+- **管理员端密码门未加**（用户「现在不用账号」）：三端现可自由切换、无鉴权；日后若要把管理员端锁回，再加密码门（非本轮配置锁，那把锁已删）。
+- **操作员配置端**（fetch + production + library）；**新建产品未按端 gating**（产品列 product_rail 仍各端常显）。
+- **flower 核心待做 ① 多件解析消费 / ② 多件→多文件生成 未动**：① 待接（`order_importer`/`ParseResult` 读 `items[]` + GPT 层件数校验）；② 动生产关键路径，**动手前需与用户敲定命名/映射**（计划 P0-6）。⑥ 文字对齐阻塞于手绘样例。
+
+## 本会话改动（2026-06-20 · 订单链路性能优化·分阶段：应对常态 600+/峰值 1700+(1h涌入)）
+
+**权威计划 + 全程进度**：[.claude/plans/2026-06-20-order-pipeline-perf-staged.md](.claude/plans/2026-06-20-order-pipeline-perf-staged.md)。三层分治、决策（**保留 SQLite 加固、不换 Postgres**；顺序一→二→三）、红线、真机校准点都在里面。跨 flower + automation 两子系统。
+
+- **阶段一·DB 地基（automation/inbox-service，✅测试 130 passed）**：`db.py` 开 WAL+synchronous=NORMAL+busy_timeout（写不堵读）；`models.py`+迁移 `0008` 补索引 received_at/refund_status/(status,received_at)；`list_orders` 消 N+1(eager-load)+分页(limit/offset)+真实总数 count；新增 `POST /inbox/orders/batch` 批量入库；retention 改批量 DELETE。
+- **阶段二·抓取吞吐（✅安全部分已测；翻页待真机校准）**：`scrape_planner.diff_manifest` 逐条 get→一次 IN 查询；扩展 `auto_cycle` 逐单 await→批量 `pushOrders`(`/orders/batch`)；**自动翻页+游标「页面记录」**（`worker/paginate.ts` 纯逻辑+`extractor/dianxiaomi_pager.ts` DOM 胶水+`content.ts` 接线，游标存 `chrome.storage.local`，加了 storage 权限）——稳态只读第1页、洪峰翻到接上游标，绝不每轮全量重读。扩展 vitest 83 passed/tsc/build 通过。**真机校准点见计划文档**（翻页等待时长/虚拟滚动满页/风控）。打标保持「抓完立即打标」（用户要求，未动）。
+- **阶段三·UI 虚拟列表（flower，✅）**：订单表 `CTkScrollableFrame` 逐行 → `ttk.Treeview`（原生虚拟化扛 1700+ 行；深色样式；整行按退款/风控着色；双击详情、选中+✕/Delete/右键删除、多选）。`list_orders` 拉 limit=2000 一次显示全量。**↓ 下面那条「实时订单表 Level1+2 增量 diff」的 CTk 逐行渲染已被本阶段的 Treeview 取代**（本地删行思路保留）。
+- 测试：inbox-service 130、扩展 83、flower test_ui_app 80 passed（8 failed=本分支既有 preview/文字/字段 WIP，与本次无关）。
+- **整体未真机点测**：起 inbox-service(8770)+扩展 dist+配置端，验吞吐(翻页/批量)+订单表(1700行秒开/删除/详情)。
+
+## 本会话改动（2026-06-20 · 「实时订单」表删除/刷新从整表重建 → 增量 diff + 本地删行，仅改 ui_app.py + test_ui_app.py）
+
+问题：删一条订单走 `_confirm_delete_order` → `_refresh_orders_table`（再 `health`+`list_orders`+`get_scrape_control` 三次 HTTP）→ `_render_orders_rows` 把整表 `winfo_children()` 全 destroy 后逐行重建。按 218 单算 ≈ 销毁+重建 ~1700 个 CTk 控件 + 3 次 HTTP，几秒卡死、压 CPU、延迟高。范式照搬本仓已有的 `_render_layers`（按 id 增量复用行）。用户拍板做 **Level 1+2**（Level 3 = 换 `ttk.Treeview`/虚拟列表**暂不做**，单量常态上几百再排）。
+
+- **Level 2 增量渲染**：`_render_orders_rows` 改 diff——表头常驻复用（`_orders_header`）；按 `order_id` 删消失行 / 建新增行(`_build_order_row`) / 存活行原位更新(`_update_order_row`) / `grid_configure` 重排。状态由 `self._orders_rows: {order_id→控件dict}` 持有（`__init__` 初始化，旁边还有 `_orders_header`/`_orders_empty_hint`）。
+- **Level 1 本地删行**：`_confirm_delete_order` 成功回调改调 `_remove_order_row_local(order_id)`——只 `pop`+`destroy` 那一行、状态行计数 −1、删空显占位；**不再调 `_refresh_orders_table`**（不触网、不整表重建）。详情弹窗「删除此单」同享此路径（`on_done=win.destroy`）。
+- 删 `_orders_row`（整行重建用）+ `_bind_click_deep`（仅其用到）；点行看详情改走 `_open_order_detail_row` 读 `row['raw']`（增量更新时变，绑一次不叠加）。`order_row_view`/`_format_scrape_status` 等纯函数不动。
+- 行内删除后剩余行 grid 行号留空（空行高 0、无视觉缝），下次整刷（点刷新/进配置端/立即清理）经 `grid_configure` 重排为连续。
+- 测试：新增 `test_orders_table_renders_incrementally_and_deletes_one_row_locally`（验：建/删/复用同控件对象/状态原位更新/本地删行；需 Tk，否则 skip）。`pytest tests/test_ui_app.py` = **80 passed / 8 failed**（8 失败=本分支既有 preview 平移缩放/文字大小写/字段指令 WIP，与本次无关）；`ruff`/`py_compile` 我的改动 clean（test 里 line 2169 `SAFE_MARGIN_Y` F401 是既有 WIP，非本次）。
+- **未真机点测**：起 inbox-service 后进配置端验：删一条**瞬时不卡**、刷新只动变化行、删到空显占位、点行看详情/详情里删除均 OK。
+
+## 本会话改动（2026-06-20 · 「抓取订单」开始/停止两按钮 → 单个实时开关 CTkSwitch，仅改 ui_app.py + test_ui_app.py）
+
+用户诉求：自动抓总开关要在**操作员配置端**实时开/关。它本就在该端（`_VIEW_CARD_ORDER[operator_config]=("fetch","library")`），但旧版是 `[开始][停止]` 两按钮——这次按用户拍板**换成一个实时开关**（更直观、可见当前真实态）。**下方 06-19 那节里写的「开始/停止两按钮」已被本次取代，语义不变（仍是 PUT `/inbox/scrape/control {enabled}`）。**
+
+- `_build_fetch_panel`：`[开始][停止]` → 一个 `ctk.CTkSwitch`「自动抓取」（`fetch_switch`/`fetch_switch_var`，progress_color=accent）；`[设置][刷新]`、定时抓取栏、状态文案均不变。布局：开关靠左、设置/刷新靠右。
+- **勾选态 = 服务真实 `enabled`**；进配置端（`_apply_view` 懒探，原样）/点刷新后**自动同步**，不用手点。
+- **未连接/状态未知 → 开关置灰不可拨**；误触发会**回弹+提示**先起 inbox-service。拨动期间禁用防连点；PUT 失败**自动回弹**并显错。
+- 关键：`variable.set()` 只刷视觉**不触发 command**（CTkSwitch 的 command 仅用户点击才发），故 `_render_fetch_status` 回填开关态无递归。
+- 删 `_on_fetch_start`/`_on_fetch_stop` → `_on_fetch_switch_toggle`；新增纯函数 `_scrape_switch_state(probed,connected,control)->(checked,clickable)` + setter `_set_switch_state`。`_format_scrape_status` 不动（其护栏测试仍绿）。
+- 测试：新增 `test_scrape_switch_state_maps_connection_to_clickable_and_checked`（5 例）。`pytest tests/test_ui_app.py` = **79 passed / 8 failed**，8 个失败全是本分支既有的 preview 平移缩放/文字大小写/字段指令 WIP（`<B2-Motion>` 等绑定断言），**与本次无关**（init 测试已构造完含开关的整个 App 才在 preview 断言失败）。
+- **未真机点测**：需起 `uvicorn app.main:app --port 8770` + 进操作员配置端，验：连上后开关反映真实态、拨开/拨关即生效、未连接置灰、失败回弹。
+
+## 本会话改动（2026-06-19 · 「抓取订单」面板接通 inbox-service 自动抓开关，新增 inbox_service_client.py + ui_app）
+
+「抓取订单」面板（操作员配置端）从骨架**接通到 automation 真实接口**。背景：automation 已补齐「定时自动抓 + 缓存/完整性」**服务核心**并**专门给 flower 留了开关接口**——`GET/PUT /inbox/scrape/control`（automation/AGENTS.md 明记「flower 唯一要写的开关」`{enabled, interval_seconds, scrape_from}`，「从 T 重抓」= PUT `restart_from`）。拓扑：**flower → inbox-service（写开关）→ 扩展（读开关去抓）**，inbox-service 是唯一中转，flower 不直连扩展。
+
+- **新增 `inbox_service_client.py`**（标准库 urllib，无新依赖）：`health()`（探活，不可达回 None）、`get_scrape_control()`、`put_scrape_control(enabled?/interval_seconds?/restart_from?/clear_restart_from?)`（部分更新）。base url 默认 `127.0.0.1:8770`，可被 env `FLOWER_INBOX_HOST/PORT` 覆盖以对齐服务端。HTTP 错误转可读消息。**注意：这是 automation 的 inbox-service（live 本地服务），不是暂缓的 web `services/api`**。测试 `tests/test_inbox_service_client.py`（6 条，注入 fake transport，不打真网络）。
+- **`_build_fetch_panel` 接通**（映射全由契约定，用户已确认「照此接」）：**开始/停止** = `PUT enabled` true/false（自动抓总开关）；**设置**弹窗 = 抓取间隔 `interval_seconds`(PUT) + 服务地址(本地存 `self._inbox_service_url`) + 收件夹(只读显示)；**定时锁** = 从某付款时间 `restart_from`（应用=PUT restart_from / 清空=clear_restart_from）；**刷新** = 重新探活+读开关。状态行 = 服务连接(/healthz) + 自动抓态(enabled/间隔/scrape_from) + 收件夹当前单。
+- **开始/停止语义已变**（上一版骨架里是控制本地收件夹监听，用户拍板改成自动抓开关）。收件夹消费（轮询载单进编辑器）照常后台跑、不在面板按钮里（`_stop_inbox_poller` + `_start_inbox_poller` 幂等守卫仍在，供内部用）。
+- HTTP 全走 `run_background`（不卡 UI）；**懒探**：不在构造时探网，进入操作员配置端（`_apply_view` role==config）或点「刷新」才查，省得每次起 App / 每个无头测试都连一次（`_scrape_probed` 标志；warnings 从 47 回落到 5）。
+- 纯函数 `_format_scrape_status(connected, base_url, control, active_name)` 可测；`_render_fetch_status` 纯渲染（`getattr` 容错部分实例）。
+- 测试：`test_format_scrape_status_reflects_connection_and_switch`（替换原 `_format_fetch_status` 测试）+ 客户端 6 条。
+
+**跨仓待做（automation/扩展侧，非 flower）**：flower 这半**已接通**（写开关）。**仍缺**：① **扩展的「读开关 → 按 scrape_from/间隔 抓新单 → POST /inbox/scrape/diff 拿 worklist → 逐单抓 → POST /inbox/orders」自动循环**（automation/AGENTS.md 记为 ⬜扩展循环，属扩展 + Chrome 真机活）；② inbox-service 真·起服务（`uvicorn app.main:app --port 8770`）才有得连——**flower 面板服务未起时显示「未连接」**（已优雅处理，不崩）。
+
+**验证**：`ruff`/`py_compile` clean（我的源文件）；全量 `pytest tests/` = **372 passed / 8 failed（同前预存 WIP，与本轮无关）/ 7 skip / 5 warnings**；**headless 冒烟过**（注入 fake client + 同步 run_background：进配置端懒探→连上→开始 PUT enabled=True、定时锁 PUT restart_from、清空 PUT clear、停止 enabled=False，按钮态随开关切）。**未真机点测**（需起 inbox-service + 在 App 操作员配置端验：连接态、开始/停止、设置改间隔、定时锁从某时间重抓、刷新）。
 
 ## 本会话改动（2026-06-18 · 功能区锁范围调整 + info 结果框只读接 AI，仅改 ui_app.py）
 

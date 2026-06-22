@@ -21,6 +21,8 @@ export default defineManifest({
       all_frames: true,
     },
   ],
+  // 自动抓取翻页游标（高水位付款时间）存本地，避免每轮从第 1 页重读所有页。
+  permissions: ['storage'],
   // service worker fetch 到本地服务需要 host 权限。
   host_permissions: ['http://127.0.0.1:8770/*', 'http://localhost:8770/*'],
 })

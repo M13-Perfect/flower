@@ -11,12 +11,13 @@ import json
 import pytest
 
 from gpt_parser import (
+    DEEPSEEK_ORDERS_JSON_SUFFIX,
     ORDERS_SCHEMA,
     build_orders_system_prompt,
     parse_orders_payload,
     parse_orders_with_gpt,
 )
-from models import AIParseConfig, ParseResult
+from models import AIParseConfig, ParsePromptTrace, ParseResult
 from parse_pipeline import parse_orders_auto, split_order_blocks
 
 
@@ -170,6 +171,79 @@ def test_parse_orders_with_gpt_uses_custom_prompt():
     content = captured["payload"]["input"][0]["content"]
     assert "只提取名字" in content
     assert "【背景】礼品语境" in content
+
+
+def test_parse_orders_with_gpt_fills_trace_with_actual_sent_prompt_openai():
+    # 可观测性 ③：trace 记的「本次提示词」必须**逐字等于**真正发给 OpenAI 的 system 内容。
+    captured: dict = {}
+
+    def fake_post(url, payload, headers, timeout):
+        captured["payload"] = payload
+        return {"output_text": json.dumps({"orders": []})}
+
+    trace = ParsePromptTrace()
+    parse_orders_with_gpt(
+        "  4090627965\nName: Amy  ", api_key="k", provider="openai",
+        system_prompt="只提取名字", background_prompt="礼品语境",
+        http_post=fake_post, trace=trace,
+    )
+
+    assert trace.filled is True
+    assert trace.provider == "openai"
+    assert trace.model  # 解析到的模型名（默认 gpt-5-nano）非空
+    sent_system = captured["payload"]["input"][0]["content"]
+    sent_user = captured["payload"]["input"][1]["content"]
+    assert trace.system_prompt == sent_system  # 显示 == 发送，零漂移
+    assert trace.user_content == sent_user
+
+
+def test_parse_orders_with_gpt_fills_trace_with_deepseek_json_suffix():
+    # DeepSeek 路径：trace 的 system 提示词必须含真实追加的 JSON 约定后缀，并等于发出去的 content。
+    captured: dict = {}
+
+    def fake_post(url, payload, headers, timeout):
+        captured["payload"] = payload
+        return {"choices": [{"message": {"content": json.dumps({"orders": []})}}]}
+
+    trace = ParsePromptTrace()
+    parse_orders_with_gpt(
+        "note", api_key="k", provider="deepseek",
+        system_prompt="只提取名字", http_post=fake_post, trace=trace,
+    )
+
+    assert trace.provider == "deepseek"
+    assert DEEPSEEK_ORDERS_JSON_SUFFIX in trace.system_prompt
+    sent_system = captured["payload"]["messages"][0]["content"]
+    assert trace.system_prompt == sent_system
+
+
+def test_parse_orders_with_gpt_without_trace_is_unchanged():
+    # 不传 trace 时行为零变化（旧调用方/测试不受影响）。
+    def fake_post(url, payload, headers, timeout):
+        return {"output_text": json.dumps({"orders": [{"text": "Amy", "month": 1, "font": 1, "flower": 1}]})}
+
+    results = parse_orders_with_gpt("note", api_key="k", provider="openai", http_post=fake_post)
+    assert [r.text for r in results] == ["Amy"]
+
+
+def test_parse_orders_auto_threads_trace_to_parser():
+    # 管线把 trace 透传到解析器；不传 trace 时 fake 解析器 kwargs 里不出现 trace。
+    config = AIParseConfig(enabled=True, system_prompt="SP")
+    seen: dict = {}
+
+    def fake_orders(remark, **kwargs):
+        seen.update(kwargs)
+        if kwargs.get("trace") is not None:
+            kwargs["trace"].filled = True
+        return [ParseResult(text="A", month=1, font=1, flower=1)]
+
+    trace = ParsePromptTrace()
+    parse_orders_auto("note", ai_config=config, gpt_orders_parser=fake_orders, trace=trace)
+    assert seen.get("trace") is trace and trace.filled is True
+
+    seen.clear()
+    parse_orders_auto("note", ai_config=config, gpt_orders_parser=fake_orders)
+    assert "trace" not in seen
 
 
 def test_split_order_blocks_extracts_each_order_number():

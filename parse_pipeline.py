@@ -8,7 +8,7 @@ from typing import Any
 from gpt_parser import parse_order_remark_with_gpt, parse_orders_with_gpt
 # 本地规则已停用（全局 AI 对齐），保留可恢复：
 # from local_order_parser import parse_order_remark_local
-from models import AIParseConfig, ParseResult
+from models import AIParseConfig, ParsePromptTrace, ParseResult
 from order_catalog import LibraryBundle, enrich_parse_result
 
 
@@ -44,18 +44,20 @@ def parse_orders_auto(
     bundle: LibraryBundle | None = None,
     gpt_orders_parser: OrdersParser | None = None,
     local_parser: LocalParser | None = None,
+    trace: ParsePromptTrace | None = None,
 ) -> list[ParseResult]:
     """多订单识别：一次粘贴可含多笔订单，返回 ParseResult 列表（每笔一条）。
 
     **全局使用 AI 解析**（用户要求）：始终走多订单 GPT，不受「AI 优先」开关影响；
     AI 失败直接抛错由 UI 提示，**不再静默回退本地规则**。传入 bundle 时每条再富化落素材/字体 key。
+    传入 `trace`（空壳 ParsePromptTrace）时，解析路径把实际发出的提示词写回，供解析页可观测性展示。
     本地兜底代码（_local_orders / split_order_blocks / _should_prefer_ai 门控）已注释停用、保留可恢复。
     """
     gpt = gpt_orders_parser or parse_orders_with_gpt
     # 本地规则已停用：注释掉本地解析器与按块兜底，全局只用 AI。
     # local = local_parser or parse_order_remark_local
 
-    results = [r for r in _call_orders_gpt(gpt, remark, ai_config) if r is not None]
+    results = [r for r in _call_orders_gpt(gpt, remark, ai_config, trace) if r is not None]
     # if _should_prefer_ai(ai_config):
     #     try:
     #         results = [r for r in _call_orders_gpt(gpt, remark, ai_config) if r is not None]
@@ -70,22 +72,28 @@ def parse_orders_auto(
 
 
 def _call_orders_gpt(
-    gpt: OrdersParser, remark: str, ai_config: AIParseConfig | None
+    gpt: OrdersParser,
+    remark: str,
+    ai_config: AIParseConfig | None,
+    trace: ParsePromptTrace | None = None,
 ) -> list[ParseResult]:
-    if ai_config is None:
-        return gpt(remark)
-    return gpt(
-        remark,
-        api_key=ai_config.api_key,
-        model=ai_config.model,
-        project=ai_config.project,
-        organization=ai_config.organization,
-        provider=ai_config.provider,
-        base_url=ai_config.base_url,
-        system_prompt=ai_config.system_prompt,
-        background_prompt=ai_config.background_prompt,
-        timeout=ai_config.timeout,
-    )
+    # trace 仅在调用方需要可观测性时传入；为 None 时不放进 kwargs，保持对旧 fake 解析器的零侵入。
+    kwargs: dict[str, Any] = {}
+    if ai_config is not None:
+        kwargs.update(
+            api_key=ai_config.api_key,
+            model=ai_config.model,
+            project=ai_config.project,
+            organization=ai_config.organization,
+            provider=ai_config.provider,
+            base_url=ai_config.base_url,
+            system_prompt=ai_config.system_prompt,
+            background_prompt=ai_config.background_prompt,
+            timeout=ai_config.timeout,
+        )
+    if trace is not None:
+        kwargs["trace"] = trace
+    return gpt(remark, **kwargs)
 
 
 def _local_orders(remark: str, local: LocalParser) -> list[ParseResult]:

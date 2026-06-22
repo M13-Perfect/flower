@@ -5,7 +5,7 @@ import os
 from typing import Any, Callable
 from urllib import error, request
 
-from models import ParseResult
+from models import ParsePromptTrace, ParseResult
 
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -13,6 +13,14 @@ DEFAULT_MODEL = "gpt-5-nano"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEFAULT_MAX_OUTPUT_TOKENS = 1200
+
+# DeepSeek 不支持 json_schema，只能要 json_object；这段「顶层 orders + 字段列表」是发给它的
+# system 提示词**真实追加的后缀**（机器 I/O 约定，非业务规则，按用户要求保留）。抽成常量是为了让
+# 解析页可观测性显示的「本次提示词」与真正发送内容逐字一致（见 ParsePromptTrace）。
+DEEPSEEK_ORDERS_JSON_SUFFIX = (
+    ' 必须输出 JSON：{"orders":[...]}，每个元素含 order_number, quantity, month, '
+    "flower_name, flower, font, text, gift_message, warnings, confidence。"
+)
 
 
 ORDER_REMARK_SCHEMA: dict[str, Any] = {
@@ -177,25 +185,36 @@ def parse_orders_with_gpt(
     background_prompt: str | None = None,
     http_post: HttpPost | None = None,
     timeout: float = 20,
+    trace: ParsePromptTrace | None = None,
 ) -> list[ParseResult]:
     """多订单版：一次解析含多笔订单的文本，返回 ParseResult 列表（每笔一条）。
 
     系统提示词来自前台「提取/背景提示词」（system_prompt/background_prompt），为空时回落默认提示词。
+    传入 `trace`（空壳 ParsePromptTrace）时，把**实际发出**的 system 提示词 + 用户内容 + provider/model
+    就地写回，供解析页可观测性展示（见 ③）；不传则零行为变化。
     """
     selected_provider = _normalize_provider(provider)
     prompt = build_orders_system_prompt(system_prompt, background_prompt)
     if selected_provider == "deepseek":
         return _parse_orders_with_deepseek(
             remark, prompt, api_key=api_key, model=model, base_url=base_url,
-            http_post=http_post, timeout=timeout,
+            http_post=http_post, timeout=timeout, trace=trace,
         )
     if selected_provider != "openai":
         raise ValueError(f"不支持的 AI provider：{selected_provider}")
 
+    # 提示词不依赖密钥/模型，尽早写回 trace：即便后续因缺 key 抛错，解析页也能看到「本次提示词」。
+    if trace is not None:
+        trace.provider = "openai"
+        trace.system_prompt = prompt
+        trace.user_content = remark
+        trace.filled = True
     key = api_key or os.environ.get("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("未配置 OPENAI_API_KEY，无法调用 GPT 解析")
     selected_model = model or os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
+    if trace is not None:
+        trace.model = selected_model
     payload = {
         "model": selected_model,
         "store": False,
@@ -231,21 +250,25 @@ def _parse_orders_with_deepseek(
     base_url: str | None = None,
     http_post: HttpPost | None = None,
     timeout: float = 20,
+    trace: ParsePromptTrace | None = None,
 ) -> list[ParseResult]:
+    # 真正发给 DeepSeek 的 system 全文 = 前台提示词 + JSON 约定后缀；trace 也记这份全文（逐字一致）。
+    full_system_prompt = system_prompt + DEEPSEEK_ORDERS_JSON_SUFFIX
+    if trace is not None:
+        trace.provider = "deepseek"
+        trace.system_prompt = full_system_prompt
+        trace.user_content = remark
+        trace.filled = True
     key = api_key or os.environ.get("DEEPSEEK_API_KEY")
     if not key:
         raise RuntimeError("未配置 DEEPSEEK_API_KEY，无法调用 DeepSeek 解析")
     selected_model = model or os.environ.get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
+    if trace is not None:
+        trace.model = selected_model
     payload = {
         "model": selected_model,
         "messages": [
-            {
-                "role": "system",
-                # DeepSeek 不支持 json_schema，只能要 json_object；显式叮嘱顶层 orders 数组与字段。
-                "content": system_prompt
-                + ' 必须输出 JSON：{"orders":[...]}，每个元素含 order_number, quantity, month, '
-                "flower_name, flower, font, text, gift_message, warnings, confidence。",
-            },
+            {"role": "system", "content": full_system_prompt},
             {"role": "user", "content": remark},
         ],
         "response_format": {"type": "json_object"},

@@ -60,6 +60,65 @@ describe('collectOrders（店小秘 vxe 列表页真实结构）', () => {
       expect(hit.anchorEl.classList.contains('orderCode')).toBe(true)
     }
   })
+
+  it('单件订单仍抓出长度 1 的 items[]，product_sku 与 spec 一致，无 refund_status', () => {
+    const order = byId(hits, '4093542955').order
+    expect(order.items).toHaveLength(1)
+    expect(order.items?.[0].line_index).toBe(0)
+    expect(order.items?.[0].product_sku).toBe(order.spec)
+    expect(order.items?.[0].personalization_raw).toBe(order.remark)
+    expect(order.refund_status).toBeUndefined()
+  })
+})
+
+describe('一单多件 + 退款状态（店小秘「全部订单」列表页真实结构）', () => {
+  const hits = collectOrders(loadFixture('dianxiaomi-order-multi.html'))
+
+  it('混单：4 个行项目按序抓出，跨固定列不重复', () => {
+    const order = byId(hits, '4092270213').order
+    expect(order.items).toHaveLength(4)
+    expect(order.items?.map((it) => it.line_index)).toEqual([0, 1, 2, 3])
+    expect(order.items?.map((it) => it.product_sku)).toEqual([
+      '21842163406',
+      '21842163420',
+      '27901510805',
+      '28275184592',
+    ])
+  })
+
+  it('件数 ×N 解析：默认 1，显式数量按整数读', () => {
+    const items = byId(hits, '4092270213').order.items
+    expect(items?.[0].quantity).toBe(1)
+    expect(items?.[1].quantity).toBe(2)
+    // 第三件无 quantity span → 缺省（按 1，不写字段）
+    expect(items?.[2].quantity).toBeUndefined()
+  })
+
+  it('每个行项目带本行原始定制备注 + extras（listing/price/缩略图）', () => {
+    const items = byId(hits, '4092270213').order.items
+    expect(items?.[0].personalization_raw).toBe(
+      'Choose Your Birth Flower: Oct - Cosmos / Font Design: Font 3 / Personalization: Anna Veit',
+    )
+    expect(items?.[0].extras?.listing_url).toBe('https://www.etsy.com/listing/1763390413')
+    expect(items?.[0].extras?.price).toBe('USD 79.50')
+    expect(items?.[0].extras?.thumbnail).toBe('https://i.etsystatic.com/il_100x100.a.jpg')
+  })
+
+  it('退款状态从 .orderState 抓出原文', () => {
+    expect(byId(hits, '4092270213').order.refund_status).toBe('待打单（有货）')
+    expect(byId(hits, '4092128423').order.refund_status).toBe('已退款')
+  })
+
+  it('付款时间从时间轴「付款：」项抓出（自动抓取时间基准）', () => {
+    expect(byId(hits, '4092270213').order.paid_at).toBe('2026-06-19 02:25')
+    expect(byId(hits, '4092128423').order.paid_at).toBe('2026-06-19 03:10')
+  })
+
+  it('已退款订单仍抓出 2 个行项目（结构不受状态影响）', () => {
+    const order = byId(hits, '4092128423').order
+    expect(order.items).toHaveLength(2)
+    expect(order.items?.map((it) => it.product_sku)).toEqual(['21842163266', '21482780391'])
+  })
 })
 
 describe('边界', () => {
@@ -71,5 +130,22 @@ describe('边界', () => {
     const order = extractOrder(new JSDOM('<div>nothing</div>').window.document)
     expect(order.order_id).toBe('')
     expect(order.remark).toBe('')
+  })
+})
+
+describe('AI已处理 标记读取（标准1）', () => {
+  it('表头行含 icon_change_order → ai_done=true；否则 false', () => {
+    const doc = new JSDOM(
+      `<table><tbody>
+        <tr rowid="1"><td class="orderCode"><span class="pointer">4090627965</span></td></tr>
+        <tr rowid="1_header"><td><div class="order-mark-block"><i class="icon_change_order"></i></div></td></tr>
+        <tr rowid="2"><td class="orderCode"><span class="pointer">4093542955</span></td></tr>
+        <tr rowid="2_header"><td><div class="order-mark-block"><i class="icon_brush_bill"></i></div></td></tr>
+      </tbody></table>`,
+    ).window.document
+    const hits = collectOrders(doc)
+    expect(byId(hits, '4090627965').order.ai_done).toBe(true)
+    expect(byId(hits, '4093542955').order.ai_done).toBe(false)
+    expect(byId(hits, '4093542955').order.ai_unrecognized).toBe(true)
   })
 })

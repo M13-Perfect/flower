@@ -32,3 +32,13 @@ dev-*.log
 tmp_out/
 .idea/
 .claude/session-log.md
+
+# Build / release artifacts (PyInstaller onedir + zip)
+build/
+release/
+
+# SQLite runtime / backup files (inbox.db itself already ignored)
+*.db-shm
+*.db-wal
+*.db.bak-*
+db-backup-*/

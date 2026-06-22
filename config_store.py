@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+import hashlib
+import hmac
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,8 +14,64 @@ from models import EngravingLayout
 
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = APP_DIR / "birth_flower_config.json"
-DEFAULT_OUTPUT_DIR = APP_DIR / "outputs"
+
+
+def _is_writable(directory: Path) -> bool:
+    try:
+        probe = directory / ".bf_write_test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _data_root() -> Path:
+    """配置/输出根。优先级：BIRTHFLOWER_DATA_DIR > 冻结态(exe 同级 data\\ / %APPDATA%) > 源码态(本目录)。
+
+    源码态返回 APP_DIR，与历史行为完全一致（开发/测试不受影响）。冻结态把数据放到 exe 旁的
+    data\\，升级换 exe 不丢；exe 目录不可写时回落 %APPDATA%\\BirthFlower。打包后由 packaging/
+    launcher.py 通过 BIRTHFLOWER_DATA_DIR 统一注入（两处算法保持一致）。
+    """
+    env_dir = os.environ.get("BIRTHFLOWER_DATA_DIR")
+    if env_dir:
+        return Path(env_dir)
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        if _is_writable(exe_dir):
+            return exe_dir / "data"
+        appdata = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        return (Path(appdata) if appdata else exe_dir) / "BirthFlower"
+    return APP_DIR
+
+
+def _default_config_path() -> Path:
+    explicit = os.environ.get("BIRTHFLOWER_CONFIG")
+    if explicit:
+        return Path(explicit)
+    return _data_root() / "birth_flower_config.json"
+
+
+def _default_inbox_folder() -> str:
+    """统一包里 flower「收件夹」的兜底值，使打包后无需手动配置即可自动取单。
+
+    serve（inbox-service）把订单 JSON 写到 FLOWER_INBOX_DIR（launcher 注入 = DATA_ROOT/outputs/inbox）；
+    flower 需轮询同一目录才能自动载入。故：有 FLOWER_INBOX_DIR 时用它；冻结态回落 DATA_ROOT/outputs/inbox；
+    纯源码/开发态返回 ""（保持历史行为：收件夹默认关，需用户在「抓取设置」里手动指定）。
+    """
+    env_dir = os.environ.get("FLOWER_INBOX_DIR")
+    if env_dir:
+        return env_dir
+    if getattr(sys, "frozen", False):
+        return str(_data_root() / "outputs" / "inbox")
+    return ""
+
+
+# 注意：以下常量在**模块 import 时**按当时的环境变量一次性固化。打包后 flower 子进程由 launcher
+# 在 subprocess 启动前注入 BIRTHFLOWER_DATA_DIR/FLOWER_INBOX_DIR，故子进程 import 时 env 已就位、取值正确。
+# 但任何在 import 之后才设/改这些 env 的代码都不会反映到这里——勿在进程内动态改 DATA_ROOT。
+DEFAULT_CONFIG_PATH = _default_config_path()
+DEFAULT_OUTPUT_DIR = _data_root() / "outputs"
 DEFAULT_OUTPUT_PATH = DEFAULT_OUTPUT_DIR / "birth_flower.svg"
 DEFAULT_OUTPUT_FORMATS = ("svg", "dxf")
 SUPPORTED_OUTPUT_FORMATS = {"png", "svg", "dxf"}
@@ -71,8 +131,19 @@ class AppConfig:
     # 自动取单收件夹（automation/ 一期）：扩展→本地服务→写 {order_id}.json 到此目录；
     # Flower 用 Tk .after 轮询，自动载入备注+解析、停在生成前。空=功能关（默认），对现有用户零影响。
     inbox_folder: Path = Path("")
-    # 收件夹来单后是否自动解析（始终停在生成前，绝不自动生成）。
-    inbox_autoparse: bool = True
+    # 收件夹来单后是否自动解析识别（始终停在生成前，绝不自动生成）。默认关：
+    # 「自动识别」必须由用户在 GUI 的「抓取订单」区域显式打开，与「自动抓取」语义/状态完全独立。
+    inbox_autoparse: bool = False
+    # 「自动识别」是否由用户经新版 GUI 显式设置过。False=旧配置 / 全新 / 默认。
+    # 安全优先：load 时只有该标记为 True 才采信存储的 inbox_autoparse，否则一律回落 False，
+    # 避免旧配置里遗留的 inbox_autoparse=True 在用户没有明确同意时自动触发解析。
+    inbox_autoparse_user_set: bool = False
+    # flower→inbox-service 地址（「抓取订单」面板的服务地址）。空=用客户端默认 127.0.0.1:8770。
+    # 在「抓取设置」里改后持久化到此，重启不丢。
+    inbox_service_url: str = ""
+    # 管理员端密码（PBKDF2-SHA256，格式见 hash_password）。空=尚未设密码（首次进管理员端引导设置）。
+    # 只存哈希、不存明文；选端页「管理员端」据此决定是否弹密码门。
+    admin_password_hash: str = ""
 
     def __post_init__(self) -> None:
         if not self.products:
@@ -101,6 +172,10 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     if not profiles:
         profiles = (AIProfile(),)
     active_profile = _string_value(payload, "active_ai_profile", profiles[0].name)
+    # 「自动识别」安全迁移：仅当用户经新版 GUI 显式设置过（inbox_autoparse_user_set=True）才采信存储值；
+    # 否则（旧配置遗留 True / 全新 / 缺字段）一律回落 False，避免未经用户明确同意就自动解析。
+    autoparse_user_set = _bool_value(payload, "inbox_autoparse_user_set", False)
+    inbox_autoparse = _bool_value(payload, "inbox_autoparse", False) if autoparse_user_set else False
     return AppConfig(
         flower_dir=Path(_string_value(payload, "flower_dir", str(AppConfig().flower_dir))),
         font_source=Path(_string_value(payload, "font_source", str(AppConfig().font_source))),
@@ -113,8 +188,11 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         products=_products_from_payload(payload.get("products")),
         active_product_id=_string_value(payload, "active_product_id", ""),
         products_panel_collapsed=_bool_value(payload, "products_panel_collapsed", True),
-        inbox_folder=Path(_optional_string_value(payload, "inbox_folder", "")),
-        inbox_autoparse=_bool_value(payload, "inbox_autoparse", True),
+        inbox_folder=Path(_optional_string_value(payload, "inbox_folder", "") or _default_inbox_folder()),
+        inbox_autoparse=inbox_autoparse,
+        inbox_autoparse_user_set=autoparse_user_set,
+        inbox_service_url=_optional_string_value(payload, "inbox_service_url", ""),
+        admin_password_hash=_optional_string_value(payload, "admin_password_hash", ""),
     )
 
 
@@ -136,6 +214,9 @@ def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Pa
         "products_panel_collapsed": bool(config.products_panel_collapsed),
         "inbox_folder": str(config.inbox_folder),
         "inbox_autoparse": bool(config.inbox_autoparse),
+        "inbox_autoparse_user_set": bool(config.inbox_autoparse_user_set),
+        "inbox_service_url": config.inbox_service_url,
+        "admin_password_hash": config.admin_password_hash,
     }
     config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return config_path
@@ -312,6 +393,50 @@ def with_product_prompts(
         for product in config.products
     )
     return replace(config, products=products)
+
+
+# ===== 管理员密码（PBKDF2-SHA256，纯标准库，无新依赖）=====
+# 存储格式：``pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>``。只存哈希、不存明文。
+_PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password: str, *, salt: bytes | None = None, iterations: int = _PBKDF2_ITERATIONS) -> str:
+    """把明文密码哈希成可持久化字符串（带随机盐 + 迭代）。salt 仅供测试注入固定值。"""
+    if salt is None:
+        salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(stored: str, password: str) -> bool:
+    """常量时间校验明文是否匹配已存哈希；格式非法/空哈希一律返回 False。"""
+    if not stored:
+        return False
+    try:
+        algo, iter_s, salt_hex, hash_hex = stored.split("$")
+        iterations = int(iter_s)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+    except ValueError:
+        return False
+    if algo != "pbkdf2_sha256":
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(digest, expected)
+
+
+def has_admin_password(config: AppConfig) -> bool:
+    """是否已设管理员密码（空哈希=未设，首次进管理员端引导设置）。"""
+    return bool(config.admin_password_hash)
+
+
+def verify_admin_password(config: AppConfig, password: str) -> bool:
+    return verify_password(config.admin_password_hash, password)
+
+
+def with_admin_password(config: AppConfig, password: str) -> AppConfig:
+    """返回设好管理员密码的新配置（不可变）。空密码=清除（回到未设态）。"""
+    return replace(config, admin_password_hash=hash_password(password) if password else "")
 
 
 def _bool_value(payload: dict[str, Any], key: str, default: bool) -> bool:

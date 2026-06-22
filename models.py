@@ -54,6 +54,23 @@ class AIParseConfig:
     background_prompt: str | None = None
 
 
+@dataclass
+class ParsePromptTrace:
+    """记录某次解析「实际发给模型」的提示词全文 + provider/model，供解析页可观测性展示。
+
+    解析路径（gpt_parser.parse_orders_with_gpt / _parse_orders_with_deepseek）把**真正拼装并发出**的
+    system 提示词（含 DeepSeek 的「顶层 orders + 字段列表」JSON 约定后缀）与用户内容写回这里，
+    UI 据此显示「本次提示词」，**不自行重算**，避免界面显示与真实发送内容漂移。
+    可变（非 frozen）：作为「出参」由调用方建空壳传入、解析路径就地填充。
+    """
+
+    provider: str = ""
+    model: str = ""
+    system_prompt: str = ""
+    user_content: str = ""
+    filled: bool = False
+
+
 @dataclass(frozen=True)
 class EngravingLayout:
     canvas_width: int = 1732

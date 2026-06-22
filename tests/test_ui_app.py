@@ -11,19 +11,32 @@ import pytest
 from config_store import AIProfile, active_product
 from generation_readiness import GenerationReadiness
 from glyph_service import GlyphApplyResult, GlyphVariant
-from models import Document, FlowerAsset, FontAsset, ImageLayer, TextLayer, add_image_layer, add_text_layer
+from models import Document, FlowerAsset, FontAsset, ImageLayer, ParseResult, TextLayer, add_image_layer, add_text_layer
 import ui_app as ui_app_module
 from ui_app import (
     APP_COLORS,
     BirthFlowerApp,
+    ENTRY_ROLE_META,
     IMPORTABLE_ASSET_SUFFIXES,
     IMPORTABLE_FONT_SUFFIXES,
+    VIEW_ADMIN,
+    VIEW_OPERATOR,
+    VIEW_OPERATOR_CONFIG,
+    view_cards_for_role,
+    order_row_view,
+    mark_status_style,
+    ai_status_style,
+    shop_status_style,
+    _short_dt,
+    _blend_hex,
     _preview_text_ink_image,
     _ttf_family_name,
     build_ai_profile_from_settings,
     build_ai_parse_config,
     build_design_from_values,
     build_readiness_parse_result_from_values,
+    collect_importable_files,
+    _paths_equal,
     dxf_path_for_svg,
     format_font_asset_label,
     format_glyph_detail,
@@ -42,6 +55,178 @@ class FakeRoot:
 
     def after(self, delay, callback):
         self.callbacks.append((delay, callback))
+
+
+def test_view_cards_for_role_splits_three_ends():
+    # 三端↔卡片映射的回归护栏：提示词类卡片(②/字段/背景)只在管理员端；生成/图层只在操作员端；
+    # 资源库只在配置端；订单信息/解析结果(①③)在操作员与管理员两端共用。
+    # 2026-06-19 改：配置端不编辑、只监控调度+订单，故中心区换成订单表，不再挂「画布/图层」(production)。
+    operator = view_cards_for_role(VIEW_OPERATOR)
+    admin = view_cards_for_role(VIEW_ADMIN)
+    config = view_cards_for_role(VIEW_OPERATOR_CONFIG)
+
+    assert operator == ["order", "result", "production", "output"]
+    assert admin == ["order", "result", "production", "fields", "background", "prompt_obs", "output"]
+    assert config == ["fetch", "library"]
+    # 红线：②提示词全文/字段规则/背景词不进操作员端（IP 归管理员端）。
+    for ip_card in ("prompt_obs", "fields", "background"):
+        assert ip_card not in operator
+    # 「画布/图层」(production) 只对操作员/管理员两端开放；配置端无画板（中心区是订单表）。
+    assert "production" in operator and "production" in admin
+    assert "production" not in config
+    # 输出（输出设置+生成）在操作员、管理员两端都有；配置端不放输出。资源库只在配置端。
+    assert "output" in operator and "output" in admin and "output" not in config
+    assert "library" not in operator and "library" not in admin
+    # 「抓取订单」面板只在操作员配置端。
+    assert "fetch" in config and "fetch" not in operator and "fetch" not in admin
+    # 未知端回退操作员端，绝不空。
+    assert view_cards_for_role("bogus") == operator
+
+
+def test_short_dt_compacts_iso_and_handles_empty():
+    assert _short_dt("2026-06-19T02:25:00+00:00") == "06-19 02:25"
+    assert _short_dt("2026-06-19T02:25") == "06-19 02:25"
+    assert _short_dt(None) == "—"
+    assert _short_dt("") == "—"
+
+
+def test_shop_status_style_classifies_by_keyword():
+    # 状态列=店小秘订单状态原文，按退款拦截口径上色。
+    assert shop_status_style("已退款")[0] == "已退款" and shop_status_style("已退款")[1] == "#3d2422"  # 退款=红
+    assert shop_status_style("取消不发货")[1] == "#3d2422"  # 取消=红
+    assert shop_status_style("风控中")[1] == "#3d3220"  # 风控=黄
+    assert shop_status_style("已审核")[1] == "#1f3d2c"  # 正常=绿
+    assert shop_status_style("已发货")[1] == "#1f3d2c"
+    assert shop_status_style("已忽略")[1] == "#2c3036"  # 忽略=灰
+    assert shop_status_style("")[0] == "未抓取" and shop_status_style("")[1] == "#2c3036"  # 未抓到=灰
+
+
+def test_order_row_view_status_is_shop_status_not_internal():
+    # 状态列=店小秘订单状态(refund_status)；内部 status 只进 internal_label，不当主状态。
+    order = {
+        "order_id": "DX001",
+        "status": "CANNOT_AUTOGEN",      # 内部状态
+        "refund_status": "已审核",        # 店小秘状态
+        "paid_at": "2026-06-19T02:31:00+00:00",
+        "received_at": "2026-06-19T02:40:00+00:00",
+        "items": [
+            {"quantity": 2, "is_target_box": True},
+            {"quantity": 1, "is_target_box": True},
+            {"quantity": 5, "is_target_box": False},  # 其他商品
+        ],
+    }
+    row = order_row_view(order)
+    assert row["order_id"] == "DX001"
+    assert row["status_label"] == "已审核"     # 主状态=店小秘状态，不是内部的"人工审核"
+    assert row["status_bg"] == "#1f3d2c"       # 已审核=绿
+    assert row["shop_status"] == "已审核"
+    assert row["internal_label"] == "人工审核"  # 内部 CANNOT_AUTOGEN → 详情用
+    assert row["quantity"] == 8  # 2+1+5
+    assert row["has_other_products"] is True
+    assert row["paid_at"] == "06-19 02:31"  # 用 paid_at 而非 received_at
+    assert "refund" not in row  # 不再有独立"退款"字段/列
+
+
+def test_order_row_view_refunded_shop_status_and_empty_items():
+    # items 空（扩展只抓列表页）→ 件数 0（UI 显 —）；店小秘已退款→红；内部未知状态原样进 internal_label。
+    order = {
+        "order_id": "DX002",
+        "status": "WEIRD_STATE",
+        "refund_status": "已退款",
+        "received_at": "2026-06-19T03:00:00+00:00",
+        "items": [],
+    }
+    row = order_row_view(order)
+    assert row["quantity"] == 0
+    assert row["has_other_products"] is False
+    assert row["status_label"] == "已退款"
+    assert row["status_bg"] == "#3d2422"        # 退款=红（生产拦截信号）
+    assert row["internal_label"] == "WEIRD_STATE"  # 未知内部状态原样
+    assert row["paid_at"] == "06-19 03:00"  # 无 paid_at → 回退 received_at
+
+
+def test_format_scrape_status_reflects_connection_and_switch():
+    # 抓取面板状态文案：服务连接 + 自动抓开关态 + 授权态（任务租约）+ 订单范围 + 当前单。
+    base = "http://127.0.0.1:8770"
+    on = BirthFlowerApp._format_scrape_status(
+        True, base,
+        {"enabled": True, "authorized": True, "interval_seconds": 300, "scrape_from": "2026-06-19 02:25"},
+        "4090627965",
+    )
+    assert "已连接" in on and base in on and "自动抓：开" in on and "300s" in on
+    assert "授权 是" in on and "2026-06-19 02:25" in on and "4090627965" in on
+    # 开关「开」但授权「否」（任务过期/未心跳，如 flower 异常退出残留）→ 文案提示授权 否。
+    stale = BirthFlowerApp._format_scrape_status(
+        True, base, {"enabled": True, "authorized": False, "interval_seconds": 300, "scrape_from": None}, None
+    )
+    assert "自动抓：开" in stale and "授权 否" in stale
+    off = BirthFlowerApp._format_scrape_status(
+        True, base, {"enabled": False, "authorized": False, "interval_seconds": 60, "scrape_from": None}, None
+    )
+    assert "自动抓：关" in off and "授权 否" in off and "当前单：—" in off
+    # 服务未连接：提示未连接 + 地址，不读开关。
+    down = BirthFlowerApp._format_scrape_status(False, base, None, None)
+    assert "未连接" in down and base in down
+
+
+def test_scrape_switch_state_maps_connection_to_clickable_and_checked():
+    # 自动抓实时开关：未探活/未连接/状态未知 → 不可点且不勾；已知 → 勾选=enabled、可点。
+    assert BirthFlowerApp._scrape_switch_state(False, False, None) == (False, False)  # 未探活
+    assert BirthFlowerApp._scrape_switch_state(True, False, None) == (False, False)  # 已探活但未连接
+    assert BirthFlowerApp._scrape_switch_state(True, True, None) == (False, False)   # 连上但开关态未知
+    assert BirthFlowerApp._scrape_switch_state(True, True, {"enabled": True}) == (True, True)
+    assert BirthFlowerApp._scrape_switch_state(True, True, {"enabled": False}) == (False, True)
+
+
+def _make_order(order_id, *, refund="已审核", qty=1):
+    return {
+        "order_id": order_id, "refund_status": refund, "paid_at": "2026-06-20 01:00",
+        "items": [{"quantity": qty, "is_target_box": True}], "mark_jobs": None,
+    }
+
+
+def test_orders_table_renders_incrementally_and_deletes_one_row_locally():
+    # 阶段三护栏：Treeview 增量渲染（iid=order_id）——删消失行、建新增行、存活行原位更新值；本地删行只删那一行。
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+    try:
+        app = BirthFlowerApp(root)
+        app._render_orders_rows([_make_order("A"), _make_order("B"), _make_order("C")])
+        assert set(app.orders_tree.get_children("")) == {"A", "B", "C"}
+        assert set(app._orders_data) == {"A", "B", "C"}
+        # 再渲染：去掉 B、改 A 的店小秘状态 → A/C 复用(iid 还在)、B 删除、A 状态原位更新。
+        app._render_orders_rows([_make_order("A", refund="已退款"), _make_order("C")])
+        assert set(app.orders_tree.get_children("")) == {"A", "C"}
+        assert not app.orders_tree.exists("B")                      # 消失行已删
+        assert shop_status_style("已退款")[0] in app.orders_tree.item("A", "values")  # 值原位更新
+        assert app.orders_tree.item("A", "tags") == ("refund",)    # 退款 → 整行红 tag
+        # 本地删行：删 A → 只剩 C，不触网/不整表重拉。
+        app._remove_order_row_local("A")
+        assert set(app.orders_tree.get_children("")) == {"C"}
+        assert "A" not in app._orders_data
+    finally:
+        root.destroy()
+
+
+def test_format_parse_result_renders_structured_summary():
+    result = ParseResult(
+        text="Amy", month=12, font=4, flower=2, flower_name="Narcissus",
+        order_number="4090627965", quantity=2, confidence=0.97,
+    )
+    summary = BirthFlowerApp._format_parse_result(result, 0, 3)
+    assert "第 1/3 单" in summary          # 多单时带序号
+    assert "4090627965" in summary
+    assert "Amy" in summary
+    assert "Narcissus" in summary          # 花名随花号一起显示
+    assert "0.97" in summary
+    # 异常/缺失：警告以 ⚠ 前缀显示；None 结果不炸。
+    warned = BirthFlowerApp._format_parse_result(
+        ParseResult(text="", warnings=["件数与定制数不一致"]), 0, 1
+    )
+    assert "⚠" in warned and "件数与定制数不一致" in warned
+    assert BirthFlowerApp._format_parse_result(None, 0, 0) == "（未识别到订单）"
 
 
 def test_build_design_from_manual_values_accepts_user_edits():
@@ -67,11 +252,12 @@ def test_sanitize_filename_stem_strips_illegal_and_trailing():
     assert sanitize_filename_stem("nul") == "_nul"
 
 
-def _fake_filename_app(typed="", order_no="", inbox=None):
-    """只喂 _resolve_output_basename 用到的三个属性，免去构建整套 UI（headless 易碎）。"""
+def _fake_filename_app(typed="", order_no="", db_order=None, inbox=None):
+    """只喂 _resolve_output_basename 用到的属性，免去构建整套 UI（headless 易碎）。"""
     return SimpleNamespace(
         filename_template_var=SimpleNamespace(get=lambda: typed),
         current_order_number=order_no,
+        _db_order_active_id=db_order,
         _inbox_active=inbox,
     )
 
@@ -84,10 +270,49 @@ def test_resolve_output_basename_priority():
     assert resolve(_fake_filename_app(typed="a/b:c"), base) == "abc"
     # 2) 框留空 → 解析到的订单号优先。
     assert resolve(_fake_filename_app(order_no="29972194015"), base) == "29972194015"
-    # 3) 框空且无解析订单号 → 回退 inbox 收件夹 JSON 文件名 stem。
+    # 3) 框空且无解析订单号 → 回退库驱动载单的订单号。
+    assert resolve(_fake_filename_app(db_order="4091090394"), base) == "4091090394"
+    # 4) 再回退 inbox 收件夹 JSON 文件名 stem。
     assert resolve(_fake_filename_app(inbox=Path("inbox/2997.json")), base) == "2997"
-    # 4) 全空 → 回退「输出目录」原文件名（旧行为），名字永不为空。
+    # 5) 全空 → 回退「输出目录」原文件名（旧行为），名字永不为空。
     assert resolve(_fake_filename_app(), base) == "原始名"
+
+
+def _fake_db_load_app(*, autoparse: bool):
+    """喂 _load_db_order 用到的最小桩：捕获 remark/文件名/状态/订单号 + 记录是否触发解析。"""
+    captured: dict = {"parse_called": False, "warnings_cleared": False}
+    fake = SimpleNamespace(
+        current_order_number="",
+        _db_order_active_id=None,
+        filename_template_var=SimpleNamespace(set=lambda v: captured.update(filename=v)),
+        status_var=SimpleNamespace(set=lambda v: captured.update(status=v)),
+        config=SimpleNamespace(inbox_autoparse=autoparse),
+        _set_remark_text=lambda v: captured.update(remark=v),
+        _set_warnings=lambda v: captured.update(warnings_cleared=(v == [])),
+        _refresh_fetch_status=lambda: captured.update(fetch_refreshed=True),
+        parse_remark=lambda: captured.update(parse_called=True),
+    )
+    return fake, captured
+
+
+def test_load_db_order_populates_box_filename_and_active_id():
+    # 库订单 dict → 订单信息框首行=订单号、其后接备注；文件名框=订单号；记当前订单号 + 队首守卫 id。
+    fake, captured = _fake_db_load_app(autoparse=False)
+    order = {"order_id": "4091090394", "remark": "Jun - Rose / Patty", "items": []}
+    BirthFlowerApp._load_db_order(fake, order)
+    assert captured["remark"] == "4091090394\nJun - Rose / Patty"
+    assert captured["filename"] == "4091090394"
+    assert fake.current_order_number == "4091090394"
+    assert fake._db_order_active_id == "4091090394"
+    assert captured["warnings_cleared"] is True
+    assert captured["parse_called"] is False  # 自动识别关 → 只载入不解析
+
+
+def test_load_db_order_autoparses_when_enabled():
+    fake, captured = _fake_db_load_app(autoparse=True)
+    BirthFlowerApp._load_db_order(fake, {"order_id": "X1", "remark": "", "items": [{"personalization_raw": "Amy"}]})
+    assert captured["remark"] == "X1\nAmy"  # 空 remark 回退 items[].personalization_raw
+    assert captured["parse_called"] is True  # 自动识别开 → 载入即解析（绝不自动生成）
 
 
 def test_build_design_from_manual_values_accepts_extended_asset_and_font_indexes_when_paths_exist():
@@ -694,6 +919,118 @@ def test_import_flower_file_selects_asset_and_flower(monkeypatch, tmp_path):
         root.destroy()
 
 
+def test_collect_importable_files_single_file_by_suffix(tmp_path):
+    good = tmp_path / "rose.svg"
+    bad = tmp_path / "notes.txt"
+    good.write_text("<svg/>", encoding="utf-8")
+    bad.write_text("x", encoding="utf-8")
+    assert collect_importable_files(good, IMPORTABLE_ASSET_SUFFIXES) == ([good], [])
+    assert collect_importable_files(bad, IMPORTABLE_ASSET_SUFFIXES) == ([], [bad])
+
+
+def test_collect_importable_files_folder_splits_and_is_case_insensitive(tmp_path):
+    svg = tmp_path / "rose.svg"
+    png = tmp_path / "tulip.PNG"  # 大写后缀也应识别
+    txt = tmp_path / "notes.txt"  # 不支持 → 跳过
+    for path in (svg, png, txt):
+        path.write_text("x", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    deep = sub / "deep.svg"
+    deep.write_text("<svg/>", encoding="utf-8")
+
+    valid, skipped = collect_importable_files(tmp_path, IMPORTABLE_ASSET_SUFFIXES)
+    assert valid == [svg, png]  # 排序稳定、非递归忽略子目录
+    assert skipped == [txt]
+
+    valid_recursive, _ = collect_importable_files(tmp_path, IMPORTABLE_ASSET_SUFFIXES, recursive=True)
+    assert deep in valid_recursive
+
+
+def test_collect_importable_files_missing_path_is_empty(tmp_path):
+    assert collect_importable_files(tmp_path / "nope", IMPORTABLE_ASSET_SUFFIXES) == ([], [])
+
+
+def test_add_library_folder_imports_image_folder_and_accumulates(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        monkeypatch.setattr(ui_app_module, "save_config", lambda *_a, **_k: None)
+        folder = tmp_path / "lib_a"
+        folder.mkdir()
+        (folder / "rose.svg").write_text("<svg/>", encoding="utf-8")
+        (folder / "tulip.png").write_bytes(b"\x89PNG\r\n")
+        (folder / "notes.txt").write_text("skip me", encoding="utf-8")  # 不支持 → 不中断
+
+        summary = app._add_library_folder("image", folder)
+
+        assert summary["imported"] >= 1  # 文件夹内支持的素材批量并入
+        assert summary["skipped"] == 1  # 不支持文件被跳过、流程未中断
+        assert summary["already"] is False
+        assert any(_paths_equal(folder, d) for d in active_product(app.config).image_library_dirs)
+
+        # 再次导入同一文件夹 = 按路径去重，不重复添加，也不报错
+        dirs_before = list(active_product(app.config).image_library_dirs)
+        summary_again = app._add_library_folder("image", folder)
+        assert summary_again["already"] is True
+        assert list(active_product(app.config).image_library_dirs) == dirs_before
+    finally:
+        root.destroy()
+
+
+def test_add_library_folder_imports_font_folder_and_skips_unsupported(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        monkeypatch.setattr(ui_app_module, "save_config", lambda *_a, **_k: None)
+        folder = tmp_path / "fonts"
+        folder.mkdir()
+        (folder / "Custom.ttf").write_bytes(b"\x00\x01\x00\x00fake-font")
+        (folder / "readme.txt").write_text("skip", encoding="utf-8")
+
+        summary = app._add_library_folder("font", folder)
+
+        assert summary["imported"] >= 1
+        assert summary["skipped"] == 1
+        assert any(_paths_equal(folder, d) for d in active_product(app.config).font_library_dirs)
+        assert any(asset.path.name == "Custom.ttf" for asset in app.font_assets)
+    finally:
+        root.destroy()
+
+
+def test_add_library_folder_warns_and_keeps_config_when_no_supported_files(monkeypatch, tmp_path):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display is not available")
+
+    try:
+        app = BirthFlowerApp(root)
+        monkeypatch.setattr(ui_app_module, "save_config", lambda *_a, **_k: None)
+        warnings: list = []
+        monkeypatch.setattr(ui_app_module.messagebox, "showwarning", lambda *a, **k: warnings.append(a))
+        folder = tmp_path / "empty_lib"
+        folder.mkdir()
+        (folder / "readme.txt").write_text("no assets here", encoding="utf-8")
+        dirs_before = list(active_product(app.config).image_library_dirs)
+
+        summary = app._add_library_folder("image", folder)
+
+        assert summary["imported"] == 0
+        assert warnings  # 给了提示
+        assert list(active_product(app.config).image_library_dirs) == dirs_before  # 配置未被改动
+    finally:
+        root.destroy()
+
+
 def test_confirm_rejects_bitmap_flower_when_dxf_is_selected(monkeypatch, tmp_path):
     try:
         root = tk.Tk()
@@ -1236,10 +1573,11 @@ def test_parse_remark_reads_current_text_widget_content(monkeypatch):
         calls = []
         received_bundle = []
 
-        def fake_parser(remark, ai_config=None, bundle=None):
+        def fake_parser(remark, ai_config=None, bundle=None, trace=None):
             calls.append(remark)
             received_bundle.append(bundle)
             # 多订单接口返回列表；单笔时 _apply_parsed_orders 载入第一笔。
+            # trace=空壳 ParsePromptTrace（解析可观测②）：真实解析路径会填它，fake 无需填。
             return [SimpleNamespace(text="Lacey", month=9, font=3, flower=1, warnings=[])]
 
         def run_immediately(_root, work, on_success, on_error):
@@ -2007,3 +2345,207 @@ def test_resize_text_box_to_font_unbounded_overflows_safe_area_while_clamped_cap
     clamped = BirthFlowerApp._resize_text_box_to_font(app, capped, clamp_to_safe_area=True)
     assert clamped is True
     assert capped.text_box_width <= safe_w + 1  # 封顶到安全区
+
+
+# ── 生成成功后入队「AI已处理」标记回写（_enqueue_mark_done_after_generate）──
+
+
+def _mark_world(monkeypatch):
+    """patch run_background 同步执行 + 捕获 inbox_client.request_mark 调用。返回捕获 dict。"""
+    captured: dict = {}
+    monkeypatch.setattr(ui_app_module, "run_background", lambda root, work, done, err: done(work()))
+
+    def fake_request_mark(url, *, order_id, action):
+        captured.update(url=url, order_id=order_id, action=action)
+        return {"order_id": order_id, "action": action, "status": "pending"}
+
+    monkeypatch.setattr(ui_app_module.inbox_client, "request_mark", fake_request_mark)
+    return captured
+
+
+def test_enqueue_mark_done_uses_current_order_number(monkeypatch):
+    captured = _mark_world(monkeypatch)
+    fake = SimpleNamespace(
+        current_order_number="4090000003",
+        _inbox_active=None,
+        _inbox_service_url="http://h:8770",
+        root=None,
+        warning_var=SimpleNamespace(set=lambda *_: None),
+    )
+    BirthFlowerApp._enqueue_mark_done_after_generate(fake)
+    assert captured == {"url": "http://h:8770", "order_id": "4090000003", "action": "mark_done"}
+
+
+def test_enqueue_mark_done_falls_back_to_inbox_filename(monkeypatch):
+    captured = _mark_world(monkeypatch)
+    fake = SimpleNamespace(
+        current_order_number="",
+        _db_order_active_id=None,
+        _inbox_active=Path(r"C:\x\outputs\inbox\4090000099.json"),
+        _inbox_service_url="http://h:8770",
+        root=None,
+        warning_var=SimpleNamespace(set=lambda *_: None),
+    )
+    BirthFlowerApp._enqueue_mark_done_after_generate(fake)
+    assert captured["order_id"] == "4090000099"
+    assert captured["action"] == "mark_done"
+
+
+def test_enqueue_mark_done_skips_when_no_order_id(monkeypatch):
+    captured = _mark_world(monkeypatch)
+    fake = SimpleNamespace(
+        current_order_number="",
+        _db_order_active_id=None,
+        _inbox_active=None,
+        _inbox_service_url="http://h:8770",
+        root=None,
+        warning_var=SimpleNamespace(set=lambda *_: None),
+    )
+    BirthFlowerApp._enqueue_mark_done_after_generate(fake)
+    assert captured == {}  # 没有订单号 → 不入队
+
+
+# ── 配置端「标签」列：mark_status_style + order_row_view 标记派生 ──
+
+
+def test_mark_status_style_prefers_done():
+    assert mark_status_style([{"action": "mark_done", "status": "done"}])[0] == "AI已处理 ✓"
+    # done 优先于 unrecognized：生成后 mark_done 待写 + 未识别已写 → 显已处理·待写
+    assert mark_status_style(
+        [{"action": "mark_done", "status": "pending"}, {"action": "mark_unrecognized", "status": "done"}]
+    )[0] == "AI已处理·待写"
+    assert mark_status_style([{"action": "mark_done", "status": "failed"}])[0] == "AI已处理·失败"
+
+
+def test_mark_status_style_unrecognized_and_empty():
+    assert mark_status_style([{"action": "mark_unrecognized", "status": "done"}])[0] == "AI未识别"
+    assert mark_status_style([{"action": "mark_unrecognized", "status": "pending"}])[0] == "AI未识别·待写"
+    assert mark_status_style([])[0] == "—"
+    assert mark_status_style(None)[0] == "—"
+
+
+def test_order_row_view_includes_mark_label():
+    view = order_row_view(
+        {"order_id": "4090000001", "mark_jobs": [{"action": "mark_unrecognized", "status": "pending"}]}
+    )
+    assert view["mark_label"] == "AI未识别·待写"
+    # 无 mark_jobs + 默认 pending → 用 AI 权威态兜底显示「待识别」（不再退化成「—」）
+    assert order_row_view({"order_id": "X"})["mark_label"] == "待识别"
+
+
+def test_order_row_view_recognized_without_mark_jobs_shows_done():
+    """recognized 且无打标历史（mark_jobs 空）→ 用权威态兜底显示「AI已处理」，不退化成「—」。"""
+    assert order_row_view({"order_id": "X", "ai_status": "recognized"})["mark_label"] == "AI已处理"
+    # recognized 有 mark_done 历史 → 保留写状态细节
+    view = order_row_view(
+        {"order_id": "Y", "ai_status": "recognized", "mark_jobs": [{"action": "mark_done", "status": "done"}]}
+    )
+    assert view["mark_label"] == "AI已处理 ✓"
+
+
+# ── AI 识别状态对账：ai_status_style + order_row_view 消费 ai_status / 复核筛选标记 ──
+
+
+def test_ai_status_style_conflict_and_locked():
+    assert ai_status_style("conflict")[0] == "复核"
+    assert ai_status_style("locked")[0] == "人工锁定"
+    # pending/recognized/None → 不醒目，回退 mark_status_style（返回 None）
+    assert ai_status_style("pending") is None
+    assert ai_status_style("recognized") is None
+    assert ai_status_style(None) is None
+
+
+def test_order_row_view_conflict_overrides_mark_label_and_flags_review():
+    """复核态：标签列显示「复核」并覆盖 mark 写状态；needs_review=True 驱动筛选/着色。"""
+    view = order_row_view(
+        {
+            "order_id": "4100000002",
+            "ai_status": "conflict",
+            "mark_jobs": [{"action": "mark_unrecognized", "status": "pending"}],
+        }
+    )
+    assert view["mark_label"] == "复核"
+    assert view["needs_review"] is True
+    assert view["ai_status"] == "conflict"
+
+
+def test_order_row_view_non_conflict_keeps_mark_writeback_label():
+    """recognized/pending：仍显示 mark 写状态细节，needs_review=False（不进复核筛选）。"""
+    view = order_row_view(
+        {
+            "order_id": "4100000003",
+            "ai_status": "recognized",
+            "mark_jobs": [{"action": "mark_done", "status": "done"}],
+        }
+    )
+    assert view["mark_label"] == "AI已处理 ✓"
+    assert view["needs_review"] is False
+    # 缺省 ai_status（旧订单 dict）→ pending，不进复核
+    assert order_row_view({"order_id": "X"})["needs_review"] is False
+    assert order_row_view({"order_id": "X"})["ai_status"] == "pending"
+
+
+# ── 选端页（门厅）：预混配色 / 角色元数据 / 管理员密码门 gating ──
+
+
+def test_blend_hex_flattens_over_opaque_bg():
+    assert _blend_hex("#ffffff", "#000000", 0.5) == "#808080"
+    assert _blend_hex("#2fd4a8", "#101218", 0.0) == "#101218"  # alpha 0 = 纯底色
+    assert _blend_hex("#2fd4a8", "#101218", 1.0) == "#2fd4a8"  # alpha 1 = 纯前景
+
+
+def test_entry_role_meta_covers_three_ends():
+    assert set(ENTRY_ROLE_META) == {VIEW_OPERATOR, VIEW_OPERATOR_CONFIG, VIEW_ADMIN}
+    for icon, accent, title, desc in ENTRY_ROLE_META.values():
+        assert icon and accent.startswith("#") and title and desc
+
+
+def test_admin_gate_success_from_switch_uses_apply_view():
+    calls = []
+    fake = SimpleNamespace(
+        _admin_authed=False,
+        _view_overlay=None,  # 无遮罩（从顶部切端触发）
+        _apply_view=lambda role: calls.append(("apply", role)),
+        _enter_view=lambda role: calls.append(("enter", role)),
+    )
+    BirthFlowerApp._admin_gate_success(fake)
+    assert fake._admin_authed is True
+    assert calls == [("apply", VIEW_ADMIN)]
+
+
+def test_admin_gate_success_from_overlay_uses_enter_view():
+    calls = []
+    fake = SimpleNamespace(
+        _admin_authed=False,
+        _view_overlay=object(),  # 有遮罩（从门厅触发）→ 连遮罩一起关
+        _apply_view=lambda role: calls.append(("apply", role)),
+        _enter_view=lambda role: calls.append(("enter", role)),
+    )
+    BirthFlowerApp._admin_gate_success(fake)
+    assert calls == [("enter", VIEW_ADMIN)]
+
+
+def _switch_view_fake(authed: bool):
+    calls = []
+    fake = SimpleNamespace(
+        _admin_authed=authed,
+        active_view=VIEW_OPERATOR,
+        active_view_var=SimpleNamespace(set=lambda v: calls.append(("set", v))),
+        _enter_admin_view=lambda: calls.append(("gate",)),
+        _apply_view=lambda role: calls.append(("apply", role)),
+    )
+    return fake, calls
+
+
+def test_switch_to_admin_unauthed_always_gates_even_without_password():
+    # 回归护栏：未鉴权切管理员端必须过门（_enter_admin_view），即使尚未设密码也不得直进——堵下拉鉴权绕过。
+    fake, calls = _switch_view_fake(authed=False)
+    BirthFlowerApp._on_switch_view(fake, ui_app_module.VIEW_LABELS[VIEW_ADMIN])
+    assert ("gate",) in calls
+    assert all(c[0] != "apply" for c in calls)  # 绝不直接 _apply_view 进管理员端
+
+
+def test_switch_to_admin_after_authed_applies_directly():
+    fake, calls = _switch_view_fake(authed=True)
+    BirthFlowerApp._on_switch_view(fake, ui_app_module.VIEW_LABELS[VIEW_ADMIN])
+    assert calls == [("apply", VIEW_ADMIN)]  # 本次已鉴权 → 自由切，不再问

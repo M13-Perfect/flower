@@ -32,7 +32,8 @@ from production import ProductionParams
 logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "library.json"
-IMAGE_EXTENSIONS = {".svg", ".png", ".jpg", ".jpeg", ".webp"}
+# 与 ui_app.IMPORTABLE_ASSET_SUFFIXES 对齐：位图素材（含 .bmp）也算素材，文件夹零配置扫描时一并收。
+IMAGE_EXTENSIONS = {".svg", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
 @dataclass(frozen=True)

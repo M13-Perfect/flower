@@ -1,0 +1,17 @@
+{
+  "material_root": "请改为本店素材目录，例如 D:\\素材",
+  "active_profile": "EZCAD",
+  "always_on_top": true,
+  "auto_center": false,
+  "inbox_base_url": "http://127.0.0.1:8770",
+  "refund_check_enabled": false,
+  "profiles": [
+    {
+      "name": "EZCAD",
+      "exe_path": "请改为本机 EzCad2.exe 的完整路径，例如 C:\\EzCad2.7.6\\EzCad2.exe",
+      "vector_hotkey": "ctrl+b",
+      "bitmap_hotkey": "ctrl+w"
+    }
+  ],
+  "rules": []
+}

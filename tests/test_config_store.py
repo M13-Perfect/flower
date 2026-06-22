@@ -7,12 +7,52 @@ from config_store import (
     AppConfig,
     active_ai_profile,
     active_product,
+    has_admin_password,
+    hash_password,
     load_config,
     normalize_output_formats,
     normalize_output_path,
     save_config,
+    verify_admin_password,
+    verify_password,
+    with_admin_password,
     with_product_prompts,
 )
+
+
+def test_hash_and_verify_password_round_trip():
+    stored = hash_password("s3cret", salt=b"0123456789abcdef")
+    assert stored.startswith("pbkdf2_sha256$")
+    assert verify_password(stored, "s3cret") is True
+    assert verify_password(stored, "wrong") is False
+    # 同密码不同盐 → 不同哈希串，但都能各自校验通过（盐随机）。
+    assert hash_password("s3cret") != hash_password("s3cret")
+
+
+def test_verify_password_rejects_empty_and_malformed():
+    assert verify_password("", "anything") is False
+    assert verify_password("not-a-valid-format", "x") is False
+    assert verify_password("pbkdf2_sha256$abc$zz$zz", "x") is False
+
+
+def test_with_admin_password_sets_verifies_and_clears():
+    cfg = AppConfig()
+    assert has_admin_password(cfg) is False
+    cfg2 = with_admin_password(cfg, "1234")
+    assert has_admin_password(cfg2) is True
+    assert verify_admin_password(cfg2, "1234") is True
+    assert verify_admin_password(cfg2, "0000") is False
+    # 空密码 = 清除，回到未设态。
+    assert has_admin_password(with_admin_password(cfg2, "")) is False
+
+
+def test_admin_password_hash_persists_round_trip(tmp_path):
+    path = tmp_path / "config.json"
+    cfg = with_admin_password(AppConfig(), "pw12")
+    save_config(cfg, path)
+    loaded = load_config(path)
+    assert loaded.admin_password_hash == cfg.admin_password_hash
+    assert verify_admin_password(loaded, "pw12") is True
 
 
 def test_save_and_load_config_round_trip(tmp_path):
@@ -181,7 +221,7 @@ def test_with_product_prompts_allows_empty_and_isolates_other_products(tmp_path)
 
 
 def test_save_and_load_config_keeps_inbox_settings(tmp_path):
-    """收件夹路径与自动解析开关随配置往返持久化（automation 一期）。"""
+    """收件夹路径随配置往返持久化（automation 一期）。"""
     path = tmp_path / "config.json"
     config = AppConfig(inbox_folder=tmp_path / "inbox", inbox_autoparse=False)
 
@@ -193,8 +233,62 @@ def test_save_and_load_config_keeps_inbox_settings(tmp_path):
 
 
 def test_load_config_defaults_inbox_off(tmp_path):
-    """旧配置无 inbox 键：收件夹为空（功能关），自动解析默认开。"""
+    """旧配置无 inbox 键：收件夹为空（功能关），自动识别默认【关】（安全优先，须用户在 GUI 显式开）。"""
     config = load_config(tmp_path / "missing.json")
 
     assert str(config.inbox_folder) in ("", ".")
-    assert config.inbox_autoparse is True
+    assert config.inbox_autoparse is False
+    assert config.inbox_autoparse_user_set is False
+
+
+def test_load_config_legacy_autoparse_true_without_user_flag_falls_back_off(tmp_path):
+    """安全迁移：旧配置遗留 inbox_autoparse=True 但无 user_set 标记 → 强制回落 False（未经用户明确同意不自动解析）。"""
+    path = tmp_path / "config.json"
+    path.write_text('{"inbox_autoparse": true}', encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.inbox_autoparse is False
+    assert config.inbox_autoparse_user_set is False
+
+
+def test_load_config_honors_explicit_user_autoparse_on(tmp_path):
+    """用户经新版 GUI 显式开启（user_set=True + autoparse=True）→ 采信存储值，往返保持 True。"""
+    path = tmp_path / "config.json"
+    config = AppConfig(inbox_autoparse=True, inbox_autoparse_user_set=True)
+
+    save_config(config, path)
+    loaded = load_config(path)
+
+    assert loaded.inbox_autoparse is True
+    assert loaded.inbox_autoparse_user_set is True
+
+
+def test_load_config_honors_explicit_user_autoparse_off(tmp_path):
+    """用户显式关闭（user_set=True + autoparse=False）→ 采信存储 False，往返保持关。"""
+    path = tmp_path / "config.json"
+    config = AppConfig(inbox_autoparse=False, inbox_autoparse_user_set=True)
+
+    save_config(config, path)
+    loaded = load_config(path)
+
+    assert loaded.inbox_autoparse is False
+    assert loaded.inbox_autoparse_user_set is True
+
+
+def test_save_and_load_config_keeps_inbox_service_url(tmp_path):
+    """抓取面板「服务地址」随配置往返持久化（2026-06-19 缺口修复，重启不丢）。"""
+    path = tmp_path / "config.json"
+    config = AppConfig(inbox_service_url="http://127.0.0.1:8888")
+
+    save_config(config, path)
+    loaded = load_config(path)
+
+    assert loaded.inbox_service_url == "http://127.0.0.1:8888"
+
+
+def test_load_config_defaults_inbox_service_url_empty(tmp_path):
+    """旧配置无该键：服务地址为空串（由客户端回落默认 127.0.0.1:8770）。"""
+    config = load_config(tmp_path / "missing.json")
+
+    assert config.inbox_service_url == ""

@@ -17,7 +17,11 @@ BATCH_HEADERS = ["订单号", "备注"]
 
 
 def _pending_orders(session: Session) -> list[Order]:
-    stmt = select(Order).where(Order.status.in_(EXPORTABLE_STATUSES)).order_by(Order.received_at.asc())
+    stmt = (
+        select(Order)
+        .where(Order.status.in_(EXPORTABLE_STATUSES), Order.deleted.is_(False))  # 软删单不导出生产
+        .order_by(Order.received_at.asc())
+    )
     return list(session.scalars(stmt))
 
 
@@ -36,7 +40,12 @@ def export_pool_to_xlsx(
         batches_dir = Path(batches_dir)
         batches_dir.mkdir(parents=True, exist_ok=True)
         stamp = now.strftime("%Y%m%d-%H%M%S")
+        # 不覆盖（D3 生产重试）：时间戳已基本唯一；同秒再导出时追加 -vN 防覆盖。
         path = batches_dir / f"pooled-{stamp}-{len(orders)}.xlsx"
+        version = 2
+        while path.exists():
+            path = batches_dir / f"pooled-{stamp}-{len(orders)}-v{version}.xlsx"
+            version += 1
         workbook = Workbook()
         sheet = workbook.active
         sheet.append(BATCH_HEADERS)
