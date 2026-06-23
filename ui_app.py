@@ -51,15 +51,17 @@ from prompt_references import (
     PromptReferenceError,
     ReferenceConflictError,
     ReferenceField,
+    SYSTEM_SOURCE_LABELS,
     active_reference_fields,
     create_reference_field,
     default_prompt_template,
     field_token,
     find_template_references,
+    iter_template_segments,
     reference_fields_from_legacy,
-    render_template_view,
     resolve_prompt_template,
     set_reference_field_enabled,
+    slash_query_at_cursor,
     soft_delete_reference_field,
     system_token,
     update_reference_field_prompt,
@@ -2817,13 +2819,18 @@ class BirthFlowerApp:
         status_row = ctk.CTkFrame(body, fg_color="transparent")
         status_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         status_row.columnconfigure(1, weight=1)
-        ctk.CTkLabel(
+        self._size_status_row = status_row
+        self._size_edit_frame = None  # 内联编辑画布尺寸时复用；None=未在编辑
+        self.preview_size_label = ctk.CTkLabel(
             status_row,
             textvariable=self.preview_canvas_size_var,
             anchor="w",
             text_color=APP_COLORS["muted"],
             font=ctk.CTkFont(size=11),
-        ).grid(row=0, column=0, sticky="w")
+            cursor="hand2",  # 提示这行可点击编辑
+        )
+        self.preview_size_label.grid(row=0, column=0, sticky="w")
+        self.preview_size_label.bind("<Button-1>", lambda _e: self._begin_canvas_size_edit())
         ctk.CTkLabel(
             status_row,
             text=" | ",
@@ -3497,9 +3504,10 @@ class BirthFlowerApp:
         field["result_var"] = tk.StringVar(value=self.field_results.get(field["key"], ""))
 
     def _field_chip(self, parent, text: str):
+        # 序号短（#1~#99），窄 chip 贴合文字即可；padx 也收窄，把空间让给名称/结果框。
         return ctk.CTkLabel(
             parent, text=text, fg_color=APP_COLORS["accent_soft"], text_color="#7fa8ff",
-            corner_radius=6, width=52, font=ctk.CTkFont(size=11),
+            corner_radius=6, width=30, font=ctk.CTkFont(size=11),
         )
 
     def _build_fields_panel(self, parent) -> ctk.CTkFrame:
@@ -3526,11 +3534,13 @@ class BirthFlowerApp:
             card.columnconfigure(0, weight=1)
             top = ctk.CTkFrame(card, fg_color="transparent")
             top.grid(row=0, column=0, sticky="ew", padx=7, pady=(7, 3))
-            top.columnconfigure(2, weight=1)
+            # 名称(col1)与结果(col2)同 uniform 组，按 2:3 权重分剩余宽度 → 拉伸/缩窄比例不变，名称不再挤占结果。
+            top.columnconfigure(1, weight=2, uniform="fieldrow")
+            top.columnconfigure(2, weight=3, uniform="fieldrow")
             # chip 显示不可修改的固定序号；引用名称单独编辑，不能再依赖位置编号。
-            self._field_chip(top, f"#{field.get('sequence_number', i + 1)}").grid(row=0, column=0, padx=(0, 6))
+            self._field_chip(top, f"#{field.get('sequence_number', i + 1)}").grid(row=0, column=0, padx=(0, 4))
             name_entry = ctk.CTkEntry(
-                top, textvariable=field["name_var"], width=98,
+                top, textvariable=field["name_var"], width=60,
                 fg_color=APP_COLORS["background"], border_color=APP_COLORS["border"],
                 text_color=APP_COLORS["text"],
             )
@@ -3539,16 +3549,21 @@ class BirthFlowerApp:
             name_entry.bind(
                 "<Return>",
                 lambda _e, key=field["key"], var=field["name_var"], original=original_name:
-                self._save_reference_field_name(key, var, original),
+                self._save_reference_field_name(key, var, original, silent=False),
             )
             name_entry.bind(
                 "<Escape>",
                 lambda _e, var=field["name_var"], original=original_name: var.set(original),
             )
+            name_entry.bind(
+                "<FocusOut>",
+                lambda _e, key=field["key"], var=field["name_var"], original=original_name:
+                self._save_reference_field_name(key, var, original),
+            )
             # 字段类型不再用下拉框选择；类型/约束统一写进下方「提取规则」提示词里。
             # 结果框只读：只显示 AI 解析回填的值（见 _apply_results_to_fields，映射 B「填X」），本就不可手输。
             result = ctk.CTkEntry(
-                top, textvariable=field["result_var"], state="readonly",
+                top, textvariable=field["result_var"], state="readonly", width=60,
                 fg_color=APP_COLORS["background"],
                 border_color=APP_COLORS["border"], text_color=APP_COLORS["text"],
             )
@@ -3556,11 +3571,18 @@ class BirthFlowerApp:
             if field["result_var"].get().strip().lower() == "error":
                 result.configure(border_color=APP_COLORS["warning"], text_color=APP_COLORS["warning"])
             result.grid(row=0, column=2, sticky="ew")
+            # 去掉空壳「更多」选项：变量留空 → 按钮只显示 ↓ 箭头；选完动作把变量复位回空，文字不残留。
+            more_var = tk.StringVar(value="")
             ctk.CTkOptionMenu(
                 top,
-                width=72,
-                values=("更多", "停用" if field.get("enabled", True) else "启用", "删除"),
-                command=lambda action, key=field["key"]: self._on_reference_field_more_action(key, action),
+                width=36,
+                variable=more_var,
+                values=("停用" if field.get("enabled", True) else "启用", "删除"),
+                # 整控件并入卡片底色（input），按钮段不再用默认蓝 → 只剩 ↓ 图标；hover 时才提示可点。
+                fg_color=APP_COLORS["input"], button_color=APP_COLORS["input"],
+                button_hover_color=APP_COLORS["accent_soft"], text_color=APP_COLORS["text"],
+                command=lambda action, key=field["key"], var=more_var:
+                    (self._on_reference_field_more_action(key, action), var.set("")),
             ).grid(row=0, column=3, padx=(6, 0))
             # 规则较长（含对照表），用多行 Textbox 编辑；KeyRelease 同步进 inst_var、FocusOut 落盘。
             inst_box = ctk.CTkTextbox(
@@ -3611,7 +3633,9 @@ class BirthFlowerApp:
         self._render_fields()
         self._persist_prompts()
 
-    def _save_reference_field_name(self, key: str, var: tk.StringVar, original: str) -> None:
+    def _save_reference_field_name(self, key: str, var: tk.StringVar, original: str, *, silent: bool = True) -> None:
+        if var.get().strip() == original.strip():
+            return
         product = active_product(self.config)
         try:
             updated_fields = rename_reference_field(
@@ -3622,11 +3646,17 @@ class BirthFlowerApp:
             )
         except DuplicateReferenceNameError as exc:
             var.set(original)
+            self.status_var.set(f"字段名称未保存：{exc}")
+            if silent:
+                return
             self.status_var.set("字段名称保存失败")
             messagebox.showerror("字段名称", str(exc))
             return
         except ValueError as exc:
             var.set(original)
+            self.status_var.set(f"字段名称未保存：{exc}")
+            if silent:
+                return
             self.status_var.set("字段名称保存失败")
             messagebox.showerror("字段名称", str(exc))
             return
@@ -3852,11 +3882,12 @@ class BirthFlowerApp:
         self.background_prompt_text = ctk.CTkTextbox(
             body, height=54, fg_color=APP_COLORS["input"], text_color=APP_COLORS["text"],
             border_width=1, border_color=APP_COLORS["border"],
+            undo=True, autoseparators=True, maxundo=-1,
         )
         self.background_prompt_text.grid(row=0, column=0, sticky="ew")
-        saved = self._current_prompt_template_text()
+        saved = self._stored_prompt_template()
         if saved:
-            self.background_prompt_text.insert("1.0", saved)
+            self._render_template_into_editor(saved)
         self.background_prompt_text.bind("<FocusOut>", lambda _e: self._persist_prompts())
         self.background_prompt_text.bind("<KeyRelease>", self._on_prompt_template_keyrelease)
         self.background_prompt_text.bind("<Up>", self._on_prompt_template_up)
@@ -3865,12 +3896,62 @@ class BirthFlowerApp:
         self.background_prompt_text.bind("<Escape>", self._hide_slash_popup)
         return panel
 
+    def _stored_prompt_template(self) -> str:
+        product = active_product(self.config)
+        return product.prompt_template or default_prompt_template(product.reference_fields, product.background_prompt)
+
+    def _tag_prompt_reference(self, kind: str, ref_id: str, start: str, end: str) -> None:
+        box = self.background_prompt_text
+        if box is None:
+            return
+        raw = getattr(box, "_textbox", box)
+        tag = ("ref::" if kind == "field" else "src::") + ref_id
+        raw.tag_add(tag, start, end)
+        raw.tag_add("chip", start, end)
+        raw.tag_config("chip", foreground=APP_COLORS["accent"])
+
+    def _render_template_into_editor(self, template: str) -> None:
+        box = self.background_prompt_text
+        if box is None:
+            return
+        box.delete("1.0", "end")
+        product = active_product(self.config)
+        for segment in iter_template_segments(template, fields=product.reference_fields, scope_id=product.id):
+            if segment[0] == "text":
+                box.insert("insert", segment[1])
+                continue
+            kind, ref_id, display = segment
+            start = box.index("insert")
+            box.insert("insert", display)
+            self._tag_prompt_reference(kind, ref_id, start, box.index("insert"))
+        getattr(box, "_textbox", box).edit_reset()  # 载入的模板不进 undo 栈，首个 Ctrl+Z 不会撤成空
+
+    def _template_text_from_editor(self) -> str:
+        box = self.background_prompt_text
+        if box is None:
+            return ""
+        raw = getattr(box, "_textbox", box)
+        output: list[str] = []
+        active_ref: str | None = None
+        for key, value, _index in raw.dump("1.0", "end-1c", tag=True, text=True):
+            if key == "tagon" and (value.startswith("ref::") or value.startswith("src::")):
+                if active_ref is None:
+                    active_ref = value
+                    if value.startswith("ref::"):
+                        output.append(field_token(value.removeprefix("ref::")))
+                    else:
+                        output.append(system_token(value.removeprefix("src::")))
+            elif key == "tagoff" and value == active_ref:
+                active_ref = None
+            elif key == "text" and active_ref is None:
+                output.append(value)
+        return "".join(output).strip()
+
     def _current_prompt_template_text(self) -> str:
         box = self.background_prompt_text
         if box is not None:
-            return box.get("1.0", "end-1c").strip()
-        product = active_product(self.config)
-        return product.prompt_template or default_prompt_template(product.reference_fields, product.background_prompt)
+            return self._template_text_from_editor()
+        return self._stored_prompt_template()
 
     def _append_field_to_template_if_empty(self, field: ReferenceField) -> str:
         current = self._current_prompt_template_text()
@@ -3881,40 +3962,53 @@ class BirthFlowerApp:
     def _prompt_reference_candidates(self, query: str = "") -> list[dict[str, str]]:
         product = active_product(self.config)
         query_norm = query.strip().casefold()
+        source_label = "/" + SYSTEM_SOURCE_LABELS["order_information"]
         candidates = [
-            {"label": "/订单信息", "insert": system_token("order_information"), "group": "系统数据源"}
+            {
+                "label": source_label,
+                "display_name": source_label,
+                "ref_kind": "source",
+                "ref_id": "order_information",
+            }
         ]
         for field in active_reference_fields(product.reference_fields):
-            label = f"/#{field.sequence_number} {field.reference_name}"
-            if query_norm and query_norm not in label.casefold() and query_norm not in field.reference_name.casefold():
-                continue
-            candidates.append({"label": label, "insert": field_token(field.id), "group": "自定义字段"})
+            candidates.append(
+                {
+                    "label": f"/#{field.sequence_number} {field.reference_name}",
+                    "display_name": "/" + field.reference_name,
+                    "ref_kind": "field",
+                    "ref_id": field.id,
+                }
+            )
         if query_norm:
             candidates = [
                 item for item in candidates
-                if query_norm in item["label"].casefold() or item["group"] == "系统数据源" and query_norm in "订单信息"
+                if query_norm in item["label"].casefold() or query_norm in item["display_name"].casefold()
             ]
         return candidates
 
     def _on_prompt_template_keyrelease(self, event) -> None:
         if event.keysym in {"Up", "Down", "Return", "Escape"}:
             return
-        self._persist_prompts()
-        self._update_slash_popup()
+        self._update_slash_popup()  # 存盘交给 FocusOut，避免每键序列化+写盘
 
     def _slash_query_before_cursor(self) -> tuple[str, str] | None:
+        # 锚定光标：只看光标下那个词（往左扫到空白/chip 边界/行首），不再 rfind 整行选错斜杠。
         box = self.background_prompt_text
         if box is None:
             return None
         line = box.get("insert linestart", "insert")
-        slash_at = line.rfind("/")
-        if slash_at < 0:
+        query = slash_query_at_cursor(line, self._char_in_chip)
+        if query is None:
             return None
-        query = line[slash_at + 1:]
-        if any(ch.isspace() for ch in query):
-            return None
-        start = f"insert - {len(query) + 1}c"
-        return start, query
+        return f"insert - {len(query) + 1}c", query
+
+    def _char_in_chip(self, col: int) -> bool:
+        box = self.background_prompt_text
+        if box is None:
+            return False
+        raw = getattr(box, "_textbox", box)
+        return "chip" in raw.tag_names(box.index(f"insert linestart + {col} chars"))
 
     def _update_slash_popup(self) -> None:
         found = self._slash_query_before_cursor()
@@ -3957,22 +4051,22 @@ class BirthFlowerApp:
         return "break"
 
     def _on_prompt_template_up(self, _event=None):
-        if self._slash_popup is None:
+        if self._slash_popup is None or not self._slash_candidates:
             return None
         self._slash_selected_index = max(0, self._slash_selected_index - 1)
         self._render_slash_popup()
         return "break"
 
     def _on_prompt_template_down(self, _event=None):
-        if self._slash_popup is None:
+        if self._slash_popup is None or not self._slash_candidates:
             return None
         self._slash_selected_index = min(len(self._slash_candidates) - 1, self._slash_selected_index + 1)
         self._render_slash_popup()
         return "break"
 
     def _on_prompt_template_return(self, _event=None):
-        if self._slash_popup is None:
-            return None
+        if self._slash_popup is None or not self._slash_candidates:
+            return None  # 无候选(含「无结果」)时放行 Enter，否则斜杠后换不了行
         self._insert_slash_candidate(self._slash_selected_index)
         return "break"
 
@@ -3981,8 +4075,12 @@ class BirthFlowerApp:
         if box is None or not self._slash_candidates:
             return
         candidate = self._slash_candidates[max(0, min(index, len(self._slash_candidates) - 1))]
-        box.delete(self._slash_start_index, "insert")
-        box.insert(self._slash_start_index, candidate["insert"])
+        # 先把 _slash_start_index（"insert - Nc" 相对式）锁成绝对坐标，再删；否则删完 insert 左移，
+        # 二次解析会落到更左边，导致 chip 插错位并把相邻已有文字一起吃进字段标签。
+        start = box.index(self._slash_start_index)
+        box.delete(start, "insert")
+        box.insert(start, candidate["display_name"])
+        self._tag_prompt_reference(candidate["ref_kind"], candidate["ref_id"], start, box.index("insert"))
         self._hide_slash_popup()
         self._persist_prompts()
 
@@ -4054,13 +4152,20 @@ class BirthFlowerApp:
 
     def _reference_fields_from_field_defs(self) -> tuple[ReferenceField, ...]:
         product = active_product(self.config)
-        existing_by_id = {field.id: field for field in product.reference_fields}
+        working_fields = list(product.reference_fields)
         fields: list[ReferenceField] = []
         for item in self.field_defs:
             field_id = str(item.get("id") or item.get("key") or "")
-            existing = existing_by_id.get(field_id)
+            existing = next((field for field in working_fields if field.id == field_id), None)
             if existing is None:
                 continue
+            name = item["name_var"].get() if "name_var" in item else str(item.get("name", ""))
+            if name.strip() and name.strip() != existing.reference_name:
+                try:
+                    working_fields = list(rename_reference_field(tuple(working_fields), existing.id, name, scope_id=product.id))
+                    existing = next(field for field in working_fields if field.id == field_id)
+                except ValueError:
+                    pass
             prompt = item["inst_var"].get() if "inst_var" in item else str(item.get("instruction", ""))
             field_type = item["type_var"].get() if "type_var" in item else str(item.get("type", "文本"))
             fields.append(update_reference_field_prompt((existing,), existing.id, prompt, scope_id=product.id)[0])
@@ -4134,13 +4239,12 @@ class BirthFlowerApp:
         box = self.background_prompt_text
         if box is None:
             return
-        box.delete("1.0", "end")
-        prompt_template = self._current_prompt_template_text()
+        prompt_template = self._stored_prompt_template()
         if prompt_template:
-            box.insert("1.0", prompt_template)
+            self._render_template_into_editor(prompt_template)
 
     def _show_generated_prompt(self) -> None:
-        """预览真正会发给 API 的内容：字段规则套进脚手架的系统提示词 + 用户内容（订单文本）。"""
+        """预览真正会发给 API 的内容：字段规则 + 订单文本原样拼接（订单文本不再加 <order_data> 包裹）。"""
         remark = self._current_remark_text().strip()
         product = active_product(self.config)
         template = self._current_prompt_template_text()
@@ -4151,19 +4255,9 @@ class BirthFlowerApp:
                 fields=product.reference_fields,
                 order_information=remark,
             )
-            text = (
-                "[template]\n"
-                f"{render_template_view(template, fields=product.reference_fields, scope_id=product.id) or '（空）'}\n\n"
-                "[final]\n"
-                f"{resolved.final_prompt or '（空）'}"
-            )
+            text = resolved.final_prompt or "（空）"
         except PromptReferenceError as exc:
-            text = (
-                "[template]\n"
-                f"{render_template_view(template, fields=product.reference_fields, scope_id=product.id) or '（空）'}\n\n"
-                "[error]\n"
-                f"{exc}"
-            )
+            text = f"[error]\n{exc}"
         box = self.generated_prompt_text
         if box is not None:
             box.configure(state="normal")
@@ -5254,9 +5348,11 @@ class BirthFlowerApp:
             return
         text = (
             f"[{trace.provider} · {trace.model}]\n\n"
-            f"[system]\n{trace.system_prompt or '（空）'}\n\n"
-            f"[user]\n{trace.user_content or '（空）'}"
+            f"[system]\n{trace.system_prompt or '（空）'}"
         )
+        # 模板内联订单文本时 user 消息本就为空，别再展示「[user]（空）」这种内部占位。
+        if (trace.user_content or "").strip():
+            text += f"\n\n[user]\n{trace.user_content}"
         box.configure(state="normal")
         box.delete("1.0", "end")
         box.insert("1.0", text)
@@ -8129,6 +8225,72 @@ class BirthFlowerApp:
         var = getattr(self, "preview_canvas_size_var", None)
         if var is not None:
             var.set(self._preview_canvas_size_text(layout))
+
+    def _begin_canvas_size_edit(self) -> None:
+        """点击实时画板尺寸 → 原地把这行变成 [宽] × [高] px 两个输入框。
+        回车/失焦提交，Esc 取消。提交即写回 layout_vars（trace 自动重绘）并存盘。"""
+        if self._size_edit_frame is not None:
+            return
+        try:
+            layout = layout_from_values(self.layout_vars)
+            w0, h0 = int(layout.canvas_width), int(layout.canvas_height)
+        except Exception:
+            w0 = h0 = ""
+        self.preview_size_label.grid_remove()
+        frame = ctk.CTkFrame(self._size_status_row, fg_color="transparent")
+        frame.grid(row=0, column=0, sticky="w")
+        self._size_edit_frame = frame
+        font = ctk.CTkFont(size=11)
+        ctk.CTkLabel(frame, text="画布：", text_color=APP_COLORS["muted"], font=font).pack(side="left")
+        self._size_w_entry = ctk.CTkEntry(frame, width=52, height=22, font=font)
+        self._size_w_entry.pack(side="left")
+        ctk.CTkLabel(frame, text=" × ", text_color=APP_COLORS["muted"], font=font).pack(side="left")
+        self._size_h_entry = ctk.CTkEntry(frame, width=52, height=22, font=font)
+        self._size_h_entry.pack(side="left")
+        ctk.CTkLabel(frame, text=" px", text_color=APP_COLORS["muted"], font=font).pack(side="left")
+        for entry, val in ((self._size_w_entry, w0), (self._size_h_entry, h0)):
+            entry.insert(0, str(val))
+            entry.bind("<Return>", lambda _e: self._commit_canvas_size_edit(strict=True))
+            entry.bind("<Escape>", lambda _e: self._end_canvas_size_edit())
+            entry.bind("<FocusOut>", self._on_canvas_size_focus_out)
+        self._size_w_entry.focus_set()
+
+    def _on_canvas_size_focus_out(self, _event) -> None:
+        # 在宽/高两框间切换 Tab/点击不算离开；焦点真正移出编辑区才按非严格提交。
+        def check() -> None:
+            if self._size_edit_frame is None:
+                return
+            if self.root.focus_get() not in (self._size_w_entry, self._size_h_entry):
+                self._commit_canvas_size_edit(strict=False)
+        self.root.after_idle(check)
+
+    def _commit_canvas_size_edit(self, *, strict: bool) -> None:
+        if self._size_edit_frame is None:
+            return
+        try:
+            w = int(round(float(self._size_w_entry.get())))
+            h = int(round(float(self._size_h_entry.get())))
+        except ValueError:
+            w = h = 0
+        if w <= 0 or h <= 0:
+            if strict:  # 回车显式提交才报错并留在编辑态；失焦则静默取消，不打断操作
+                messagebox.showerror("画布尺寸", "宽和高必须是大于 0 的数值。")
+                self._size_w_entry.focus_set()
+                return
+            self._end_canvas_size_edit()
+            return
+        self.layout_vars["canvas_width"].set(str(w))   # 触发 trace → _redraw_preview
+        self.layout_vars["canvas_height"].set(str(h))
+        self._update_preview_canvas_size_status()
+        self._save_current_config()
+        self._end_canvas_size_edit()
+
+    def _end_canvas_size_edit(self) -> None:
+        frame = self._size_edit_frame
+        if frame is not None:
+            self._size_edit_frame = None
+            frame.destroy()
+        self.preview_size_label.grid()
 
     def _preview_base_transform(self, layout: EngravingLayout) -> tuple[float, float, float]:
         canvas = self.preview_canvas

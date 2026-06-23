@@ -1632,7 +1632,7 @@ def test_field_instructions_drive_ai_system_prompt(monkeypatch):
         assert "Narcissus" in rules  # 含月→花对照表
         cfg = app._current_ai_config("ORDER TEXT")
         assert "Narcissus" in cfg.system_prompt
-        assert "<order_data>\nORDER TEXT\n</order_data>" in cfg.system_prompt
+        assert "ORDER TEXT" in cfg.system_prompt  # 订单文本原样插入，无 <order_data> 包裹
         assert cfg.user_content == ""
         # 编辑某字段 instruction → 立即反映进发给 API 的提示词
         app.field_defs[0]["inst_var"].set("只提取顾客名字 XYZ")
