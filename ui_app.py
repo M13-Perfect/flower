@@ -4,6 +4,7 @@ import dataclasses
 import datetime
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -28,6 +29,7 @@ from canvas_text_item import CanvasTextItem, FloatingTextEditor
 from config_store import (
     AIProfile,
     AppConfig,
+    LayerPin,
     ProductConfig,
     active_ai_profile,
     active_product,
@@ -39,8 +41,29 @@ from config_store import (
     verify_admin_password,
     with_added_product,
     with_admin_password,
+    with_product_defaults,
     with_product_library_dirs,
-    with_product_prompts,
+    with_product_layer_pins,
+    with_product_reference_fields,
+)
+from prompt_references import (
+    DuplicateReferenceNameError,
+    PromptReferenceError,
+    ReferenceConflictError,
+    ReferenceField,
+    active_reference_fields,
+    create_reference_field,
+    default_prompt_template,
+    field_token,
+    find_template_references,
+    reference_fields_from_legacy,
+    render_template_view,
+    resolve_prompt_template,
+    set_reference_field_enabled,
+    soft_delete_reference_field,
+    system_token,
+    update_reference_field_prompt,
+    rename_reference_field,
 )
 from generation_readiness import GenerationReadiness, build_generation_readiness
 from glyph_service import (
@@ -60,7 +83,7 @@ from glyph_service import (
     remove_glyph_override,
     resolve_glyph,
 )
-from models import AIParseConfig, AnchoredHeartLayer, BirthFlowerDesign, Document, EngravingLayout, FlowerAsset, FontAsset, ImageLayer, ParsePromptTrace, TextLayer, ParseResult, add_image_layer, add_text_layer, delete_layer, hit_test, move_layer
+from models import AIParseConfig, AnchoredHeartLayer, BirthFlowerDesign, Document, EngravingLayout, FlowerAsset, FontAsset, GroupLayer, HistoryManager, ImageLayer, ParsePromptTrace, TextLayer, ParseResult, add_image_layer, add_text_layer, delete_layer, hit_test, move_layer
 from order_importer import load_order_from_file, load_order_remark_from_file, order_from_payload
 from parse_pipeline import parse_orders_auto
 import inbox_service_client as inbox_client
@@ -71,7 +94,6 @@ from gpt_parser import (
     DEFAULT_DEEPSEEK_BASE_URL,
     DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_MODEL,
-    build_orders_system_prompt,
     parse_order_remark_with_gpt,
 )
 from renderer import DEBUG_VISUAL_BBOX, PreviewCache, flower_debug_bboxes, render_document_png, render_dxf, render_png, render_svg
@@ -189,7 +211,6 @@ VIEW_LABELS = {
     VIEW_OPERATOR_CONFIG: "操作员配置端",
     VIEW_ADMIN: "管理员端",
 }
-
 # ===== 选端页（门厅）专属皮肤：B「精炼深空」+ C 门口状态条 =====
 # 启动选端遮罩页用这套独立深色「门厅」配色：比 App 内部 APP_COLORS 更黑，用青/蓝/琥珀给三端做色编码；
 # 进入某端后回到 App 现有深色（门厅 vs 内部的有意色差）。图标走 line_icons（Tabler/MIT，cairosvg 渲染）。
@@ -602,7 +623,6 @@ def import_dianxiaomi_xlsx_batch(path: Path | str, layout: dict | None = None) -
 
 # 当前产品线唯一模板;多产品后改为按当前模板选择。
 PHYSICAL_TEMPLATE_ID = "birth-flower-card"
-
 
 def load_template_physical_size() -> object:
     """物理尺寸的唯一数据源是模板文件;UI 只读写它,禁止本地另存副本。"""
@@ -1097,6 +1117,24 @@ def layout_from_values(values: dict[str, tk.StringVar | str]) -> EngravingLayout
     return layout
 
 
+def _clamp_sashes(
+    fractions: tuple[float, ...],
+    total: int,
+    min_rail: int = PRODUCT_RAIL_COLLAPSED_WIDTH,
+    min_center: int = 360,
+    min_func: int = 300,
+) -> tuple[int, int]:
+    """把存的 2 个比例还原成 2 条 sash 的 x 像素，保证：左≥min_rail、中≥min_center、右≥min_func、x0<x1。
+
+    约束：x0=左列宽、x1-x0=中列宽、total-x1=右列宽。当 total 够大（≥三者之和）时三约束都满足；
+    窗口被拖到比 minsize 之和还小时尽力而为（中列优先让位），不抛错。
+    """
+    hi1 = total - min_func  # x1 上界：右列至少 min_func
+    x0 = min(max(fractions[0] * total, min_rail), hi1 - min_center)  # 左列在 [min_rail, 留够中+右]
+    x1 = min(max(fractions[1] * total, x0 + min_center), hi1)        # 右 sash 至少离左 sash min_center
+    return int(x0), int(x1)
+
+
 class BirthFlowerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -1154,6 +1192,10 @@ class BirthFlowerApp:
         self.filename_template_var = tk.StringVar(value="")
         self.background_prompt_text = None
         self.generated_prompt_text = None
+        self._slash_popup = None
+        self._slash_candidates: list[dict[str, str]] = []
+        self._slash_selected_index = 0
+        self._slash_start_index = ""
         # 多订单识别队列：一次粘贴可含多笔订单，逐笔载入编辑器确认/生成。
         self.parsed_orders: list[ParseResult] = []
         self._parsed_order_index = 0
@@ -1179,6 +1221,8 @@ class BirthFlowerApp:
         self._layers_empty_hint = None                # 无图层时的占位提示
         self._layer_row_widgets: list = []            # (row_card, layer_id)，拖动落点命中用
         self._drag_layer_id: str | None = None        # 当前拖动中的图层 id
+        self._tree_drag_source_id: str | None = None
+        self._tree_drag_started = False
         self._drop_indicator = None                   # 拖动时的蓝色落点指示线（place 覆盖在图层容器上）
         self._drop_insert_index: int | None = None    # 当前落点：插到第几个显示行之前
         self._render_layers_scheduled = False         # 图层行渲染 after_idle 去重标记
@@ -1194,11 +1238,11 @@ class BirthFlowerApp:
         self.preview_cache = PreviewCache()
         # 保存 PhotoImage 引用，避免 Tk 垃圾回收后预览文字消失。
         self.preview_text_images: list[object] = []
-        default_layout = self.config.layout_defaults
+        default_layout = active_product(self.config).defaults
         # 多图层文档是画布的真实数据源；旧版字段继续保留，保证订单解析和月份/字体选择兼容。
         self.document = Document(default_layout.canvas_width, default_layout.canvas_height)
-        self.history_manager = None  # 预留 Ctrl+Z/Ctrl+Y 历史管理入口。
-        self.layers_listbox: tk.Listbox | None = None
+        self.history_manager = HistoryManager()
+        self.layers_tree: ttk.Treeview | None = None
         # 增量5：设置窗口里「产品素材库/字体库目录列表」编辑器（打开设置时建，保存时读回）。
         self.settings_image_listbox: tk.Listbox | None = None
         self.settings_font_listbox: tk.Listbox | None = None
@@ -1253,12 +1297,14 @@ class BirthFlowerApp:
         self._drag_target: str | None = None
         self._drag_start: tuple[int, int] | None = None
         self._drag_mode: str = "move"
+        self._drag_history_pushed = False
         self.selected_preview_item: str | None = None
         # 画板视图状态：默认等比适配；滚轮缩放时只改变视图，不改 Document/export 坐标。
         self.preview_zoom = 1.0
         self.preview_pan_x = 0.0
         self.preview_pan_y = 0.0
         self.preview_zoom_status_var = tk.StringVar(value=self._preview_zoom_percent_text())
+        self.preview_canvas_size_var = tk.StringVar(value=self._preview_canvas_size_text(default_layout))
         # 素材下拉框的当前值先作为待添加素材保存；只有点击“添加素材”才真正创建 ImageLayer。
         self.pending_flower_asset_label: str = ""
         # 初始化、刷新列表、解析订单等程序化更新期间，不让控件事件触发业务写入。
@@ -1360,8 +1406,9 @@ class BirthFlowerApp:
         self.root.bind("<Right>", lambda _event: self._nudge_selected_layer(1, 0))
         self.root.bind("<Up>", lambda _event: self._nudge_selected_layer(0, -1))
         self.root.bind("<Down>", lambda _event: self._nudge_selected_layer(0, 1))
-        self.root.bind("<Control-z>", lambda _event: self.status_var.set("撤销历史已预留，后续版本启用"))
-        self.root.bind("<Control-y>", lambda _event: self.status_var.set("重做历史已预留，后续版本启用"))
+        self.root.bind("<Control-z>", self._on_undo_key)
+        self.root.bind("<Control-y>", self._on_redo_key)
+        self.root.bind("<Control-Shift-Z>", self._on_redo_key)
 
     def _build_menubar(self, parent) -> ctk.CTkFrame:
         """顶部深色菜单条：每个按钮弹出自绘 CtkMenu（深色圆角，无系统白边）。"""
@@ -1564,31 +1611,47 @@ class BirthFlowerApp:
         # 「生成」按钮 + 状态也移入该卡（见 _build_output_settings_panel）。
         # 腾出的底部空间由 body（预览 + 功能区）自动 fill 撑满 → 画布更高、功能区更长。
 
-        # 产品切换列：作为最左新增一列，原 body（预览 + 功能区）两栏布局保持不变。
-        self.product_rail = ctk.CTkFrame(
-            frame, width=PRODUCT_RAIL_COLLAPSED_WIDTH, corner_radius=0, fg_color=APP_COLORS["panel"]
+        # 三列横向布局用 tk.PanedWindow：分隔条（sash）自带拖拽，三列都能拉宽缩窄，不用自己写鼠标拖动。
+        # 选 tk 版而非 ttk：每 pane 的 minsize 是原生的（ttk 版只有 weight，得自己钳最小宽 = 多代码）。
+        paned = tk.PanedWindow(
+            frame, orient="horizontal", bg=APP_COLORS["border"],
+            sashwidth=6, sashrelief="flat", bd=0, showhandle=False, opaqueresize=True,
         )
-        self.product_rail.pack(side="left", fill="y", padx=(0, 8))
+        paned.pack(fill="both", expand=True)
+        self._paned = paned
+
+        # 左列：产品切换列。宽度仍由「收/展」按钮设（_toggle_product_rail 吸附 sash），现在也能直接拖。
+        self.product_rail = ctk.CTkFrame(
+            paned, width=PRODUCT_RAIL_COLLAPSED_WIDTH, corner_radius=0, fg_color=APP_COLORS["panel"]
+        )
         self.product_rail.pack_propagate(False)
         self._render_product_rail()
 
-        body = ttk.Frame(frame, style="App.TFrame")
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1, minsize=360)
-        body.columnconfigure(1, weight=0, minsize=300)
-        body.rowconfigure(0, weight=1)
+        # 中列：预览/订单两块叠在同一容器 grid，按端 grid_remove 切换（逻辑不变，父容器从 body 换成 center）。
+        center = ttk.Frame(paned, style="App.TFrame")
+        center.columnconfigure(0, weight=1)
+        center.rowconfigure(0, weight=1)
+        preview_panel = self._build_preview_panel(center)
+        orders_panel = self._build_orders_table_panel(center)
+        preview_panel.grid(row=0, column=0, sticky="nsew")
+        orders_panel.grid(row=0, column=0, sticky="nsew")
 
-        preview_panel = self._build_preview_panel(body)
-        # 配置端中心区用的「实时订单表」与画板同占 col0；按端切换显隐（_apply_center_for_view）。
-        orders_panel = self._build_orders_table_panel(body)
-        function_panel, order_panel, production_panel = self._build_function_panel(body)
+        # 右列：功能区。CTkScrollableFrame 是 frame→canvas→scrollableframe 复合体，其真身不是 paned 的
+        # 直接子节点，不能直接 add 进 PanedWindow；包一层普通 frame 当 pane，功能区 pack 满它。
+        right = ttk.Frame(paned, style="App.TFrame")
+        function_panel, order_panel, production_panel = self._build_function_panel(right)
+        function_panel.pack(fill="both", expand=True)
 
-        preview_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        orders_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        function_panel.grid(row=0, column=1, sticky="nsew")
+        # 装三列：左/右固定不拉伸、中列吸收窗口缩放；minsize 沿用原 body 的 360/300 + 产品列收起宽。
+        paned.add(self.product_rail, minsize=PRODUCT_RAIL_COLLAPSED_WIDTH, stretch="never", sticky="nsew")
+        paned.add(center, minsize=360, stretch="always", sticky="nsew")
+        paned.add(right, minsize=300, stretch="never", sticky="nsew")
+
         self._preview_panel = preview_panel
         self._orders_panel = orders_panel
         orders_panel.grid_remove()  # 默认操作员端：先藏订单表，由 _apply_center_for_view 决定
+        # 还原上次拖好的列宽：须等窗口有真实宽度才能按比例放 sash，故 after_idle。
+        self.root.after_idle(self._restore_pane_sashes)
 
         self.section_frames = {
             "order_panel": order_panel,
@@ -1668,21 +1731,53 @@ class BirthFlowerApp:
             _attach_tooltip(button, str(item["name"]))
 
     def _toggle_product_rail(self) -> None:
-        """收/展产品列；窗口宽度同步增减，让列「往外推出」而非「往内挤占画板」。"""
-        delta = PRODUCT_RAIL_EXPANDED_WIDTH - PRODUCT_RAIL_COLLAPSED_WIDTH
-        expanding = self.products_collapsed  # 当前收起 → 即将展开
+        """收/展产品列：翻状态→存盘→重建内容→把左分隔条吸附到收起/展开宽。按钮与拖拽并存。"""
         self.products_collapsed = not self.products_collapsed
         self.config = dataclasses.replace(
             self.config, products_panel_collapsed=self.products_collapsed
         )
         save_config(self.config)
         self._render_product_rail()
-        # 窗口整体加宽/收窄 delta，使画板与功能区宽度保持不变（产品列向外扩，不吃画板）。
-        self.root.update_idletasks()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        new_width = width + delta if expanding else max(MIN_WINDOW_WIDTH, width - delta)
-        self.root.geometry(f"{new_width}x{height}")
+        # 把左 sash 吸附到目标宽；中列吸收差值（paned 天然行为，比旧的整窗加宽更简单、与拖拽一致）。
+        target = PRODUCT_RAIL_COLLAPSED_WIDTH if self.products_collapsed else PRODUCT_RAIL_EXPANDED_WIDTH
+        paned = getattr(self, "_paned", None)
+        if paned is not None:
+            paned.update_idletasks()
+            paned.sash_place(0, target, 0)
+
+    def _restore_pane_sashes(self) -> None:
+        """按上次存的比例还原 2 条分隔条位置；无存值用默认列宽。须在窗口已实化（有真实宽度）后调用。"""
+        fractions = self.config.pane_sash_fractions
+        paned = getattr(self, "_paned", None)
+        if paned is None or len(fractions) != 2:
+            return
+        paned.update_idletasks()
+        total = paned.winfo_width()
+        if total <= 1:
+            # 窗口还没真正实化，winfo_width 仍是占位的 1，再等一拍。
+            # ponytail: 一次重试就够；还拿不到就放弃还原、用默认列宽
+            self.root.after(50, self._restore_pane_sashes)
+            return
+        x0, x1 = _clamp_sashes(fractions, total)
+        paned.sash_place(0, x0, 0)
+        paned.sash_place(1, x1, 0)
+
+    def _save_pane_sashes(self) -> None:
+        """关窗前把 2 条分隔条位置按「占总宽比例」存盘；下次启动 _restore_pane_sashes 折算还原。"""
+        paned = getattr(self, "_paned", None)
+        if paned is None:
+            return
+        try:
+            total = paned.winfo_width()
+            if total <= 1:
+                return
+            fractions = tuple(paned.sash_coord(i)[0] / total for i in range(2))
+        except Exception:
+            LOGGER.debug("保存分隔条位置失败（忽略）", exc_info=True)
+            return
+        if fractions != tuple(self.config.pane_sash_fractions):
+            self.config = dataclasses.replace(self.config, pane_sash_fractions=fractions)
+            save_config(self.config)
 
     def _switch_product(self, product_id: str) -> None:
         """切换激活产品：持久化 + 把该产品的素材/字体库灌进扫描入口并重扫。"""
@@ -1698,8 +1793,12 @@ class BirthFlowerApp:
         if product.font_library_dirs:
             self.font_source_var.set(str(product.font_library_dirs[0]))
         self._scan_assets(show_errors=False)
+        self._apply_layout_defaults(product.defaults)
+        self._clear_document_history()
         self._load_prompts_into_widgets()  # 载入新产品的提示词
         self._render_product_rail()
+        self._refresh_layers_panel()
+        self._redraw_preview()
         self.status_var.set(f"已切换产品：{product.name}")
 
     def _open_new_product_dialog(self) -> None:
@@ -1776,7 +1875,7 @@ class BirthFlowerApp:
             name=name,
             image_library_dirs=image_dirs,
             font_library_dirs=font_dirs,
-            defaults=self.config.layout_defaults,
+            defaults=self._active_layout_defaults(),
         )
         # 先追加（不激活）再走切换逻辑，复用切换里的重扫/重绘/持久化。
         self.config = with_added_product(self.config, product, activate=False)
@@ -1798,7 +1897,7 @@ class BirthFlowerApp:
 
         # 三端视图：所有卡片建一次存进 self._function_cards（key→widget），再按当前端 grid（见 _apply_view）。
         # 卡片 key 与端归属见 _VIEW_CARD_ORDER；订单信息/解析结果在 operator 与 admin 两端共用同一 widget。
-        # 旧的「图层」listbox 面板(_build_layers_panel)暂不装配；其刷新方法已自带 None 守卫退化为 no-op。
+        # 图层卡在 _build_production_panel 内使用 ttk.Treeview；旧 _build_layers_panel 仅保留兼容入口。
         order_panel = self._build_order_panel(panel)
         production_panel = self._build_production_panel(panel)  # 「图层」卡，真实动态行 + 保留隐藏全局选择器联动
         self._function_panel = panel
@@ -2114,6 +2213,7 @@ class BirthFlowerApp:
 
         不释放的话，扩展会一直以为还被授权，直到租约自然到期（最多 lease 秒）才停——尽量主动释放。
         """
+        self._save_pane_sashes()  # 先把拖好的列宽存盘，再走清理/销毁
         self._stop_heartbeat()
         task_id = self._scrape_task_id
         self._scrape_task_id = None
@@ -2657,66 +2757,8 @@ class BirthFlowerApp:
 
 
     def _build_layers_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
-        """右下角图层面板：负责选择、显隐、锁定、删除和调整层级。"""
-        panel, body = self._ctk_card(parent, "图层")
-        self.layers_listbox = tk.Listbox(
-            body,
-            height=7,
-            exportselection=False,
-            bg=APP_COLORS["input"],
-            fg=APP_COLORS["text"],
-            selectbackground=APP_COLORS["accent"],
-            selectforeground="#ffffff",
-            highlightthickness=1,
-            highlightbackground=APP_COLORS["border"],
-            relief="flat",
-            borderwidth=0,
-        )
-        self.layers_listbox.grid(row=0, column=0, columnspan=5, sticky="ew")
-        self.layers_listbox.bind("<<ListboxSelect>>", self._on_layer_list_select)
-        self.layers_listbox.bind("<Double-Button-1>", self._on_layer_list_double_click)
-        self.layers_listbox.bind("<Button-3>", self._show_layer_context_menu)
-        self.layers_listbox.bind("<Button-2>", self._show_layer_context_menu)
-        self._btn(body, "显/隐", self._toggle_selected_layer_visible).grid(row=1, column=0, sticky="ew", pady=3, padx=2)
-        self._btn(body, "锁/解", self._toggle_selected_layer_locked).grid(row=1, column=1, sticky="ew", pady=3, padx=2)
-        self._btn(body, "删除", self._delete_selected_layer).grid(row=1, column=2, sticky="ew", pady=3, padx=2)
-        self._btn(body, "上移", lambda: self._move_selected_layer("up")).grid(row=2, column=0, sticky="ew", pady=3, padx=2)
-        self._btn(body, "下移", lambda: self._move_selected_layer("down")).grid(row=2, column=1, sticky="ew", pady=3, padx=2)
-        self._btn(body, "置顶", lambda: self._move_selected_layer("top")).grid(row=2, column=2, sticky="ew", pady=3, padx=2)
-        self._btn(body, "置底", lambda: self._move_selected_layer("bottom")).grid(row=2, column=3, sticky="ew", pady=3, padx=2)
-        ctk.CTkLabel(
-            body, textvariable=self.layer_detail_var, text_color=APP_COLORS["muted"],
-            wraplength=240, anchor="w", justify="left",
-        ).grid(row=3, column=0, columnspan=5, sticky="ew", pady=(4, 0))
-        ctk.CTkLabel(body, text="文本", anchor="w").grid(row=4, column=0, sticky="w", pady=(6, 2))
-        ctk.CTkEntry(body, textvariable=self.layer_text_var).grid(row=4, column=1, columnspan=4, sticky="ew", pady=(6, 2))
-        ctk.CTkLabel(body, text="字号", anchor="w").grid(row=5, column=0, sticky="w", pady=2)
-        ctk.CTkEntry(body, textvariable=self.layer_font_size_var, width=70).grid(row=5, column=1, sticky="ew", pady=2)
-        ctk.CTkLabel(body, text="颜色", anchor="w").grid(row=5, column=2, sticky="w", pady=2)
-        ctk.CTkEntry(body, textvariable=self.layer_color_var, width=90).grid(row=5, column=3, sticky="ew", pady=2)
-        self._btn(body, "应用文本属性", self._apply_text_layer_properties).grid(row=5, column=4, sticky="ew", pady=2, padx=2)
-        # 增量4：图层级生产参数（几何）——任意图层可编辑位置/尺寸，应用写回 layer.production 并落到画布几何。
-        ctk.CTkLabel(body, text="位置X", anchor="w").grid(row=6, column=0, sticky="w", pady=2)
-        ctk.CTkEntry(body, textvariable=self.layer_x_var, width=70).grid(row=6, column=1, sticky="ew", pady=2)
-        ctk.CTkLabel(body, text="Y", anchor="w").grid(row=6, column=2, sticky="w", pady=2)
-        ctk.CTkEntry(body, textvariable=self.layer_y_var, width=70).grid(row=6, column=3, sticky="ew", pady=2)
-        ctk.CTkLabel(body, text="宽", anchor="w").grid(row=7, column=0, sticky="w", pady=2)
-        ctk.CTkEntry(body, textvariable=self.layer_w_var, width=70).grid(row=7, column=1, sticky="ew", pady=2)
-        ctk.CTkLabel(body, text="高", anchor="w").grid(row=7, column=2, sticky="w", pady=2)
-        ctk.CTkEntry(body, textvariable=self.layer_h_var, width=70).grid(row=7, column=3, sticky="ew", pady=2)
-        self._btn(body, "应用生产参数", self._apply_layer_production).grid(row=7, column=4, sticky="ew", pady=2, padx=2)
-        # 字体样式（per-layer override，文本图层有效）：由上方「应用文本属性」一并写回选中图层。
-        ctk.CTkCheckBox(body, text="加粗", variable=self.layer_bold_var, width=60).grid(
-            row=8, column=0, sticky="w", pady=2
-        )
-        ctk.CTkCheckBox(body, text="下划线", variable=self.layer_underline_var, width=72).grid(
-            row=8, column=1, sticky="w", pady=2
-        )
-        ctk.CTkLabel(body, text="字间距", anchor="w").grid(row=8, column=2, sticky="w", pady=2)
-        ctk.CTkEntry(body, textvariable=self.layer_letter_spacing_var, width=70).grid(
-            row=8, column=3, sticky="ew", pady=2
-        )
-        return panel
+        """兼容旧调用名；真实图层面板已迁到 _build_production_panel 的 Treeview。"""
+        return self._build_production_panel(parent)
 
     def _build_order_panel(self, parent: ttk.Frame) -> ttk.LabelFrame:
         panel, body = self._ctk_card(parent, "订单信息")
@@ -2774,14 +2816,28 @@ class BirthFlowerApp:
 
         status_row = ctk.CTkFrame(body, fg_color="transparent")
         status_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        status_row.columnconfigure(0, weight=1)
+        status_row.columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            status_row,
+            textvariable=self.preview_canvas_size_var,
+            anchor="w",
+            text_color=APP_COLORS["muted"],
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            status_row,
+            text=" | ",
+            anchor="w",
+            text_color=APP_COLORS["muted"],
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=1, sticky="w", padx=4)
         ctk.CTkLabel(
             status_row,
             textvariable=self.preview_zoom_status_var,
             anchor="e",
             text_color=APP_COLORS["muted"],
             font=ctk.CTkFont(size=11),
-        ).grid(row=0, column=0, sticky="e")
+        ).grid(row=0, column=2, sticky="e")
 
         # 画板保持白底：代表浅色木料，雕刻预览是深灰折线 + 黑墨字，翻黑会看不见。
         # 上/左刻度尺固定显示物理 mm，跟随同一个 document→screen 变换。
@@ -3331,20 +3387,45 @@ class BirthFlowerApp:
         header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         header.columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            header,
-            text=f"画布尺寸 {self.layout_vars['canvas_width'].get()} × {self.layout_vars['canvas_height'].get()}",
-            anchor="w", text_color=APP_COLORS["muted"], font=ctk.CTkFont(size=11),
-        ).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
-            header, text="拖柄调序 · 右键/⋮ 设属性", anchor="e",
+            header, text="行内点眼睛/📌/删除 · 右键设属性", anchor="e",
             text_color=APP_COLORS["muted"], font=ctk.CTkFont(size=10),
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=0, sticky="e")
 
-        # 每个图层一行：内容字段 + 来源库 + 具体素材/字体（文字另含字号）聚合在行内；
-        # 位置/尺寸/对齐/显隐/删除走右键。真实动态行由 _render_layers() 按 document.layers 渲染。
-        self.layers_rows_box = ctk.CTkFrame(body, fg_color="transparent")
-        self.layers_rows_box.grid(row=1, column=0, sticky="ew")
-        self.layers_rows_box.columnconfigure(0, weight=1)
+        tree_wrap = ttk.Frame(body)
+        tree_wrap.grid(row=1, column=0, sticky="ew")
+        tree_wrap.columnconfigure(0, weight=1)
+        self.layers_tree = ttk.Treeview(
+            tree_wrap,
+            columns=("visible", "pin", "type", "delete"),
+            show="tree headings",
+            height=7,
+            selectmode="browse",
+        )
+        self.layers_tree.heading("#0", text="图层")
+        self.layers_tree.heading("visible", text="👁")
+        self.layers_tree.heading("pin", text="📌")
+        self.layers_tree.heading("type", text="类型")
+        self.layers_tree.heading("delete", text="🗑")
+        self.layers_tree.column("#0", width=168, minwidth=120, stretch=True)
+        self.layers_tree.column("visible", width=36, minwidth=32, stretch=False, anchor="center")
+        self.layers_tree.column("pin", width=42, minwidth=34, stretch=False, anchor="center")
+        self.layers_tree.column("type", width=54, minwidth=46, stretch=False, anchor="center")
+        self.layers_tree.column("delete", width=42, minwidth=34, stretch=False, anchor="center")
+        self.layers_tree.tag_configure("hidden", foreground=APP_COLORS["muted"])
+        self.layers_tree.tag_configure("locked", foreground=APP_COLORS["muted"])
+        self.layers_tree.tag_configure("pinned", foreground="#e3b34a")
+        self.layers_tree.grid(row=0, column=0, sticky="ew")
+        scrollbar = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.layers_tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.layers_tree.configure(yscrollcommand=scrollbar.set)
+        self.layers_tree.bind("<<TreeviewSelect>>", self._on_layers_tree_select)
+        self.layers_tree.bind("<ButtonPress-1>", self._on_layers_tree_button_press)
+        self.layers_tree.bind("<B1-Motion>", self._on_layers_tree_drag_motion)
+        self.layers_tree.bind("<ButtonRelease-1>", self._on_layers_tree_button_release)
+        self.layers_tree.bind("<Double-Button-1>", self._on_layer_list_double_click)
+        self.layers_tree.bind("<Button-3>", self._show_layers_tree_context_menu)
+        self.layers_tree.bind("<Button-2>", self._show_layers_tree_context_menu)
+        self.layers_rows_box = None
         self._render_layers()
 
         action_row = ctk.CTkFrame(body, fg_color="transparent")
@@ -3356,6 +3437,17 @@ class BirthFlowerApp:
         self._btn(
             action_row, "+ 图片图层", self._add_selected_flower_to_canvas
         ).grid(row=0, column=2)
+
+        library_box = ctk.CTkFrame(body, fg_color="transparent")
+        library_box.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        library_box.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            library_box, text="资源库", anchor="w",
+            text_color=APP_COLORS["muted"], font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="w")
+        self._production_library_rows_frame = ctk.CTkFrame(library_box, fg_color="transparent")
+        self._production_library_rows_frame.grid(row=1, column=0, sticky="ew")
+        self._production_library_rows_frame.columnconfigure(0, weight=1)
 
         # 隐藏容器承载原四个全局选择器：parse/扫描/选库 全部联动仍依赖它们。
         # P1 暂不显示（已收进图层行示意）；P2 把库/素材/字体选择真正做进每个图层行后移除。
@@ -3434,10 +3526,25 @@ class BirthFlowerApp:
             card.columnconfigure(0, weight=1)
             top = ctk.CTkFrame(card, fg_color="transparent")
             top.grid(row=0, column=0, sticky="ew", padx=7, pady=(7, 3))
-            top.columnconfigure(1, weight=1)
-            # chip 用位置编号 info1/info2/…（按当前顺序实时算），不显示内部 name；
-            # name 仍保留给提取提示词（刻字内容/出生花/字体等语义标签）。
-            self._field_chip(top, f"info{i + 1}").grid(row=0, column=0, padx=(0, 6))
+            top.columnconfigure(2, weight=1)
+            # chip 显示不可修改的固定序号；引用名称单独编辑，不能再依赖位置编号。
+            self._field_chip(top, f"#{field.get('sequence_number', i + 1)}").grid(row=0, column=0, padx=(0, 6))
+            name_entry = ctk.CTkEntry(
+                top, textvariable=field["name_var"], width=98,
+                fg_color=APP_COLORS["background"], border_color=APP_COLORS["border"],
+                text_color=APP_COLORS["text"],
+            )
+            name_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+            original_name = field["name_var"].get()
+            name_entry.bind(
+                "<Return>",
+                lambda _e, key=field["key"], var=field["name_var"], original=original_name:
+                self._save_reference_field_name(key, var, original),
+            )
+            name_entry.bind(
+                "<Escape>",
+                lambda _e, var=field["name_var"], original=original_name: var.set(original),
+            )
             # 字段类型不再用下拉框选择；类型/约束统一写进下方「提取规则」提示词里。
             # 结果框只读：只显示 AI 解析回填的值（见 _apply_results_to_fields，映射 B「填X」），本就不可手输。
             result = ctk.CTkEntry(
@@ -3448,10 +3555,13 @@ class BirthFlowerApp:
             # error 哨兵：结果为 error（不区分大小写）→ 标红（禁用「生成」的联动在 P3 接真值时做）。
             if field["result_var"].get().strip().lower() == "error":
                 result.configure(border_color=APP_COLORS["warning"], text_color=APP_COLORS["warning"])
-            result.grid(row=0, column=1, sticky="ew")
-            self._btn(
-                top, "✕", lambda key=field["key"]: self._delete_field(key), width=30
-            ).grid(row=0, column=2, padx=(6, 0))
+            result.grid(row=0, column=2, sticky="ew")
+            ctk.CTkOptionMenu(
+                top,
+                width=72,
+                values=("更多", "停用" if field.get("enabled", True) else "启用", "删除"),
+                command=lambda action, key=field["key"]: self._on_reference_field_more_action(key, action),
+            ).grid(row=0, column=3, padx=(6, 0))
             # 规则较长（含对照表），用多行 Textbox 编辑；KeyRelease 同步进 inst_var、FocusOut 落盘。
             inst_box = ctk.CTkTextbox(
                 card, height=78, fg_color=APP_COLORS["background"], wrap="word",
@@ -3468,35 +3578,109 @@ class BirthFlowerApp:
             row=len(self.field_defs) + 1, column=0, sticky="w", pady=(8, 0)
         )
 
-    def _next_field_key(self) -> str:
-        """生成唯一字段 key：取现有 fieldN 中最大序号 +1。
-
-        不能用「字段数量+1」当 key：删掉中间字段后会与存活字段撞 key
-        （如 field1/field3 删后再加得 field3 撞车）。最大序号+1 始终唯一。
-        """
-        max_n = 0
-        for f in self.field_defs:
-            k = str(f.get("key", ""))
-            if k.startswith("field") and k[5:].isdigit():
-                max_n = max(max_n, int(k[5:]))
-        return f"field{max_n + 1}"
-
     def _add_field(self) -> None:
         # 编号基于「现有字段数量」+1（chip 实时按位置显示 infoN），不再按点击次数累加。
-        key = self._next_field_key()
-        field = {"key": key, "name": f"info{len(self.field_defs) + 1}", "type": "文本", "instruction": ""}
-        self._ensure_field_vars(field)
-        self.field_defs.append(field)
+        product = active_product(self.config)
+        try:
+            fields, seq_max, created = create_reference_field(
+                product.reference_fields,
+                field_seq_max=product.field_seq_max,
+                scope_id=product.id,
+                reference_name=f"字段{product.field_seq_max + 1}",
+                prompt="",
+            )
+        except ValueError as exc:
+            messagebox.showerror("添加字段", str(exc))
+            return
+        self.config = with_product_reference_fields(
+            self.config,
+            reference_fields=fields,
+            field_seq_max=seq_max,
+            prompt_template=self._append_field_to_template_if_empty(created),
+            extraction_prompt=self._serialize_field_defs(),
+            background_prompt=self._current_prompt_template_text(),
+        )
+        self._load_field_defs_into_self()
         self._on_field_changed()
 
     def _delete_field(self, key: str) -> None:
-        self.field_defs = [f for f in self.field_defs if f["key"] != key]
-        self._on_field_changed()
+        self._on_reference_field_more_action(key, "删除")
 
     def _on_field_changed(self) -> None:
         # 字段增删 → 重渲染字段卡 + 落盘（字段就是提示词规则，改动要持久化）。
         self._render_fields()
         self._persist_prompts()
+
+    def _save_reference_field_name(self, key: str, var: tk.StringVar, original: str) -> None:
+        product = active_product(self.config)
+        try:
+            updated_fields = rename_reference_field(
+                product.reference_fields,
+                key,
+                var.get(),
+                scope_id=product.id,
+            )
+        except DuplicateReferenceNameError as exc:
+            var.set(original)
+            self.status_var.set("字段名称保存失败")
+            messagebox.showerror("字段名称", str(exc))
+            return
+        except ValueError as exc:
+            var.set(original)
+            self.status_var.set("字段名称保存失败")
+            messagebox.showerror("字段名称", str(exc))
+            return
+        self.config = with_product_reference_fields(
+            self.config,
+            reference_fields=updated_fields,
+            field_seq_max=product.field_seq_max,
+            prompt_template=self._current_prompt_template_text(),
+            extraction_prompt=self._serialize_field_defs(),
+            background_prompt=self._current_prompt_template_text(),
+        )
+        self.status_var.set("字段名称已保存")
+        self._load_field_defs_into_self()
+        self._render_fields()
+        save_config(self.config)
+
+    def _on_reference_field_more_action(self, key: str, action: str) -> None:
+        if action == "更多":
+            return
+        product = active_product(self.config)
+        try:
+            if action == "删除":
+                updated_fields = soft_delete_reference_field(
+                    product.reference_fields,
+                    key,
+                    templates=(self._current_prompt_template_text(),),
+                )
+            elif action in {"停用", "启用"}:
+                updated_fields = set_reference_field_enabled(
+                    product.reference_fields,
+                    key,
+                    action == "启用",
+                    scope_id=product.id,
+                )
+            else:
+                return
+        except ReferenceConflictError as exc:
+            messagebox.showerror("字段删除", f"字段仍被 {exc.reference_count} 个模板引用，不能删除。")
+            return
+        except ValueError as exc:
+            messagebox.showerror("字段", str(exc))
+            return
+        self.config = with_product_reference_fields(
+            self.config,
+            reference_fields=updated_fields,
+            field_seq_max=product.field_seq_max,
+            prompt_template=self._current_prompt_template_text(),
+            extraction_prompt=self._serialize_field_defs(),
+            background_prompt=self._current_prompt_template_text(),
+        )
+        self.status_var.set("字段已更新")
+        self._load_field_defs_into_self()
+        self._render_fields()
+        save_config(self.config)
 
     def _build_library_panel(self, parent) -> ctk.CTkFrame:
         # 「字体库 / 素材库」=资源库：归操作员配置端（见 _VIEW_CARD_ORDER 的 library）。
@@ -3516,33 +3700,50 @@ class BirthFlowerApp:
         return panel
 
     def _render_library_rows(self) -> None:
-        """按当前 active_bundle 重画库行（字体库一行、素材库一行，各带文件数与「点击上传」）。
-
-        导入后调用即就地刷新，无需重建整张卡片。下拉框里会列出文件夹下扫到的具体字体/素材。
-        """
-        frame = getattr(self, "_library_rows_frame", None)
-        if frame is None:
+        """按当前 active_bundle 逐库渲染；同一份数据挂到配置卡和图层卡下方。"""
+        frames = [
+            frame for frame in (
+                getattr(self, "_library_rows_frame", None),
+                getattr(self, "_production_library_rows_frame", None),
+            )
+            if frame is not None
+        ]
+        if not frames:
             return
-        for child in frame.winfo_children():
-            child.destroy()
         groups = (
             ("font", "字体库", self.active_bundle.font_libraries),
             ("image", "素材库", self.active_bundle.image_libraries),
         )
-        for row, (kind, prefix, libraries) in enumerate(groups):
-            count = sum(len(getattr(lib, "entries", ())) for lib in libraries)
-            names = "、".join(
-                getattr(lib, "name", "") or prefix for lib in libraries
-            ) or prefix
-            line = ctk.CTkFrame(frame, fg_color="transparent")
-            line.grid(row=row, column=0, sticky="ew", pady=2)
-            line.columnconfigure(0, weight=1)
-            ctk.CTkLabel(line, text=f"{prefix} · {names}（{count} 个）", anchor="w").grid(
-                row=0, column=0, sticky="w"
-            )
-            self._btn(
-                line, "点击上传", lambda k=kind: self.upload_into_library(k), width=80
-            ).grid(row=0, column=1, padx=(6, 0))
+        for frame in frames:
+            for child in frame.winfo_children():
+                child.destroy()
+            row = 0
+            for kind, prefix, libraries in groups:
+                ctk.CTkLabel(
+                    frame, text=prefix, anchor="w",
+                    text_color=APP_COLORS["muted"], font=ctk.CTkFont(size=11, weight="bold"),
+                ).grid(row=row, column=0, sticky="w", pady=(6 if row else 0, 2))
+                row += 1
+                if not libraries:
+                    ctk.CTkLabel(frame, text=f"暂无{prefix}", anchor="w", text_color=APP_COLORS["muted"]).grid(
+                        row=row, column=0, sticky="w", pady=1
+                    )
+                    row += 1
+                for lib in libraries:
+                    line = ctk.CTkFrame(frame, fg_color="transparent")
+                    line.grid(row=row, column=0, sticky="ew", pady=1)
+                    line.columnconfigure(0, weight=1)
+                    name = Path(getattr(lib, "root", "")).name or getattr(lib, "name", "") or prefix
+                    count = len(getattr(lib, "entries", ()))
+                    ctk.CTkLabel(line, text=f"📁 {name}", anchor="w").grid(row=0, column=0, sticky="w")
+                    ctk.CTkLabel(line, text=f"{count} 个", anchor="e", text_color=APP_COLORS["muted"]).grid(
+                        row=0, column=1, sticky="e", padx=(8, 0)
+                    )
+                    row += 1
+                self._btn(frame, f"+ 添加{prefix}", lambda k=kind: self.upload_into_library(k), width=110).grid(
+                    row=row, column=0, sticky="w", pady=(3, 4)
+                )
+                row += 1
 
     def upload_into_library(self, kind: str) -> None:
         """卡片「点击上传」入口：选一个文件夹（库=文件夹），累加并入当前产品的对应库。
@@ -3653,16 +3854,142 @@ class BirthFlowerApp:
             border_width=1, border_color=APP_COLORS["border"],
         )
         self.background_prompt_text.grid(row=0, column=0, sticky="ew")
-        saved = active_product(self.config).background_prompt
+        saved = self._current_prompt_template_text()
         if saved:
             self.background_prompt_text.insert("1.0", saved)
         self.background_prompt_text.bind("<FocusOut>", lambda _e: self._persist_prompts())
+        self.background_prompt_text.bind("<KeyRelease>", self._on_prompt_template_keyrelease)
+        self.background_prompt_text.bind("<Up>", self._on_prompt_template_up)
+        self.background_prompt_text.bind("<Down>", self._on_prompt_template_down)
+        self.background_prompt_text.bind("<Return>", self._on_prompt_template_return)
+        self.background_prompt_text.bind("<Escape>", self._hide_slash_popup)
         return panel
+
+    def _current_prompt_template_text(self) -> str:
+        box = self.background_prompt_text
+        if box is not None:
+            return box.get("1.0", "end-1c").strip()
+        product = active_product(self.config)
+        return product.prompt_template or default_prompt_template(product.reference_fields, product.background_prompt)
+
+    def _append_field_to_template_if_empty(self, field: ReferenceField) -> str:
+        current = self._current_prompt_template_text()
+        if current:
+            return current
+        return field_token(field.id)
+
+    def _prompt_reference_candidates(self, query: str = "") -> list[dict[str, str]]:
+        product = active_product(self.config)
+        query_norm = query.strip().casefold()
+        candidates = [
+            {"label": "/订单信息", "insert": system_token("order_information"), "group": "系统数据源"}
+        ]
+        for field in active_reference_fields(product.reference_fields):
+            label = f"/#{field.sequence_number} {field.reference_name}"
+            if query_norm and query_norm not in label.casefold() and query_norm not in field.reference_name.casefold():
+                continue
+            candidates.append({"label": label, "insert": field_token(field.id), "group": "自定义字段"})
+        if query_norm:
+            candidates = [
+                item for item in candidates
+                if query_norm in item["label"].casefold() or item["group"] == "系统数据源" and query_norm in "订单信息"
+            ]
+        return candidates
+
+    def _on_prompt_template_keyrelease(self, event) -> None:
+        if event.keysym in {"Up", "Down", "Return", "Escape"}:
+            return
+        self._persist_prompts()
+        self._update_slash_popup()
+
+    def _slash_query_before_cursor(self) -> tuple[str, str] | None:
+        box = self.background_prompt_text
+        if box is None:
+            return None
+        line = box.get("insert linestart", "insert")
+        slash_at = line.rfind("/")
+        if slash_at < 0:
+            return None
+        query = line[slash_at + 1:]
+        if any(ch.isspace() for ch in query):
+            return None
+        start = f"insert - {len(query) + 1}c"
+        return start, query
+
+    def _update_slash_popup(self) -> None:
+        found = self._slash_query_before_cursor()
+        if found is None:
+            self._hide_slash_popup()
+            return
+        start, query = found
+        self._slash_start_index = start
+        self._slash_candidates = self._prompt_reference_candidates(query)
+        self._slash_selected_index = min(self._slash_selected_index, max(len(self._slash_candidates) - 1, 0))
+        self._render_slash_popup()
+
+    def _render_slash_popup(self) -> None:
+        box = self.background_prompt_text
+        if box is None:
+            return
+        parent = box.master
+        if self._slash_popup is not None:
+            self._slash_popup.destroy()
+        self._slash_popup = ctk.CTkFrame(parent, fg_color=APP_COLORS["panel"], border_width=1, border_color=APP_COLORS["border"])
+        self._slash_popup.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        if not self._slash_candidates:
+            ctk.CTkLabel(self._slash_popup, text="无结果", text_color=APP_COLORS["muted"]).grid(row=0, column=0, sticky="w", padx=8, pady=6)
+            return
+        for index, item in enumerate(self._slash_candidates[:8]):
+            selected = index == self._slash_selected_index
+            btn = self._btn(
+                self._slash_popup,
+                item["label"],
+                lambda i=index: self._insert_slash_candidate(i),
+                primary=selected,
+                width=220,
+            )
+            btn.grid(row=index, column=0, sticky="ew", padx=4, pady=2)
+
+    def _hide_slash_popup(self, _event=None):
+        if self._slash_popup is not None:
+            self._slash_popup.destroy()
+            self._slash_popup = None
+        return "break"
+
+    def _on_prompt_template_up(self, _event=None):
+        if self._slash_popup is None:
+            return None
+        self._slash_selected_index = max(0, self._slash_selected_index - 1)
+        self._render_slash_popup()
+        return "break"
+
+    def _on_prompt_template_down(self, _event=None):
+        if self._slash_popup is None:
+            return None
+        self._slash_selected_index = min(len(self._slash_candidates) - 1, self._slash_selected_index + 1)
+        self._render_slash_popup()
+        return "break"
+
+    def _on_prompt_template_return(self, _event=None):
+        if self._slash_popup is None:
+            return None
+        self._insert_slash_candidate(self._slash_selected_index)
+        return "break"
+
+    def _insert_slash_candidate(self, index: int) -> None:
+        box = self.background_prompt_text
+        if box is None or not self._slash_candidates:
+            return
+        candidate = self._slash_candidates[max(0, min(index, len(self._slash_candidates) - 1))]
+        box.delete(self._slash_start_index, "insert")
+        box.insert(self._slash_start_index, candidate["insert"])
+        self._hide_slash_popup()
+        self._persist_prompts()
 
     def _build_generate_prompt_panel(self, parent) -> ctk.CTkFrame:
         # 解析可观测②：点「解析」后随本次操作自动刷新（显示实际发出的提示词全文，含 provider/model）；
         # 「预览」按钮仍可在解析前按当前字段拼一版预览。本卡只在管理员端显示（见 _VIEW_CARD_ORDER）。
-        panel, body = self._ctk_card(parent, "本次提示词（实际发出）", badge="解析可观测②")
+        panel, body = self._ctk_card(parent, "本次提示词", badge="解析可观测②")
         body.columnconfigure(0, weight=1)
         self._btn(body, "预览", self._show_generated_prompt, primary=True).grid(
             row=0, column=0, sticky="w"
@@ -3691,6 +4018,58 @@ class BirthFlowerApp:
             lines.append(prefix + inst)
         return "\n".join(lines)
 
+    @staticmethod
+    def _field_dict_from_reference(field: ReferenceField) -> dict:
+        return {
+            "id": field.id,
+            "key": field.id,
+            "sequence_number": field.sequence_number,
+            "name": field.reference_name,
+            "type": field.field_type,
+            "instruction": field.prompt,
+            "enabled": field.enabled,
+            "deleted_at": field.deleted_at,
+            "sort_order": field.sort_order,
+            "created_at": field.created_at,
+            "updated_at": field.updated_at,
+            "legacy_key": field.legacy_key,
+        }
+
+    @staticmethod
+    def _legacy_json_from_reference_fields(fields: tuple[ReferenceField, ...]) -> str:
+        items = [
+            {
+                "key": field.legacy_key or f"field{field.sequence_number}",
+                "id": field.id,
+                "name": field.reference_name,
+                "type": field.field_type,
+                "instruction": field.prompt,
+                "sequence_number": field.sequence_number,
+                "enabled": field.enabled,
+                "deleted_at": field.deleted_at,
+            }
+            for field in fields
+        ]
+        return json.dumps(items, ensure_ascii=False)
+
+    def _reference_fields_from_field_defs(self) -> tuple[ReferenceField, ...]:
+        product = active_product(self.config)
+        existing_by_id = {field.id: field for field in product.reference_fields}
+        fields: list[ReferenceField] = []
+        for item in self.field_defs:
+            field_id = str(item.get("id") or item.get("key") or "")
+            existing = existing_by_id.get(field_id)
+            if existing is None:
+                continue
+            prompt = item["inst_var"].get() if "inst_var" in item else str(item.get("instruction", ""))
+            field_type = item["type_var"].get() if "type_var" in item else str(item.get("type", "文本"))
+            fields.append(update_reference_field_prompt((existing,), existing.id, prompt, scope_id=product.id)[0])
+            fields[-1] = dataclasses.replace(fields[-1], field_type=field_type)
+        # 保留软删除字段，避免历史序号和引用快照丢失。
+        known = {field.id for field in fields}
+        fields.extend(field for field in product.reference_fields if field.id not in known)
+        return tuple(sorted(fields, key=lambda field: (field.sort_order, field.sequence_number)))
+
     def _serialize_field_defs(self) -> str:
         """把字段定义序列化成 JSON 存进 product.extraction_prompt（admin 编辑后持久化）。"""
         items = []
@@ -3705,40 +4084,43 @@ class BirthFlowerApp:
 
     def _load_field_defs_into_self(self) -> None:
         """从当前产品配置（extraction_prompt 存的 JSON）载入字段；无/非法 JSON → 用默认完整规则。"""
-        raw = (active_product(self.config).extraction_prompt or "").strip()
-        defs: list[dict] | None = None
-        if raw:
-            try:
-                data = json.loads(raw)
-            except (ValueError, TypeError):
-                data = None
-            if isinstance(data, list):
-                parsed: list[dict] = []
-                for i, item in enumerate(data):
-                    if not isinstance(item, dict):
-                        continue
-                    parsed.append({
-                        "key": str(item.get("key") or f"field{i + 1}"),
-                        "name": str(item.get("name", f"字段{i + 1}")),
-                        "type": str(item.get("type", "文本")),
-                        "instruction": str(item.get("instruction", "")),
-                    })
-                if parsed:
-                    defs = parsed
-        self.field_defs = defs if defs is not None else _default_field_defs()
-        self.field_seq = len(self.field_defs)
+        product = active_product(self.config)
+        reference_fields = product.reference_fields
+        if not reference_fields:
+            raw = product.extraction_prompt or json.dumps(_default_field_defs(), ensure_ascii=False)
+            reference_fields = reference_fields_from_legacy(raw, scope_id=product.id)
+            prompt_template = product.prompt_template or default_prompt_template(reference_fields, product.background_prompt)
+            self.config = with_product_reference_fields(
+                self.config,
+                reference_fields=reference_fields,
+                field_seq_max=max((field.sequence_number for field in reference_fields), default=0),
+                prompt_template=prompt_template,
+                extraction_prompt=product.extraction_prompt or self._legacy_json_from_reference_fields(reference_fields),
+                background_prompt=product.background_prompt,
+            )
+            product = active_product(self.config)
+        self.field_defs = [self._field_dict_from_reference(field) for field in product.reference_fields if not field.deleted_at]
+        self.field_seq = product.field_seq_max
 
     def _persist_prompts(self) -> None:
         """把「字段（提取规则）+ 背景提示词」存回当前产品配置并落盘（失焦/增删/切产品时触发）。"""
-        extraction = self._serialize_field_defs()
-        background = ""
-        if self.background_prompt_text is not None:
-            background = self.background_prompt_text.get("1.0", "end-1c").strip()
+        reference_fields = self._reference_fields_from_field_defs()
+        extraction = self._legacy_json_from_reference_fields(reference_fields)
+        prompt_template = self._current_prompt_template_text()
         product = active_product(self.config)
-        if extraction == product.extraction_prompt and background == product.background_prompt:
+        if (
+            extraction == product.extraction_prompt
+            and prompt_template == product.prompt_template
+            and reference_fields == product.reference_fields
+        ):
             return  # 无变化不写盘
-        self.config = with_product_prompts(
-            self.config, extraction_prompt=extraction, background_prompt=background
+        self.config = with_product_reference_fields(
+            self.config,
+            reference_fields=reference_fields,
+            field_seq_max=product.field_seq_max,
+            prompt_template=prompt_template,
+            extraction_prompt=extraction,
+            background_prompt=prompt_template,
         )
         save_config(self.config)
 
@@ -3753,17 +4135,35 @@ class BirthFlowerApp:
         if box is None:
             return
         box.delete("1.0", "end")
-        if active_product(self.config).background_prompt:
-            box.insert("1.0", active_product(self.config).background_prompt)
+        prompt_template = self._current_prompt_template_text()
+        if prompt_template:
+            box.insert("1.0", prompt_template)
 
     def _show_generated_prompt(self) -> None:
         """预览真正会发给 API 的内容：字段规则套进脚手架的系统提示词 + 用户内容（订单文本）。"""
-        background = ""
-        if self.background_prompt_text is not None:
-            background = self.background_prompt_text.get("1.0", "end-1c").strip()
-        system_prompt = build_orders_system_prompt(self._assemble_field_rules(), background)
         remark = self._current_remark_text().strip()
-        text = f"{system_prompt}\n\n[user] 订单信息\n{remark or '（未填写）'}"
+        product = active_product(self.config)
+        template = self._current_prompt_template_text()
+        try:
+            resolved = resolve_prompt_template(
+                template,
+                scope_id=product.id,
+                fields=product.reference_fields,
+                order_information=remark,
+            )
+            text = (
+                "[template]\n"
+                f"{render_template_view(template, fields=product.reference_fields, scope_id=product.id) or '（空）'}\n\n"
+                "[final]\n"
+                f"{resolved.final_prompt or '（空）'}"
+            )
+        except PromptReferenceError as exc:
+            text = (
+                "[template]\n"
+                f"{render_template_view(template, fields=product.reference_fields, scope_id=product.id) or '（空）'}\n\n"
+                "[error]\n"
+                f"{exc}"
+            )
         box = self.generated_prompt_text
         if box is not None:
             box.configure(state="normal")
@@ -4179,6 +4579,7 @@ class BirthFlowerApp:
 
     def _save_settings_window(self, window: tk.Toplevel) -> None:
         profile = self._settings_ai_profile()
+        layout_defaults = self._active_layout_defaults()
         # 用 replace 而非整体重建，避免清空 products / active_product_id / 产品列收展状态。
         self.config = dataclasses.replace(
             self.config,
@@ -4189,8 +4590,8 @@ class BirthFlowerApp:
             png_background=self.png_background_var.get(),
             ai_profiles=(profile,),
             active_ai_profile=profile.name,
-            layout_defaults=self._active_layout_defaults(),
         )
+        self.config = with_product_defaults(self.config, layout_defaults)
         # 增量5：把设置窗口里编辑的产品库目录列表写回当前产品（列表为空则回落单目录入口）。
         image_dirs = self._library_listbox_dirs(self.settings_image_listbox, self.flower_dir_var)
         font_dirs = self._library_listbox_dirs(self.settings_font_listbox, self.font_source_var)
@@ -4364,6 +4765,14 @@ class BirthFlowerApp:
         for key in self.layout_vars:
             self.layout_vars[key].set(str(getattr(layout, key)))
 
+    def _apply_layout_defaults(self, layout: EngravingLayout) -> None:
+        """把产品级默认几何灌进当前 UI 变量；不覆盖已有图层独立几何。"""
+        self._set_layout_vars(layout)
+        self.font_bold_var.set(bool(layout.bold))
+        self.font_underline_var.set(bool(layout.underline))
+        self.bold_strength_var.set(str(layout.bold_strength))
+        self.letter_spacing_var.set(str(layout.letter_spacing))
+
     def _active_layout_defaults(self) -> EngravingLayout:
         """全局默认布局：几何取自 layout_vars，字体样式取自独立样式变量。两条保存路径与建层共用，
         确保 layout_from_values（仅几何）不会把字体样式默认丢掉。"""
@@ -4383,6 +4792,56 @@ class BirthFlowerApp:
             bold_strength=strength,
             letter_spacing=spacing,
         )
+
+    def _clear_document_history(self) -> None:
+        history = getattr(self, "history_manager", None)
+        if history is not None:
+            history.clear()
+
+    def _push_document_history(self) -> None:
+        history = getattr(self, "history_manager", None)
+        if history is not None:
+            history.push(self.document)
+
+    def _restore_document_snapshot(self, snapshot: Document) -> None:
+        self.document = snapshot
+        self.selected_preview_item = self.document.selected_layer_id
+        selected = self.document.selected_layer()
+        if selected is not None:
+            self._sync_layer_properties(selected)
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def _focus_is_text_input(self) -> bool:
+        focus = self.root.focus_get()
+        if focus is None:
+            return False
+        try:
+            return focus.winfo_class() in {"Entry", "Text", "TEntry"} or isinstance(focus, (tk.Entry, tk.Text, ttk.Entry))
+        except tk.TclError:
+            return False
+
+    def _on_undo_key(self, _event=None):
+        if self._focus_is_text_input():
+            return None
+        snapshot = self.history_manager.undo(self.document)
+        if snapshot is None:
+            self.status_var.set("没有可撤销的画布编辑")
+            return "break"
+        self._restore_document_snapshot(snapshot)
+        self.status_var.set("已撤销画布编辑")
+        return "break"
+
+    def _on_redo_key(self, _event=None):
+        if self._focus_is_text_input():
+            return None
+        snapshot = self.history_manager.redo(self.document)
+        if snapshot is None:
+            self.status_var.set("没有可重做的画布编辑")
+            return "break"
+        self._restore_document_snapshot(snapshot)
+        self.status_var.set("已重做画布编辑")
+        return "break"
 
     def test_ai_connection(self) -> None:
         profile = self._settings_ai_profile() if hasattr(self, "ai_provider_var") else active_ai_profile(self.config)
@@ -4411,13 +4870,39 @@ class BirthFlowerApp:
 
         run_background(self.root, work, on_success, on_error)
 
-    def _current_ai_config(self) -> AIParseConfig:
+    def _current_ai_config(self, order_information: str | None = None) -> AIParseConfig:
         config = build_ai_parse_config(active_ai_profile(self.config), self.session_api_key_var.get())
-        # 提示词规则全部来自前台：system_prompt = 字段区拼出的提取规则；background_prompt = 背景提示词框。
-        # gpt_parser.build_orders_system_prompt 把规则套进结构脚手架，本地不再写死任何业务规则。
-        rules = self._assemble_field_rules()
-        background = active_product(self.config).background_prompt or ""
-        return dataclasses.replace(config, system_prompt=rules, background_prompt=background)
+        product = active_product(self.config)
+        template = self._current_prompt_template_text()
+        remark = self._current_remark_text() if order_information is None else order_information
+        resolved = resolve_prompt_template(
+            template,
+            scope_id=product.id,
+            fields=product.reference_fields,
+            order_information=remark,
+        )
+        refs = find_template_references(template)
+        user_content = "" if "order_information" in refs.source_keys else remark
+        snapshot = tuple(
+            {
+                "id": field.id,
+                "scope_id": field.scope_id,
+                "sequence_number": str(field.sequence_number),
+                "reference_name": field.reference_name,
+                "prompt": field.prompt,
+                "enabled": str(field.enabled),
+                "updated_at": field.updated_at,
+                "deleted_at": field.deleted_at,
+            }
+            for field in resolved.field_snapshot
+        )
+        return dataclasses.replace(
+            config,
+            system_prompt=resolved.final_prompt,
+            background_prompt="",
+            user_content=user_content,
+            reference_snapshot=snapshot,
+        )
 
     def _settings_ai_profile(self) -> AIProfile:
         return build_ai_profile_from_settings(
@@ -4592,7 +5077,13 @@ class BirthFlowerApp:
 
     def parse_remark(self) -> None:
         remark = self._current_remark_text()
-        ai_config = self._current_ai_config()
+        try:
+            ai_config = self._current_ai_config(remark)
+        except PromptReferenceError as exc:
+            self.status_var.set("提示词引用无效")
+            self._show_generated_prompt()
+            messagebox.showerror("提示词引用无效", str(exc))
+            return
         self.status_var.set("解析中...")
         # 解析可观测②：建空壳 trace，解析路径就地写回「实际发出的提示词全文」，回主线程后刷管理员端展示。
         trace = ParsePromptTrace()
@@ -4899,6 +5390,7 @@ class BirthFlowerApp:
         self.selected_glyph_position = None
         self._add_selected_flower_to_canvas()
         self._add_text_layer_from_fields()
+        self._clear_document_history()
 
     def _parse_result_can_create_layers(self, result) -> bool:
         warnings = getattr(result, "warnings", []) or []
@@ -5493,27 +5985,26 @@ class BirthFlowerApp:
 
 
 
-    def _layer_from_listbox_event(self, event) -> object | None:
-        listbox = self.layers_listbox
-        if listbox is None:
+    def _layer_from_tree_event(self, event) -> object | None:
+        tree = self.layers_tree
+        if tree is None:
             return None
-        index = listbox.nearest(event.y)
-        if index < 0:
+        row_id = tree.identify_row(event.y)
+        if not row_id:
             return None
-        layer_index = len(self.document.layers) - 1 - index
-        if not 0 <= layer_index < len(self.document.layers):
+        layer = self.document.layer_by_id(row_id)
+        if layer is None:
             return None
-        layer = self.document.layers[layer_index]
         self.document.selected_layer_id = layer.id
         self.selected_preview_item = layer.id
-        listbox.selection_clear(0, "end")
-        listbox.selection_set(index)
+        tree.selection_set(layer.id)
+        tree.focus(layer.id)
         self._sync_layer_properties(layer)
         return layer
 
     def _show_layer_context_menu(self, event) -> None:
         """图层列表右键菜单；文本图层暂不进入素材编辑，后续单独做文字属性编辑。"""
-        layer = self._layer_from_listbox_event(event)
+        layer = self._layer_from_tree_event(event)
         if layer is None:
             return
         menu = tk.Menu(self.root, tearoff=False)
@@ -5543,6 +6034,7 @@ class BirthFlowerApp:
             layout = layout_from_values(self.layout_vars)
         except ValueError:
             layout = EngravingLayout()
+        self._update_preview_canvas_size_status(layout)
         scale, offset_x, offset_y = self._preview_transform(layout)
         doc_x = (event.x - offset_x) / scale
         doc_y = (event.y - offset_y) / scale
@@ -5602,7 +6094,7 @@ class BirthFlowerApp:
         return menu
 
     def _on_layer_list_double_click(self, event) -> None:
-        layer = self._layer_from_listbox_event(event)
+        layer = self._layer_from_tree_event(event)
         if isinstance(layer, AnchoredHeartLayer):
             self._open_heart_anchor_dialog(layer)
         elif isinstance(layer, ImageLayer):
@@ -5800,6 +6292,9 @@ class BirthFlowerApp:
         反复销毁 CTkOptionMenu 会在 customtkinter 的 AppearanceModeTracker 里留下悬挂引用，
         下次创建下拉时崩溃（'DropdownMenu' has no attribute 'master'），故必须增量。
         """
+        if self.layers_tree is not None:
+            self._render_layers_tree()
+            return
         box = self.layers_rows_box
         if box is None:
             return
@@ -5833,6 +6328,64 @@ class BirthFlowerApp:
             self._update_layer_row(row, layer, lid == selected_id)
             row["card"].grid_configure(row=ui_row, column=0)
         self._layer_row_widgets = [(self._layer_rows[lid]["card"], lid) for lid in order]
+
+    def _render_layers_tree(self) -> None:
+        tree = self.layers_tree
+        if tree is None:
+            return
+        tree.delete(*tree.get_children(""))
+
+        def insert_layers(parent: str, layers: list) -> None:
+            for layer in reversed(layers):
+                tags = []
+                pinnable, pinned = self._layer_pin_state(layer)
+                if not layer.visible:
+                    tags.append("hidden")
+                if layer.locked:
+                    tags.append("locked")
+                if pinned:
+                    tags.append("pinned")
+                tree.insert(
+                    parent,
+                    "end",
+                    iid=layer.id,
+                    text=self._layer_tree_name(layer),
+                    values=(
+                        "👁" if layer.visible else "🚫",
+                        "📌" if pinned else ("📍" if pinnable else "·"),
+                        self._layer_type_label(layer),
+                        "⊘" if layer.locked else "🗑",
+                    ),
+                    tags=tuple(tags),
+                    open=not bool(getattr(layer, "collapsed", False)),
+                )
+                if isinstance(layer, GroupLayer):
+                    insert_layers(layer.id, layer.children)
+
+        insert_layers("", self.document.layers)
+        selected = self.document.selected_layer()
+        if selected is not None and tree.exists(selected.id):
+            tree.selection_set(selected.id)
+            tree.focus(selected.id)
+            self.layer_detail_var.set(f"已选：{selected.name} ({selected.type})")
+            self._sync_layer_properties(selected)
+        else:
+            self.layer_detail_var.set("未选择图层")
+
+    def _layer_type_label(self, layer) -> str:
+        if isinstance(layer, AnchoredHeartLayer):
+            return "爱心"
+        if isinstance(layer, TextLayer):
+            return "文字"
+        if isinstance(layer, GroupLayer):
+            return "图组"
+        return "素材"
+
+    def _layer_tree_name(self, layer) -> str:
+        name = str(getattr(layer, "name", "") or self._layer_main_text(layer) or "Layer")
+        _pinnable, pinned = self._layer_pin_state(layer)
+        suffix = "  [已锁定]" if pinned else ""
+        return f"{self._layer_icon_spec(layer)[0]} {name}{suffix}"
 
     def _build_layer_row(self, box, layer) -> dict:
         """建一行图层卡（**单行·灰字缩写**）：拖柄 + 类型图标 + 状态 + 提取内容 + 右侧灰字库缩写。
@@ -5913,6 +6466,98 @@ class BirthFlowerApp:
         self._redraw_preview()
         self._schedule_render_layers()
 
+    def _on_layers_tree_select(self, _event=None) -> None:
+        tree = self.layers_tree
+        if tree is None:
+            return
+        selection = tree.selection()
+        if not selection:
+            return
+        layer = self.document.layer_by_id(selection[0])
+        if layer is None:
+            return
+        self.document.selected_layer_id = layer.id
+        self.selected_preview_item = layer.id
+        self._sync_layer_properties(layer)
+        self._redraw_preview()
+
+    def _on_layers_tree_button_press(self, event):
+        tree = self.layers_tree
+        if tree is None:
+            return None
+        row_id = tree.identify_row(event.y)
+        column = tree.identify_column(event.x)
+        self._tree_drag_source_id = row_id or None
+        self._tree_drag_started = False
+        if not row_id:
+            return None
+        layer = self.document.layer_by_id(row_id)
+        if layer is None:
+            return None
+        if column == "#1":
+            self.document.selected_layer_id = layer.id
+            self._toggle_selected_layer_visible()
+            return "break"
+        if column == "#2":
+            self._toggle_layer_initial_pin(layer)
+            return "break"
+        if column == "#4":
+            self.document.selected_layer_id = layer.id
+            self._delete_selected_layer()
+            return "break"
+        return None
+
+    def _on_layers_tree_drag_motion(self, _event):
+        if self._tree_drag_source_id:
+            self._tree_drag_started = True
+
+    def _on_layers_tree_button_release(self, event):
+        tree = self.layers_tree
+        source_id = self._tree_drag_source_id
+        started = self._tree_drag_started
+        self._tree_drag_source_id = None
+        self._tree_drag_started = False
+        if tree is None or not source_id or not started:
+            return None
+        target_id = tree.identify_row(event.y)
+        if not target_id or target_id == source_id:
+            return None
+        self._reorder_tree_layer_to_target(source_id, target_id)
+        return "break"
+
+    def _reorder_tree_layer_to_target(self, source_id: str, target_id: str) -> None:
+        source_container, source_layer = self.document.container_of(source_id)
+        target_container, target_layer = self.document.container_of(target_id)
+        if source_container is None or target_container is None or source_layer is None or target_layer is None:
+            return
+        if source_container is not target_container:
+            self.status_var.set("暂不支持跨图组拖动")
+            return
+        old_index = source_container.index(source_layer)
+        new_index = target_container.index(target_layer)
+        if old_index == new_index:
+            return
+        self._push_document_history()
+        source_container.pop(old_index)
+        if new_index > old_index:
+            new_index -= 1
+        source_container.insert(new_index, source_layer)
+        self.document.normalize_z_indexes()
+        self.document.selected_layer_id = source_layer.id
+        self.status_var.set("图层顺序已更新")
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
+    def _show_layers_tree_context_menu(self, event):
+        tree = self.layers_tree
+        if tree is None:
+            return
+        row_id = tree.identify_row(event.y)
+        layer = self.document.layer_by_id(row_id)
+        if layer is None:
+            return
+        self._layer_menu(layer, event)
+
     def _on_layer_image_lib_changed(self, layer, label: str) -> None:
         self.document.selected_layer_id = layer.id
         self._with_programmatic_update(lambda: self.image_library_var.set(label))
@@ -5927,6 +6572,7 @@ class BirthFlowerApp:
             if not asset.path.is_file():
                 messagebox.showerror("素材错误", f"素材文件不存在：{asset.path}")
             else:
+                self._push_document_history()
                 material_key = asset.asset_key or asset.path.stem
                 found = self.active_bundle.resolve_material(material_key)
                 layer.path = asset.path
@@ -5936,6 +6582,8 @@ class BirthFlowerApp:
                 layer.material_name = asset.display_name or asset.name
                 if found:
                     layer.library_id = found[0]
+                layer.production = None
+                self._apply_effective_production_to_layer(layer)
                 self.status_var.set(f"素材 → {layer.name}")
         self._redraw_preview()
         self._schedule_render_layers()
@@ -5951,11 +6599,15 @@ class BirthFlowerApp:
         self.selected_preview_item = layer.id
         asset = self.font_label_map.get(label)
         if asset is not None and isinstance(layer, TextLayer):
+            self._push_document_history()
             layer.font_path = asset.path
             font_found = self.active_bundle.resolve_font_by_tags(index=asset.index)
             if font_found:
                 layer.font_library_id = font_found[0]
                 layer.font_key = font_found[1].key
+            if self._pin_for(layer) is not None:
+                layer.production = None
+                self._apply_effective_production_to_layer(layer)
             self._apply_auto_glyph_rules_to_layer(layer)
             self.status_var.set(f"字体 → {asset.name}")
         self._redraw_preview()
@@ -5967,6 +6619,7 @@ class BirthFlowerApp:
         except (ValueError, TypeError):
             return
         if isinstance(layer, TextLayer) and size != layer.font_size:
+            self._push_document_history()
             layer.font_size = size
             self.status_var.set(f"字号 → {size}")
             self._redraw_preview()
@@ -6059,6 +6712,7 @@ class BirthFlowerApp:
         insert_idx = max(0, min(insert_idx, len(order_ids) - 1))
         if insert_idx == old_pos:
             return  # 落回原位，免重排
+        self._push_document_history()
         order_ids.pop(old_pos)
         order_ids.insert(insert_idx, drag_id)
         layer_by_id = {doc_layer.id: doc_layer for doc_layer in self.document.layers}
@@ -6130,6 +6784,7 @@ class BirthFlowerApp:
 
     def _set_layer_align(self, layer, key: str) -> None:
         if isinstance(layer, TextLayer):
+            self._push_document_history()
             layer.align = key
             self.status_var.set(f"对齐 → {key}")
             self._redraw_preview()
@@ -6232,37 +6887,9 @@ class BirthFlowerApp:
     def _refresh_layers_panel(self) -> None:
         """刷新右下角图层面板，显示名称、类型、显隐和锁定状态。"""
         self._schedule_render_layers()  # 真实图层行：延后到 idle 渲染（去重；不在同步流程里现场建控件）
-        listbox = self.layers_listbox
-        if listbox is None:
-            return
-        listbox.delete(0, "end")
-        for layer in reversed(self.document.layers):
-            visible = "👁" if layer.visible else "🚫"
-            locked = "🔒" if layer.locked else "🔓"
-            listbox.insert("end", f"{visible} {locked} {layer.name} [{layer.type}]")
-        selected = self.document.selected_layer()
-        if selected is not None:
-            panel_index = len(self.document.layers) - 1 - self.document.layers.index(selected)
-            listbox.selection_set(panel_index)
-            self.layer_detail_var.set(f"已选：{selected.name} ({selected.type})")
-            self._sync_layer_properties(selected)
-        else:
-            self.layer_detail_var.set("未选择图层")
 
     def _on_layer_list_select(self, _event=None) -> None:
-        listbox = self.layers_listbox
-        if listbox is None:
-            return
-        selection = listbox.curselection()
-        if not selection:
-            return
-        layer_index = len(self.document.layers) - 1 - selection[0]
-        if 0 <= layer_index < len(self.document.layers):
-            layer = self.document.layers[layer_index]
-            self.document.selected_layer_id = layer.id
-            self.selected_preview_item = layer.id
-            self._sync_layer_properties(layer)
-            self._redraw_preview()
+        self._on_layers_tree_select(_event)
 
     def _sync_layer_properties(self, layer) -> None:
         if isinstance(layer, TextLayer):
@@ -6285,7 +6912,7 @@ class BirthFlowerApp:
         try:
             layout = layout_from_values(self.layout_vars)
         except ValueError:
-            layout = self.config.layout_defaults
+            layout = active_product(self.config).defaults
         if isinstance(layer, TextLayer):
             return ProductionParams(
                 x=layout.text_x, y=layout.text_y, width=layout.text_width,
@@ -6295,6 +6922,36 @@ class BirthFlowerApp:
             x=layout.flower_x, y=layout.flower_y,
             width=layout.flower_width, height=layout.flower_height,
         )
+
+    def _pin_key(self, layer) -> str | None:
+        if isinstance(layer, AnchoredHeartLayer):
+            return None
+        if isinstance(layer, TextLayer):
+            return "text:0"
+        material_key = str(getattr(layer, "material_key", "") or "").strip()
+        library_id = str(getattr(layer, "library_id", "") or "").strip()
+        if library_id and material_key:
+            return f"image:{library_id}:{material_key}"
+        path = getattr(layer, "path", None)
+        if path:
+            return f"path:{Path(path).name}"
+        return None
+
+    def _pin_for(self, layer) -> ProductionParams | None:
+        key = self._pin_key(layer)
+        if not key:
+            return None
+        for pin in active_product(self.config).layer_pins:
+            if pin.key == key:
+                return pin.production
+        return None
+
+    def _layer_pin_state(self, layer) -> tuple[bool, bool]:
+        """返回 (可锁定, 已锁定)。AnchoredHeartLayer 的几何派生自文字，不独立 pin。"""
+        key = self._pin_key(layer)
+        if not key:
+            return False, False
+        return True, any(pin.key == key for pin in active_product(self.config).layer_pins)
 
     def _layer_library_entry_defaults(self, layer) -> tuple[ProductionParams | None, ProductionParams | None]:
         """按图层挂的库/素材 key 反查（库默认, 素材默认）生产参数；查不到返回 (None, None)。"""
@@ -6311,9 +6968,71 @@ class BirthFlowerApp:
         return library.defaults, (entry.defaults if entry is not None else None)
 
     def _layer_effective_production(self, layer) -> ProductionParams:
-        """§5 回落链：产品默认 → 库默认 → 素材默认 → 图层 override（低→高优先级）。"""
+        """§5 回落链：产品默认 → 库默认 → 素材默认 → pin → 图层 override（低→高）。"""
         library_defaults, entry_defaults = self._layer_library_entry_defaults(layer)
-        return resolve_chain(self._slot_defaults(layer), library_defaults, entry_defaults, layer.production)
+        return resolve_chain(self._slot_defaults(layer), library_defaults, entry_defaults, self._pin_for(layer), layer.production)
+
+    @staticmethod
+    def _valid_pin_snapshot(production: ProductionParams) -> bool:
+        values = (production.x, production.y, production.width, production.height, production.rotation)
+        return (
+            all(value is not None and math.isfinite(float(value)) for value in values)
+            and float(production.width or 0) > 0
+            and float(production.height or 0) > 0
+            and (production.font_size is None or int(production.font_size) > 0)
+        )
+
+    def _snapshot_layer_production(self, layer) -> ProductionParams | None:
+        font_size = int(layer.font_size) if isinstance(layer, TextLayer) else None
+        snapshot = ProductionParams(
+            x=float(layer.x),
+            y=float(layer.y),
+            width=float(layer.width),
+            height=float(layer.height),
+            rotation=float(getattr(layer, "rotation", 0.0) or 0.0),
+            font_size=font_size,
+        )
+        return snapshot if self._valid_pin_snapshot(snapshot) else None
+
+    def _apply_effective_production_to_layer(self, layer) -> None:
+        production = self._layer_effective_production(layer)
+        for attr in ("x", "y", "width", "height", "rotation"):
+            value = getattr(production, attr)
+            if value is not None:
+                setattr(layer, attr, float(value))
+        if isinstance(layer, TextLayer):
+            if production.font_size is not None:
+                layer.font_size = int(production.font_size)
+            layer.text_box_width = layer.width
+            layer.text_box_height = layer.height
+
+    def _toggle_layer_initial_pin(self, layer=None) -> None:
+        layer = layer or self.document.selected_layer()
+        if layer is None:
+            self.status_var.set("未选择有效图层")
+            return
+        key = self._pin_key(layer)
+        if not key:
+            self.status_var.set("该图层的位置由其他图层派生，不能独立锁定初始位置")
+            return
+        product = active_product(self.config)
+        existing = {pin.key: pin for pin in product.layer_pins}
+        if key in existing:
+            pins = tuple(pin for pin in product.layer_pins if pin.key != key)
+            self.config = with_product_layer_pins(self.config, pins)
+            save_config(self.config)
+            self.status_var.set("已取消初始位置锁定")
+        else:
+            snapshot = self._snapshot_layer_production(layer)
+            if snapshot is None:
+                self.status_var.set("当前图层几何无效，未写入锁定")
+                return
+            pins = product.layer_pins + (LayerPin(key, snapshot),)
+            self.config = with_product_layer_pins(self.config, pins)
+            save_config(self.config)
+            self.status_var.set("已锁定该素材的初始位置")
+        self._refresh_layers_panel()
+        self._redraw_preview()
 
     def _apply_layer_production(self) -> None:
         layer = self.document.selected_layer()
@@ -6332,6 +7051,7 @@ class BirthFlowerApp:
             messagebox.showerror("生产参数", "宽和高必须大于 0")
             return
         # 写回画布几何（与拖拽同一路径，仍经导出 _apply_canvas_fit，不旁路 WYSIWYG）。
+        self._push_document_history()
         layer.x, layer.y, layer.width, layer.height = x, y, width, height
         font_size: int | None = None
         if isinstance(layer, TextLayer):
@@ -6352,6 +7072,7 @@ class BirthFlowerApp:
         if layer is None:
             self.status_var.set("未选择有效图层")
             return
+        self._push_document_history()
         layer.visible = not layer.visible
         self._refresh_layers_panel()
         self._redraw_preview()
@@ -6361,6 +7082,7 @@ class BirthFlowerApp:
         if layer is None:
             self.status_var.set("未选择有效图层")
             return
+        self._push_document_history()
         layer.locked = not layer.locked
         self._refresh_layers_panel()
         self._redraw_preview()
@@ -6368,15 +7090,32 @@ class BirthFlowerApp:
     def _delete_selected_layer(self) -> None:
         if self.inline_text_entry is not None:
             return
+        selected = self.document.selected_layer()
+        if selected is None:
+            self.status_var.set("未选择有效图层，或图层已锁定")
+            return
+        if selected.locked:
+            self.status_var.set("图层已锁定，先在右键菜单解锁")
+            return
+        if not messagebox.askyesno("删除图层", f"确定删除「{selected.name}」？"):
+            return
+        self._push_document_history()
         removed = delete_layer(self.document, self.document.selected_layer_id)
         if removed is None:
             self.status_var.set("未选择有效图层，或图层已锁定")
+        elif isinstance(removed, TextLayer):
+            remove_anchored_heart_for(self.document, removed.id)
+            if self.document.selected_layer() is None:
+                remaining = list(self.document.iter_all_layers())
+                self.document.selected_layer_id = remaining[-1].id if remaining else None
         self.selected_preview_item = self.document.selected_layer_id
         self._refresh_layers_panel()
         self._redraw_preview()
 
     def _move_selected_layer(self, action: str) -> None:
+        self._push_document_history()
         if not move_layer(self.document, self.document.selected_layer_id, action):
+            self.history_manager.undo_stack.pop()
             self.status_var.set("图层无法移动")
             return
         self._refresh_layers_panel()
@@ -6389,6 +7128,17 @@ class BirthFlowerApp:
             return
         old_text = layer.original_text
         new_text = self.layer_text_var.get()
+        try:
+            font_size = max(1, int(self.layer_font_size_var.get()))
+        except ValueError:
+            messagebox.showerror("文本属性", "字号必须是整数")
+            return
+        try:
+            spacing = float(self.layer_letter_spacing_var.get())
+        except ValueError:
+            messagebox.showerror("文本属性", "字间距必须是数字")
+            return
+        self._push_document_history()
         layer.original_text = new_text
         layer.raw_text = new_text
         layer.text = new_text
@@ -6397,21 +7147,12 @@ class BirthFlowerApp:
             layer.glyph_overrides.clear()
             self.status_var.set("文本内容已变化，特殊字形需要重新应用")
         layer.render_text = new_text
-        try:
-            layer.font_size = max(1, int(self.layer_font_size_var.get()))
-        except ValueError:
-            messagebox.showerror("文本属性", "字号必须是整数")
-            return
+        layer.font_size = font_size
         layer.fill_color = self.layer_color_var.get().strip() or "#111111"
         layer.color = layer.fill_color
         # 字体样式 per-layer override：直接写概数布尔/字间距（覆盖建层时烘的全局默认）。
         layer.bold = bool(self.layer_bold_var.get())
         layer.underline = bool(self.layer_underline_var.get())
-        try:
-            spacing = float(self.layer_letter_spacing_var.get())
-        except ValueError:
-            messagebox.showerror("文本属性", "字间距必须是数字")
-            return
         layer.letter_spacing = spacing
         layer.tracking = spacing  # 两字段同步，避免导出端 `letter_spacing or tracking` 读到旧值。
         # 字号=真实大小：图层属性面板改字号即按字号反推文本框（框随字号长大，§58）；超画布安全区则封顶。
@@ -6459,6 +7200,7 @@ class BirthFlowerApp:
         layer = self.document.selected_layer()
         if layer is None or layer.locked:
             return
+        self._push_document_history()
         layer.x += dx
         layer.y += dy
         self._redraw_preview()
@@ -6476,6 +7218,7 @@ class BirthFlowerApp:
         self._merge_additional_library_assets()
         self.preview_cache.clear()
         self._refresh_library_choices()
+        self._render_library_rows()
         self._refresh_flower_choices()
         self._refresh_font_choices()
 
@@ -6642,8 +7385,18 @@ class BirthFlowerApp:
         if not asset.path.is_file():
             messagebox.showerror("素材错误", f"素材文件不存在：{asset.path}")
             return
+        self._push_document_history()
         layer.path = asset.path
         layer.name = asset.display_name or asset.name
+        material_key = asset.asset_key or asset.path.stem
+        found = self.active_bundle.resolve_material(material_key)
+        layer.material_id = material_key
+        layer.material_key = material_key
+        layer.material_name = asset.display_name or asset.name
+        if found:
+            layer.library_id = found[0]
+        layer.production = None
+        self._apply_effective_production_to_layer(layer)
         self._set_pending_flower_asset(self._flower_label(asset), sync_fields=True)
         self._refresh_layers_panel()
         self._redraw_preview()
@@ -6661,6 +7414,7 @@ class BirthFlowerApp:
         except ValueError:
             layout = EngravingLayout()
         # 添加素材必须追加 ImageLayer，不能覆盖已存在的素材图层。
+        self._push_document_history()
         material_key = asset.asset_key or asset.path.stem
         found = self.active_bundle.resolve_material(material_key)  # 反查该素材属于哪个库
         layer = add_image_layer(
@@ -6676,6 +7430,7 @@ class BirthFlowerApp:
             library_id=found[0] if found else "",
             material_key=material_key,
         )
+        self._apply_effective_production_to_layer(layer)
         self.selected_preview_item = layer.id
         self._refresh_layers_panel()
         self._redraw_preview()
@@ -6720,6 +7475,7 @@ class BirthFlowerApp:
         font_found = (
             self.active_bundle.resolve_font_by_tags(index=font_asset.index) if font_asset is not None else None
         )
+        self._push_document_history()
         layer = add_text_layer(
             self.document,
             text,
@@ -6740,6 +7496,8 @@ class BirthFlowerApp:
         self._apply_auto_glyph_rules_to_layer(layer)
         # 新建即按字号定框（字号=真实大小、框随字号长大，§58；ending_heart 已由自动字形规则置位）。
         self._resize_text_box_to_font(layer)
+        if self._pin_for(layer) is not None:
+            self._apply_effective_production_to_layer(layer)
         self.selected_preview_item = layer.id
         self._sync_layer_properties(layer)
         self._refresh_layers_panel()
@@ -6832,14 +7590,15 @@ class BirthFlowerApp:
     def _save_current_config(self) -> None:
         # 用 replace 而非整体重建 AppConfig，否则会清空 products/active_product_id/收展态
         # （与 _save_settings_window 同一坑：__post_init__ 只在 products 空时才合成产品0）。
+        layout_defaults = self._active_layout_defaults()
         self.config = dataclasses.replace(
             self.config,
             flower_dir=Path(self.flower_dir_var.get()),
             font_source=Path(self.font_source_var.get()),
             output_path=Path(self.output_var.get()),
             output_formats=self._selected_output_formats_or_default(),
-            layout_defaults=self._active_layout_defaults(),
         )
+        self.config = with_product_defaults(self.config, layout_defaults)
         save_config(self.config)
 
     def _with_programmatic_update(self, callback):
@@ -7350,10 +8109,26 @@ class BirthFlowerApp:
     def _preview_zoom_percent_text(self) -> str:
         return f"{round(self.preview_zoom * 100)}%"
 
+    def _preview_canvas_size_text(self, layout: EngravingLayout | None = None) -> str:
+        try:
+            layout = layout or layout_from_values(self.layout_vars)
+            width = int(layout.canvas_width)
+            height = int(layout.canvas_height)
+        except Exception:
+            return "画布：— px"
+        if width <= 0 or height <= 0:
+            return "画布：— px"
+        return f"画布：{width} × {height} px"
+
     def _update_preview_zoom_status(self) -> None:
         var = getattr(self, "preview_zoom_status_var", None)
         if var is not None:
             var.set(self._preview_zoom_percent_text())
+
+    def _update_preview_canvas_size_status(self, layout: EngravingLayout | None = None) -> None:
+        var = getattr(self, "preview_canvas_size_var", None)
+        if var is not None:
+            var.set(self._preview_canvas_size_text(layout))
 
     def _preview_base_transform(self, layout: EngravingLayout) -> tuple[float, float, float]:
         canvas = self.preview_canvas
@@ -7743,6 +8518,7 @@ class BirthFlowerApp:
             else:
                 self._drag_target = layer.id if not layer.locked else None
                 self._drag_mode = "move"
+        self._drag_history_pushed = False
         self.document.selected_layer_id = layer.id if layer else None
         self.selected_preview_item = self.document.selected_layer_id
         self._drag_start = (event.x, event.y)
@@ -7779,6 +8555,9 @@ class BirthFlowerApp:
         layer = self.document.layer_by_id(self._drag_target)
         if layer is None or layer.locked:
             return
+        if not self._drag_history_pushed:
+            self._push_document_history()
+            self._drag_history_pushed = True
         try:
             layout = layout_from_values(self.layout_vars)
         except ValueError:
@@ -7818,6 +8597,7 @@ class BirthFlowerApp:
     def _on_canvas_release(self, _event) -> None:
         self._drag_target = None
         self._drag_start = None
+        self._drag_history_pushed = False
         if self._drag_mode == "pan":
             self._set_preview_cursor("")
         self._drag_mode = "move"

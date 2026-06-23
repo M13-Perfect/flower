@@ -25,3 +25,16 @@ class DxfExportResponse(ApiModel):
     content_base64: str = Field(alias="contentBase64")
     metadata: dict[str, str]
     warnings: list[ExportWarningBody] = Field(default_factory=list)
+
+
+class SvgExportRequest(ApiModel):
+    document: dict[str, Any]
+    background: Literal["canvas", "transparent"] | None = None
+    exported_at: str | None = Field(default=None, alias="exportedAt")
+
+
+class SvgExportResponse(ApiModel):
+    file_name: str = Field(alias="fileName")
+    mime_type: str = Field(alias="mimeType")
+    content: str
+    metadata: dict[str, str]

@@ -5,12 +5,21 @@ from dataclasses import dataclass, replace
 import hashlib
 import hmac
 import json
+import math
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 from models import EngravingLayout
+from prompt_references import (
+    ReferenceField,
+    create_reference_field,
+    default_prompt_template,
+    reference_fields_from_legacy,
+)
+from production import ProductionParams
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -78,6 +87,7 @@ SUPPORTED_OUTPUT_FORMATS = {"png", "svg", "dxf"}
 DEFAULT_AI_PROFILE_NAME = "OpenAI default"
 # PNG 底:transparent=镂空(默认,激光雕刻背景不出刀)| white=正常白色实心底(普通查看/打印)。
 DEFAULT_PNG_BACKGROUND = "transparent"
+_CONFIG_WRITE_LOCK = threading.RLock()
 PNG_BACKGROUND_CHOICES = ("transparent", "white")
 
 
@@ -95,6 +105,14 @@ class AIProfile:
 
 
 @dataclass(frozen=True)
+class LayerPin:
+    """产品级「锁定初始位置」：按稳定素材身份保存一份生产几何快照。"""
+
+    key: str
+    production: ProductionParams
+
+
+@dataclass(frozen=True)
 class ProductConfig:
     """一个产品（每窗口=一个产品）：声明该产品可用的素材库/字体库目录与默认生产参数。
 
@@ -106,9 +124,15 @@ class ProductConfig:
     image_library_dirs: tuple[Path, ...] = ()
     font_library_dirs: tuple[Path, ...] = ()
     defaults: EngravingLayout = EngravingLayout()
+    layer_pins: tuple[LayerPin, ...] = ()
     manual_fields: tuple[str, ...] = ()  # 人工确认字段集；空=用产品默认（Phase 2 UI 消费）
     extraction_prompt: str = ""  # 「提取提示词」：发给 API 的提取指令（按产品存）
     background_prompt: str = ""  # 「背景提示词」：附加背景上下文（按产品存）
+    # Reference Field System: 新结构与旧 extraction_prompt/background_prompt 并存，便于渐进发布和回滚。
+    reference_fields: tuple[ReferenceField, ...] = ()
+    field_seq_max: int = 0
+    prompt_template: str = ""
+    template_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -144,6 +168,9 @@ class AppConfig:
     # 管理员端密码（PBKDF2-SHA256，格式见 hash_password）。空=尚未设密码（首次进管理员端引导设置）。
     # 只存哈希、不存明文；选端页「管理员端」据此决定是否弹密码门。
     admin_password_hash: str = ""
+    # 三列布局（产品列|中心|功能区）2 条分隔条的位置，存的是占总宽的比例（0~1），不是绝对像素——
+    # 换窗口大小/换屏幕分辨率都不串位（还原时按当前总宽折算，见 ui_app._restore_pane_sashes）。空=用默认列宽。
+    pane_sash_fractions: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.products:
@@ -154,6 +181,23 @@ class AppConfig:
             )
         if not self.active_product_id:
             object.__setattr__(self, "active_product_id", self.products[0].id)
+
+
+def _fractions_value(payload: dict, key: str) -> tuple[float, ...]:
+    """读取一串 0~1 的比例值（分隔条位置）；任一项越界/非数则整组作废回落空（用默认列宽）。"""
+    raw = payload.get(key)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: list[float] = []
+    for value in raw:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return ()
+        if not (0.0 < number < 1.0):
+            return ()
+        out.append(number)
+    return tuple(out)
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
@@ -176,6 +220,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     # 否则（旧配置遗留 True / 全新 / 缺字段）一律回落 False，避免未经用户明确同意就自动解析。
     autoparse_user_set = _bool_value(payload, "inbox_autoparse_user_set", False)
     inbox_autoparse = _bool_value(payload, "inbox_autoparse", False) if autoparse_user_set else False
+    layout_defaults = _layout_from_payload(payload.get("layout_defaults"))
     return AppConfig(
         flower_dir=Path(_string_value(payload, "flower_dir", str(AppConfig().flower_dir))),
         font_source=Path(_string_value(payload, "font_source", str(AppConfig().font_source))),
@@ -184,8 +229,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         png_background=normalize_png_background(payload.get("png_background")),
         ai_profiles=profiles,
         active_ai_profile=active_profile,
-        layout_defaults=_layout_from_payload(payload.get("layout_defaults")),
-        products=_products_from_payload(payload.get("products")),
+        layout_defaults=layout_defaults,
+        products=_products_from_payload(payload.get("products"), layout_defaults),
         active_product_id=_string_value(payload, "active_product_id", ""),
         products_panel_collapsed=_bool_value(payload, "products_panel_collapsed", True),
         inbox_folder=Path(_optional_string_value(payload, "inbox_folder", "") or _default_inbox_folder()),
@@ -193,39 +238,44 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         inbox_autoparse_user_set=autoparse_user_set,
         inbox_service_url=_optional_string_value(payload, "inbox_service_url", ""),
         admin_password_hash=_optional_string_value(payload, "admin_password_hash", ""),
+        pane_sash_fractions=_fractions_value(payload, "pane_sash_fractions"),
     )
 
 
 def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Path:
     """保存用户选择的素材目录、字体源和输出路径。"""
     config_path = Path(path)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "flower_dir": str(config.flower_dir),
-        "font_source": str(config.font_source),
-        "output_path": str(config.output_path),
-        "output_formats": list(normalize_output_formats(config.output_formats)),
-        "png_background": normalize_png_background(config.png_background),
-        "ai_profiles": [_ai_profile_to_payload(profile) for profile in config.ai_profiles],
-        "active_ai_profile": active_ai_profile(config).name,
-        "layout_defaults": _layout_to_payload(config.layout_defaults),
-        "products": [_product_to_payload(product) for product in config.products],
-        "active_product_id": active_product(config).id,
-        "products_panel_collapsed": bool(config.products_panel_collapsed),
-        "inbox_folder": str(config.inbox_folder),
-        "inbox_autoparse": bool(config.inbox_autoparse),
-        "inbox_autoparse_user_set": bool(config.inbox_autoparse_user_set),
-        "inbox_service_url": config.inbox_service_url,
-        "admin_password_hash": config.admin_password_hash,
-    }
-    config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    with _CONFIG_WRITE_LOCK:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "flower_dir": str(config.flower_dir),
+            "font_source": str(config.font_source),
+            "output_path": str(config.output_path),
+            "output_formats": list(normalize_output_formats(config.output_formats)),
+            "png_background": normalize_png_background(config.png_background),
+            "ai_profiles": [_ai_profile_to_payload(profile) for profile in config.ai_profiles],
+            "active_ai_profile": active_ai_profile(config).name,
+            "layout_defaults": _layout_to_payload(config.layout_defaults),
+            "products": [_product_to_payload(product) for product in config.products],
+            "active_product_id": active_product(config).id,
+            "products_panel_collapsed": bool(config.products_panel_collapsed),
+            "inbox_folder": str(config.inbox_folder),
+            "inbox_autoparse": bool(config.inbox_autoparse),
+            "inbox_autoparse_user_set": bool(config.inbox_autoparse_user_set),
+            "inbox_service_url": config.inbox_service_url,
+            "admin_password_hash": config.admin_password_hash,
+            "pane_sash_fractions": list(config.pane_sash_fractions),
+        }
+        tmp_path = config_path.with_name(config_path.name + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(config_path)
     return config_path
 
 
 
-def _layout_from_payload(payload: Any) -> EngravingLayout:
+def _layout_from_payload(payload: Any, default: EngravingLayout | None = None) -> EngravingLayout:
     """从配置文件恢复全局默认布局；字段缺失或非法时使用项目默认值。"""
-    default = EngravingLayout()
+    default = default or EngravingLayout()
     if not isinstance(payload, dict):
         return default
     values: dict[str, int] = {}
@@ -374,6 +424,43 @@ def with_product_library_dirs(
     return replace(config, products=products, flower_dir=flower_dir, font_source=font_source)
 
 
+def with_product_defaults(
+    config: AppConfig,
+    defaults: EngravingLayout,
+    *,
+    product_id: str | None = None,
+) -> AppConfig:
+    """更新指定产品的默认几何；产品0 同步顶层 layout_defaults，旧链路零回归。"""
+    target_id = product_id or config.active_product_id
+    products = tuple(
+        replace(product, defaults=defaults) if product.id == target_id else product
+        for product in config.products
+    )
+    layout_defaults = defaults if products and products[0].id == target_id else config.layout_defaults
+    return replace(config, products=products, layout_defaults=layout_defaults)
+
+
+def with_product_layer_pins(
+    config: AppConfig,
+    layer_pins: Iterable[LayerPin],
+    *,
+    product_id: str | None = None,
+) -> AppConfig:
+    """替换指定产品的 layer_pins；按 key 去重，后出现的 pin 覆盖旧值。"""
+    target_id = product_id or config.active_product_id
+    by_key: dict[str, LayerPin] = {}
+    for pin in layer_pins:
+        cleaned = _coerce_layer_pin(pin)
+        if cleaned is not None:
+            by_key[cleaned.key] = cleaned
+    pins = tuple(by_key[key] for key in sorted(by_key))
+    products = tuple(
+        replace(product, layer_pins=pins) if product.id == target_id else product
+        for product in config.products
+    )
+    return replace(config, products=products)
+
+
 def with_product_prompts(
     config: AppConfig,
     *,
@@ -393,6 +480,69 @@ def with_product_prompts(
         for product in config.products
     )
     return replace(config, products=products)
+
+
+def with_product_reference_fields(
+    config: AppConfig,
+    *,
+    reference_fields: tuple[ReferenceField, ...],
+    field_seq_max: int,
+    prompt_template: str | None = None,
+    template_version: int | None = None,
+    extraction_prompt: str | None = None,
+    background_prompt: str | None = None,
+    product_id: str | None = None,
+) -> AppConfig:
+    """更新当前产品的可引用字段配置；旧字段同步保留，供兼容期回滚。"""
+    target_id = product_id or config.active_product_id
+
+    def patch(product: ProductConfig) -> ProductConfig:
+        if product.id != target_id:
+            return product
+        return replace(
+            product,
+            reference_fields=reference_fields,
+            field_seq_max=max(field_seq_max, *(field.sequence_number for field in reference_fields), 0),
+            prompt_template=product.prompt_template if prompt_template is None else prompt_template,
+            template_version=product.template_version if template_version is None else template_version,
+            extraction_prompt=product.extraction_prompt if extraction_prompt is None else extraction_prompt,
+            background_prompt=product.background_prompt if background_prompt is None else background_prompt,
+        )
+
+    return replace(config, products=tuple(patch(product) for product in config.products))
+
+
+def create_product_reference_field_in_file(
+    path: Path | str,
+    product_id: str,
+    *,
+    reference_name: str,
+    prompt: str,
+    field_type: str = "文本",
+) -> tuple[AppConfig, ReferenceField]:
+    """在锁内读取最新配置、分配序号并原子写回，避免并发创建拿到重复序号。"""
+    with _CONFIG_WRITE_LOCK:
+        config = load_config(path)
+        target_id = product_id or active_product(config).id
+        target = next((product for product in config.products if product.id == target_id), active_product(config))
+        fields, seq_max, created = create_reference_field(
+            target.reference_fields,
+            field_seq_max=target.field_seq_max,
+            scope_id=target.id,
+            reference_name=reference_name,
+            prompt=prompt,
+            field_type=field_type,
+        )
+        template = target.prompt_template or default_prompt_template(fields, target.background_prompt)
+        updated = with_product_reference_fields(
+            config,
+            product_id=target.id,
+            reference_fields=fields,
+            field_seq_max=seq_max,
+            prompt_template=template,
+        )
+        save_config(updated, path)
+        return updated, created
 
 
 # ===== 管理员密码（PBKDF2-SHA256，纯标准库，无新依赖）=====
@@ -444,6 +594,13 @@ def _bool_value(payload: dict[str, Any], key: str, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
 
+def _int_value(payload: dict[str, Any], key: str, default: int) -> int:
+    try:
+        return int(payload.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def _ensure_products(
     products: tuple[ProductConfig, ...],
     flower_dir: Path,
@@ -464,23 +621,41 @@ def _ensure_products(
     )
 
 
-def _products_from_payload(value: Any) -> tuple[ProductConfig, ...]:
+def _products_from_payload(value: Any, defaults: EngravingLayout | None = None) -> tuple[ProductConfig, ...]:
     if not isinstance(value, list):
         return ()
-    return tuple(_product_from_payload(item) for item in value if isinstance(item, dict))
+    return tuple(_product_from_payload(item, defaults) for item in value if isinstance(item, dict))
 
 
-def _product_from_payload(payload: dict[str, Any]) -> ProductConfig:
+def _product_from_payload(payload: dict[str, Any], defaults: EngravingLayout | None = None) -> ProductConfig:
     product_id = _string_value(payload, "id", "product")
+    extraction_prompt = _optional_string_value(payload, "extraction_prompt", "")
+    background_prompt = _optional_string_value(payload, "background_prompt", "")
+    reference_fields = _reference_fields_from_payload(payload.get("reference_fields"), product_id)
+    if not reference_fields:
+        reference_fields = reference_fields_from_legacy(extraction_prompt, scope_id=product_id)
+    field_seq_max = _int_value(
+        payload,
+        "field_seq_max",
+        max((field.sequence_number for field in reference_fields), default=0),
+    )
+    prompt_template = _optional_string_value(payload, "prompt_template", "")
+    if not prompt_template and reference_fields:
+        prompt_template = default_prompt_template(reference_fields, background_prompt)
     return ProductConfig(
         id=product_id,
         name=_string_value(payload, "name", product_id),
         image_library_dirs=_path_tuple(payload.get("image_library_dirs")),
         font_library_dirs=_path_tuple(payload.get("font_library_dirs")),
-        defaults=_layout_from_payload(payload.get("defaults")),
+        defaults=_layout_from_payload(payload.get("defaults"), defaults),
+        layer_pins=_layer_pins_from_payload(payload.get("layer_pins")),
         manual_fields=_str_tuple(payload.get("manual_fields")),
-        extraction_prompt=_optional_string_value(payload, "extraction_prompt", ""),
-        background_prompt=_optional_string_value(payload, "background_prompt", ""),
+        extraction_prompt=extraction_prompt,
+        background_prompt=background_prompt,
+        reference_fields=reference_fields,
+        field_seq_max=max(field_seq_max, *(field.sequence_number for field in reference_fields), 0),
+        prompt_template=prompt_template,
+        template_version=_int_value(payload, "template_version", 1),
     )
 
 
@@ -491,9 +666,119 @@ def _product_to_payload(product: ProductConfig) -> dict[str, Any]:
         "image_library_dirs": [str(path) for path in product.image_library_dirs],
         "font_library_dirs": [str(path) for path in product.font_library_dirs],
         "defaults": _layout_to_payload(product.defaults),
+        "layer_pins": [_layer_pin_to_payload(pin) for pin in product.layer_pins],
         "manual_fields": list(product.manual_fields),
         "extraction_prompt": product.extraction_prompt,
         "background_prompt": product.background_prompt,
+        "reference_fields": [_reference_field_to_payload(field) for field in product.reference_fields],
+        "field_seq_max": product.field_seq_max,
+        "prompt_template": product.prompt_template,
+        "template_version": product.template_version,
+    }
+
+
+def _finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_pin_production(production: ProductionParams) -> bool:
+    for field_name in ("x", "y", "width", "height"):
+        if not _finite_number(getattr(production, field_name)):
+            return False
+    if float(production.width or 0) <= 0 or float(production.height or 0) <= 0:
+        return False
+    if production.rotation is not None and not _finite_number(production.rotation):
+        return False
+    if production.font_size is not None:
+        try:
+            if int(production.font_size) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _coerce_layer_pin(value: Any) -> LayerPin | None:
+    if isinstance(value, LayerPin):
+        key = value.key.strip()
+        production = value.production
+    elif isinstance(value, dict):
+        key = _optional_string_value(value, "key", "").strip()
+        production = ProductionParams.from_mapping(value.get("production"))
+    else:
+        return None
+    if not key or not _valid_pin_production(production):
+        return None
+    return LayerPin(key=key, production=production)
+
+
+def _layer_pins_from_payload(value: Any) -> tuple[LayerPin, ...]:
+    if not isinstance(value, list):
+        return ()
+    pins: list[LayerPin] = []
+    seen: set[str] = set()
+    for item in value:
+        pin = _coerce_layer_pin(item)
+        if pin is None or pin.key in seen:
+            continue
+        seen.add(pin.key)
+        pins.append(pin)
+    return tuple(pins)
+
+
+def _layer_pin_to_payload(pin: LayerPin) -> dict[str, Any]:
+    return {"key": pin.key, "production": pin.production.to_dict()}
+
+
+def _reference_fields_from_payload(value: Any, product_id: str) -> tuple[ReferenceField, ...]:
+    if not isinstance(value, list):
+        return ()
+    fields: list[ReferenceField] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        field_id = _optional_string_value(item, "id", "")
+        if not field_id:
+            continue
+        sequence = _int_value(item, "sequence_number", 0)
+        if sequence <= 0:
+            continue
+        fields.append(
+            ReferenceField(
+                id=field_id,
+                scope_id=_optional_string_value(item, "scope_id", product_id) or product_id,
+                sequence_number=sequence,
+                reference_name=_optional_string_value(item, "reference_name", "") or f"字段{sequence}",
+                prompt=_optional_string_value(item, "prompt", ""),
+                sort_order=_int_value(item, "sort_order", sequence),
+                enabled=_bool_value(item, "enabled", True),
+                created_at=_optional_string_value(item, "created_at", ""),
+                updated_at=_optional_string_value(item, "updated_at", ""),
+                deleted_at=_optional_string_value(item, "deleted_at", ""),
+                field_type=_optional_string_value(item, "field_type", "文本") or "文本",
+                legacy_key=_optional_string_value(item, "legacy_key", ""),
+            )
+        )
+    return tuple(sorted(fields, key=lambda field: (field.sort_order, field.sequence_number)))
+
+
+def _reference_field_to_payload(field: ReferenceField) -> dict[str, Any]:
+    return {
+        "id": field.id,
+        "scope_id": field.scope_id,
+        "sequence_number": field.sequence_number,
+        "reference_name": field.reference_name,
+        "prompt": field.prompt,
+        "sort_order": field.sort_order,
+        "enabled": field.enabled,
+        "created_at": field.created_at,
+        "updated_at": field.updated_at,
+        "deleted_at": field.deleted_at,
+        "field_type": field.field_type,
+        "legacy_key": field.legacy_key,
     }
 
 

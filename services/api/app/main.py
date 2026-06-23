@@ -5,14 +5,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.domain import DomainError
-from app.domain.exports import export_dxf
+from app.domain.exports import export_dxf, export_svg
 from app.domain.fonts import get_font_file_path, list_fonts, list_glyphs
 from app.domain.orders import parse_order_note
 from app.domain.output_store import save_outputs
 from app.domain.settings import get_path_settings, update_path_settings
 from app.domain.templates import apply_template
 from app.schemas.errors import ErrorBody, ErrorEnvelope
-from app.schemas.exports import DxfExportRequest, DxfExportResponse, ExportWarningBody
+from app.schemas.exports import (
+    DxfExportRequest,
+    DxfExportResponse,
+    ExportWarningBody,
+    SvgExportRequest,
+    SvgExportResponse,
+)
 from app.schemas.fonts import (
     FontGlyphsResponse,
     FontIssueBody,
@@ -142,6 +148,26 @@ def export_document_dxf(request: DxfExportRequest) -> Any:
         contentBase64=exported.content_base64,
         metadata=exported.metadata,
         warnings=[ExportWarningBody(**warning.to_dict()) for warning in exported.warnings],
+    )
+    return response.model_dump(by_alias=True)
+
+
+@app.post("/exports/svg", response_model=None)
+def export_document_svg(request: SvgExportRequest) -> Any:
+    try:
+        exported = export_svg(
+            request.document,
+            background=request.background,
+            exported_at=request.exported_at,
+        )
+    except DomainError as exc:
+        return _domain_error_response(exc, status_code=422)
+
+    response = SvgExportResponse(
+        fileName=exported.file_name,
+        mimeType=exported.mime_type,
+        content=exported.content,
+        metadata=exported.metadata,
     )
     return response.model_dump(by_alias=True)
 

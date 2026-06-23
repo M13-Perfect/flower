@@ -183,6 +183,8 @@ def parse_orders_with_gpt(
     base_url: str | None = None,
     system_prompt: str | None = None,
     background_prompt: str | None = None,
+    user_content: str | None = None,
+    reference_snapshot: tuple[dict[str, str], ...] | None = None,
     http_post: HttpPost | None = None,
     timeout: float = 20,
     trace: ParsePromptTrace | None = None,
@@ -195,9 +197,11 @@ def parse_orders_with_gpt(
     """
     selected_provider = _normalize_provider(provider)
     prompt = build_orders_system_prompt(system_prompt, background_prompt)
+    actual_user_content = remark if user_content is None else user_content
     if selected_provider == "deepseek":
         return _parse_orders_with_deepseek(
-            remark, prompt, api_key=api_key, model=model, base_url=base_url,
+            remark, prompt, user_content=actual_user_content, reference_snapshot=reference_snapshot,
+            api_key=api_key, model=model, base_url=base_url,
             http_post=http_post, timeout=timeout, trace=trace,
         )
     if selected_provider != "openai":
@@ -207,7 +211,9 @@ def parse_orders_with_gpt(
     if trace is not None:
         trace.provider = "openai"
         trace.system_prompt = prompt
-        trace.user_content = remark
+        trace.user_content = actual_user_content
+        trace.resolved_prompt = prompt
+        trace.reference_snapshot = tuple(reference_snapshot or ())
         trace.filled = True
     key = api_key or os.environ.get("OPENAI_API_KEY")
     if not key:
@@ -221,7 +227,7 @@ def parse_orders_with_gpt(
         "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
         "input": [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": remark},
+            {"role": "user", "content": actual_user_content},
         ],
         "text": {
             "format": {
@@ -245,6 +251,8 @@ def parse_orders_with_gpt(
 def _parse_orders_with_deepseek(
     remark: str,
     system_prompt: str,
+    user_content: str | None = None,
+    reference_snapshot: tuple[dict[str, str], ...] | None = None,
     api_key: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
@@ -257,7 +265,9 @@ def _parse_orders_with_deepseek(
     if trace is not None:
         trace.provider = "deepseek"
         trace.system_prompt = full_system_prompt
-        trace.user_content = remark
+        trace.user_content = remark if user_content is None else user_content
+        trace.resolved_prompt = full_system_prompt
+        trace.reference_snapshot = tuple(reference_snapshot or ())
         trace.filled = True
     key = api_key or os.environ.get("DEEPSEEK_API_KEY")
     if not key:
@@ -269,7 +279,7 @@ def _parse_orders_with_deepseek(
         "model": selected_model,
         "messages": [
             {"role": "system", "content": full_system_prompt},
-            {"role": "user", "content": remark},
+            {"role": "user", "content": remark if user_content is None else user_content},
         ],
         "response_format": {"type": "json_object"},
         "thinking": {"type": "disabled"},

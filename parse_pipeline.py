@@ -91,6 +91,10 @@ def _call_orders_gpt(
             background_prompt=ai_config.background_prompt,
             timeout=ai_config.timeout,
         )
+        if ai_config.user_content is not None:
+            kwargs["user_content"] = ai_config.user_content
+        if ai_config.reference_snapshot:
+            kwargs["reference_snapshot"] = ai_config.reference_snapshot
     if trace is not None:
         kwargs["trace"] = trace
     return gpt(remark, **kwargs)

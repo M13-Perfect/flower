@@ -1630,10 +1630,13 @@ def test_field_instructions_drive_ai_system_prompt(monkeypatch):
         rules = app._assemble_field_rules()
         assert "month" in rules  # 默认出生花字段规则进了提示词
         assert "Narcissus" in rules  # 含月→花对照表
-        cfg = app._current_ai_config()
-        assert cfg.system_prompt == rules  # system_prompt 直接是字段拼出的规则
+        cfg = app._current_ai_config("ORDER TEXT")
+        assert "Narcissus" in cfg.system_prompt
+        assert "<order_data>\nORDER TEXT\n</order_data>" in cfg.system_prompt
+        assert cfg.user_content == ""
         # 编辑某字段 instruction → 立即反映进发给 API 的提示词
         app.field_defs[0]["inst_var"].set("只提取顾客名字 XYZ")
+        app._persist_prompts()
         assert "只提取顾客名字 XYZ" in app._current_ai_config().system_prompt
     finally:
         root.destroy()
@@ -1657,7 +1660,7 @@ def test_field_defs_persist_and_reload(monkeypatch):
         root.destroy()
 
 
-def test_add_field_key_stays_unique_after_delete(monkeypatch):
+def test_add_field_sequence_stays_unique_after_delete(monkeypatch):
     # 加字段编号基于现有字段、key 取最大序号+1：删中间字段后再加不撞已有 key。
     try:
         root = tk.Tk()
@@ -1666,18 +1669,15 @@ def test_add_field_key_stays_unique_after_delete(monkeypatch):
     try:
         monkeypatch.setattr(ui_app_module, "save_config", lambda _cfg: None)
         app = BirthFlowerApp(root)
-        # 用固定 3 字段铺底，避免依赖磁盘上持久化的产品配置。
-        app.field_defs = [
-            {"key": "field1", "name": "a", "type": "文本", "instruction": ""},
-            {"key": "field2", "name": "b", "type": "文本", "instruction": ""},
-            {"key": "field3", "name": "c", "type": "文本", "instruction": ""},
-        ]
-        app._add_field()  # → field4
-        app._delete_field("field2")  # 删中间字段，存活 field1/field3/field4
-        app._add_field()  # 旧 bug 会按数量(3)+1=field4 撞车；应取 max+1=field5
-        keys = [f["key"] for f in app.field_defs]
-        assert len(keys) == len(set(keys)), f"key 出现重复: {keys}"
-        assert "field5" in keys
+        start_seq = active_product(app.config).field_seq_max
+        app._add_field()
+        created = max(active_product(app.config).reference_fields, key=lambda field: field.sequence_number)
+        assert created.sequence_number == start_seq + 1
+        app._delete_field(created.id)
+        app._add_field()
+        sequences = [field.sequence_number for field in active_product(app.config).reference_fields]
+        assert len(sequences) == len(set(sequences)), f"sequence 出现重复: {sequences}"
+        assert max(sequences) == start_seq + 2
     finally:
         root.destroy()
 
@@ -2342,7 +2342,7 @@ def test_resize_text_box_to_font_unbounded_overflows_safe_area_while_clamped_cap
     # clamp=False（内联编辑）：大字号下框越过画布安全区、返回 True、不缩框到安全区；
     # clamp=True（默认/新建/属性面板）：封顶到安全区、返回 True。
     pytest.importorskip("PIL")
-    from text_layout import SAFE_MARGIN_X, SAFE_MARGIN_Y
+    from text_layout import SAFE_MARGIN_X
 
     app = _resize_fake_app(canvas_width=600, canvas_height=400)
     safe_w = 600 - 2 * SAFE_MARGIN_X

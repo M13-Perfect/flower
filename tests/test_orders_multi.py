@@ -197,6 +197,32 @@ def test_parse_orders_with_gpt_fills_trace_with_actual_sent_prompt_openai():
     assert trace.user_content == sent_user
 
 
+def test_parse_orders_with_gpt_uses_user_content_override_for_resolved_templates():
+    captured: dict = {}
+
+    def fake_post(url, payload, headers, timeout):
+        captured["payload"] = payload
+        return {"output_text": json.dumps({"orders": []})}
+
+    trace = ParsePromptTrace()
+    parse_orders_with_gpt(
+        "raw order",
+        api_key="k",
+        provider="openai",
+        system_prompt="<order_data>raw order</order_data>",
+        user_content="",
+        reference_snapshot=({"id": "field-id", "reference_name": "旧名称"},),
+        http_post=fake_post,
+        trace=trace,
+    )
+
+    sent_user = captured["payload"]["input"][1]["content"]
+    assert sent_user == ""
+    assert trace.user_content == ""
+    assert trace.resolved_prompt == "<order_data>raw order</order_data>"
+    assert trace.reference_snapshot == ({"id": "field-id", "reference_name": "旧名称"},)
+
+
 def test_parse_orders_with_gpt_fills_trace_with_deepseek_json_suffix():
     # DeepSeek 路径：trace 的 system 提示词必须含真实追加的 JSON 约定后缀，并等于发出去的 content。
     captured: dict = {}
@@ -261,7 +287,7 @@ def test_split_order_blocks_reads_quantity_suffix():
 
 def test_parse_orders_auto_uses_orders_gpt_and_threads_prompt():
     config = AIParseConfig(
-        enabled=True, prefer_ai=True, system_prompt="SP", background_prompt="BG"
+        enabled=True, prefer_ai=True, system_prompt="SP", background_prompt="BG", user_content=""
     )
     captured: dict = {}
 
@@ -274,6 +300,7 @@ def test_parse_orders_auto_uses_orders_gpt_and_threads_prompt():
     assert [r.text for r in results] == ["A"]
     assert captured["system_prompt"] == "SP"
     assert captured["background_prompt"] == "BG"
+    assert captured["user_content"] == ""
 
 
 def test_parse_orders_auto_raises_when_ai_fails():

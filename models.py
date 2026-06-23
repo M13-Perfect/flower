@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,8 @@ class AIParseConfig:
     # 前台「提取 / 背景提示词」：非空时作为发给 API 的系统提示词，驱动识别（见 gpt_parser.build_orders_system_prompt）。
     system_prompt: str | None = None
     background_prompt: str | None = None
+    user_content: str | None = None
+    reference_snapshot: tuple[dict[str, str], ...] = ()
 
 
 @dataclass
@@ -72,6 +75,8 @@ class ParsePromptTrace:
     model: str = ""
     system_prompt: str = ""
     user_content: str = ""
+    resolved_prompt: str = ""
+    reference_snapshot: tuple[dict[str, str], ...] = ()
     filled: bool = False
 
 
@@ -454,10 +459,32 @@ class Document:
 
 @dataclass
 class HistoryManager:
-    """预留撤销/重做栈；当前 UI 先接入快捷键，后续可存储 Document 快照。"""
+    """Document 快照撤销栈；只管画布编辑，不碰配置持久化。"""
 
     undo_stack: list[Document] = field(default_factory=list)
     redo_stack: list[Document] = field(default_factory=list)
+
+    def push(self, document: Document, *, limit: int = 50) -> None:
+        self.undo_stack.append(deepcopy(document))
+        if len(self.undo_stack) > limit:
+            del self.undo_stack[: len(self.undo_stack) - limit]
+        self.redo_stack.clear()
+
+    def undo(self, current: Document) -> Document | None:
+        if not self.undo_stack:
+            return None
+        self.redo_stack.append(deepcopy(current))
+        return self.undo_stack.pop()
+
+    def redo(self, current: Document) -> Document | None:
+        if not self.redo_stack:
+            return None
+        self.undo_stack.append(deepcopy(current))
+        return self.redo_stack.pop()
+
+    def clear(self) -> None:
+        self.undo_stack.clear()
+        self.redo_stack.clear()
 
 
 def add_image_layer(
