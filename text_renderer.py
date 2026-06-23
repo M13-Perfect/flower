@@ -107,6 +107,9 @@ class TextRenderer:
         tracking = self._tracking(layer)
         # Font 4 等：末尾要缀独立爱心时，在末行右侧预留推进量，名字+爱心一起适配字号、不溢出框。
         wants_heart = bool(getattr(layer, "ending_heart", False))
+        # 末尾爱心已交给独立 AnchoredHeartLayer（resolve 置位）时，此处不再贴爱心，但仍保留推进量
+        # 预留（advance 不变 → 名字位置与旧路径一致），爱心改由独立图层在同一落点绘制。
+        detached = bool(getattr(layer, "ending_heart_detached", False))
         ending_advance_ratio = ENDING_HEART_ADVANCE_RATIO if wants_heart else 0.0
         # 统一适配：等比选字号 + 断行，与矢量导出共用同一套 fit_text_box（不再非等比拉伸铺满框）。
         # layer.font_size 作为字号上限（cap），真实字号由文本框大小自适应得出。
@@ -144,7 +147,8 @@ class TextRenderer:
 
         # Font 4 等：把独立实心爱心缀到最后一行墨迹右侧（与导出端 place_ending_heart 同一几何）。
         # 走“增广末行图像 + 现有 compose/居中”，单行/多行都与导出的末行整体居中一致。
-        if wants_heart:
+        # detached=True（已有独立爱心图层）时跳过——爱心由 renderer._composite_anchored_heart 单独绘制。
+        if wants_heart and not detached:
             augmented = self._append_ending_heart(Image, non_empty_lines[-1], fit.font_size, fill, warnings)
             if augmented is not None:
                 non_empty_lines[-1] = augmented

@@ -10,9 +10,10 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
+from anchor_resolve import resolve_anchored_hearts
 from glyph_service import GlyphCandidate, render_glyph_thumbnail
-from models import BirthFlowerDesign, Document, EngravingLayout, ImageLayer, TextLayer
-from text_renderer import TextRenderer
+from models import AnchoredHeartLayer, BirthFlowerDesign, Document, EngravingLayout, ImageLayer, TextLayer
+from text_renderer import TextRenderer, _rasterize_heart
 from text_layout import LINE_HEIGHT_RATIO, TextLayoutResult, layout_personalization_text
 from visual_layout import FitTransform, Rect, fit_content_bbox_to_target_rect
 
@@ -213,11 +214,17 @@ def render_document_png(
     path.parent.mkdir(parents=True, exist_ok=True)
     fill = (255, 255, 255, 255) if str(background).strip().casefold() == "white" else (0, 0, 0, 0)
     canvas = Image.new("RGBA", (document.canvas_width, document.canvas_height), fill)
+    # 合成前统一解析锚定爱心：按锚定文字墨迹 + mm 偏移重算每个爱心图层几何，并给被接管文字置
+    # ending_heart_detached（下面 _composite_text_layer 据此不再自贴爱心，避免双爱心）。
+    resolve_anchored_hearts(document)
     # 渲染流程：先清空画布，再按 z_index 从底到顶合成所有 visible 叶子图层（图组已摊平）。
     for layer in document.flat_render_layers():
         if not layer.visible:
             continue
-        if isinstance(layer, ImageLayer):
+        # AnchoredHeartLayer 是 ImageLayer 子类，必须先判，否则会走读盘的圆弧版分支。
+        if isinstance(layer, AnchoredHeartLayer):
+            _composite_anchored_heart(canvas, layer)
+        elif isinstance(layer, ImageLayer):
             _composite_image_layer(canvas, Image, ImageDraw, layer)
         elif isinstance(layer, TextLayer):
             _composite_text_layer(canvas, Image, ImageDraw, ImageFont, layer)
@@ -344,6 +351,25 @@ def _composite_text_layer(canvas, image_module, draw_module, font_module, layer:
         alpha = scratch.getchannel("A").point(lambda value: int(value * max(0, min(1, layer.opacity))))
         scratch.putalpha(alpha)
     canvas.alpha_composite(scratch, (round(layer.x), round(layer.y)))
+
+
+def _composite_anchored_heart(canvas, layer: AnchoredHeartLayer) -> None:
+    """渲染锚定末尾爱心：用归一化 heart_svg_markup 栅格化（与导出 inlineSvg、文字端贴图同一几何），
+
+    贴到 resolve 算好的画布绝对位置 (x, y)、尺寸 (width, height)。避免读磁盘圆弧版导致预览与导出不一致。
+    """
+    width = max(1, round(layer.width * layer.scale_x))
+    height = max(1, round(layer.height * layer.scale_y))
+    fill = getattr(layer, "fill_color", "") or "#111111"
+    heart = _rasterize_heart(fill, width, height)
+    if heart is None:
+        return
+    if layer.opacity < 1:
+        # _rasterize_heart 有 lru_cache：改 alpha 前必须 copy，否则污染缓存图。
+        heart = heart.copy()
+        alpha = heart.getchannel("A").point(lambda value: int(value * max(0, min(1, layer.opacity))))
+        heart.putalpha(alpha)
+    canvas.alpha_composite(heart, (round(layer.x), round(layer.y)))
 
 
 def _svg_layer_transform(layer) -> str:

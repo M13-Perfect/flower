@@ -24,6 +24,7 @@ from ui_app import (
     VIEW_OPERATOR_CONFIG,
     view_cards_for_role,
     order_row_view,
+    target_box_piece_count,
     mark_status_style,
     ai_status_style,
     shop_status_style,
@@ -252,14 +253,24 @@ def test_sanitize_filename_stem_strips_illegal_and_trailing():
     assert sanitize_filename_stem("nul") == "_nul"
 
 
+def _bind_piece_methods(fake):
+    """给 SimpleNamespace 桩绑定一单多件后缀相关的真方法，并补它们读取的默认属性（默认=单件，零后缀）。"""
+    for name in ("_with_piece_suffix", "_piece_index_total", "_update_piece_filename"):
+        setattr(fake, name, getattr(BirthFlowerApp, name).__get__(fake))
+    for name, default in (("parsed_orders", []), ("_parsed_order_index", 0), ("_db_order_piece_count", 0)):
+        if not hasattr(fake, name):
+            setattr(fake, name, default)
+    return fake
+
+
 def _fake_filename_app(typed="", order_no="", db_order=None, inbox=None):
     """只喂 _resolve_output_basename 用到的属性，免去构建整套 UI（headless 易碎）。"""
-    return SimpleNamespace(
+    return _bind_piece_methods(SimpleNamespace(
         filename_template_var=SimpleNamespace(get=lambda: typed),
         current_order_number=order_no,
         _db_order_active_id=db_order,
         _inbox_active=inbox,
-    )
+    ))
 
 
 def test_resolve_output_basename_priority():
@@ -281,10 +292,12 @@ def test_resolve_output_basename_priority():
 def _fake_db_load_app(*, autoparse: bool):
     """喂 _load_db_order 用到的最小桩：捕获 remark/文件名/状态/订单号 + 记录是否触发解析。"""
     captured: dict = {"parse_called": False, "warnings_cleared": False}
+    box = _FakeVar("")
+    box.set = lambda v, _box=box: (_FakeVar.set(_box, v), captured.update(filename=v))[0]  # 既写值又记录
     fake = SimpleNamespace(
         current_order_number="",
         _db_order_active_id=None,
-        filename_template_var=SimpleNamespace(set=lambda v: captured.update(filename=v)),
+        filename_template_var=box,
         status_var=SimpleNamespace(set=lambda v: captured.update(status=v)),
         config=SimpleNamespace(inbox_autoparse=autoparse),
         _set_remark_text=lambda v: captured.update(remark=v),
@@ -292,7 +305,7 @@ def _fake_db_load_app(*, autoparse: bool):
         _refresh_fetch_status=lambda: captured.update(fetch_refreshed=True),
         parse_remark=lambda: captured.update(parse_called=True),
     )
-    return fake, captured
+    return _bind_piece_methods(fake), captured
 
 
 def test_load_db_order_populates_box_filename_and_active_id():
@@ -2549,3 +2562,75 @@ def test_switch_to_admin_after_authed_applies_directly():
     fake, calls = _switch_view_fake(authed=True)
     BirthFlowerApp._on_switch_view(fake, ui_app_module.VIEW_LABELS[VIEW_ADMIN])
     assert calls == [("apply", VIEW_ADMIN)]  # 本次已鉴权 → 自由切，不再问
+
+
+# ===== 一单多件：文件名「-k」后缀防覆盖（target_box_piece_count + piece-suffix helpers） =====
+
+class _FakeVar:
+    def __init__(self, value=""):
+        self._v = value
+
+    def get(self):
+        return self._v
+
+    def set(self, value):
+        self._v = value
+
+
+def _piece_app(*, parsed, index, db_id, db_count, current_no, filename):
+    """造一个只带文件名/件数相关字段的 App 桩，绕开 __init__（headless 无 Tk）。"""
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.parsed_orders = parsed
+    app._parsed_order_index = index
+    app._db_order_active_id = db_id
+    app._db_order_piece_count = db_count
+    app.current_order_number = current_no
+    app.filename_template_var = _FakeVar(filename)
+    return app
+
+
+def test_target_box_piece_count_sums_only_target_boxes():
+    order = {"items": [
+        {"quantity": 2, "is_target_box": True},
+        {"quantity": 1, "is_target_box": True},
+        {"quantity": 5, "is_target_box": False},  # 其他商品不雕刻不计
+    ]}
+    assert target_box_piece_count(order) == 3  # 2 + 1
+    assert target_box_piece_count({"items": []}) == 0
+    assert target_box_piece_count({}) == 0
+    # quantity 缺失/0 的目标盒子行仍按 1 件算
+    assert target_box_piece_count({"items": [{"is_target_box": True}, {"quantity": 0, "is_target_box": True}]}) == 2
+
+
+def test_with_piece_suffix_only_when_multi_piece():
+    # 库件数 4 → 当前第 2 笔 → 订单号-2
+    app = _piece_app(parsed=[1, 2, 3, 4], index=1, db_id="A1", db_count=4, current_no="A1", filename="A1")
+    assert app._with_piece_suffix("A1") == "A1-2"
+    assert app._piece_index_total() == (2, 4)
+    # 单件（库件数 1、队列 1）→ 不加后缀
+    single = _piece_app(parsed=[1], index=0, db_id="A1", db_count=1, current_no="A1", filename="A1")
+    assert single._with_piece_suffix("A1") == "A1"
+
+
+def test_piece_total_falls_back_to_queue_length_without_db_count():
+    # 手填粘贴单：无可信库件数 → 用解析队列长度
+    app = _piece_app(parsed=[1, 2, 3], index=2, db_id=None, db_count=0, current_no="B9", filename="B9")
+    assert app._piece_index_total() == (3, 3)
+    assert app._with_piece_suffix("B9") == "B9-3"
+
+
+def test_piece_total_trusts_db_count_when_order_number_blanked():
+    # 逐件解析把 order_number 留空 → 仍按库订单号兜底信库件数
+    app = _piece_app(parsed=[1, 2], index=1, db_id="C3", db_count=4, current_no="", filename="C3-1")
+    assert app._piece_index_total() == (2, 4)
+
+
+def test_update_piece_filename_overwrites_auto_value_only():
+    # 文件名框是自动值（订单号 / 订单号-数字）→ 覆盖成新后缀
+    app = _piece_app(parsed=[1, 2, 3, 4], index=2, db_id="A1", db_count=4, current_no="A1", filename="A1-1")
+    app._update_piece_filename()
+    assert app.filename_template_var.get() == "A1-3"
+    # 操作员手改成别的名字 → 保留不动
+    custom = _piece_app(parsed=[1, 2, 3, 4], index=2, db_id="A1", db_count=4, current_no="A1", filename="给客户的礼物")
+    custom._update_piece_filename()
+    assert custom.filename_template_var.get() == "给客户的礼物"

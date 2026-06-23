@@ -60,7 +60,7 @@ from glyph_service import (
     remove_glyph_override,
     resolve_glyph,
 )
-from models import AIParseConfig, BirthFlowerDesign, Document, EngravingLayout, FlowerAsset, FontAsset, ImageLayer, ParsePromptTrace, TextLayer, ParseResult, add_image_layer, add_text_layer, delete_layer, hit_test, move_layer
+from models import AIParseConfig, AnchoredHeartLayer, BirthFlowerDesign, Document, EngravingLayout, FlowerAsset, FontAsset, ImageLayer, ParsePromptTrace, TextLayer, ParseResult, add_image_layer, add_text_layer, delete_layer, hit_test, move_layer
 from order_importer import load_order_from_file, load_order_remark_from_file, order_from_payload
 from parse_pipeline import parse_orders_auto
 import inbox_service_client as inbox_client
@@ -83,6 +83,13 @@ from text_layout import (
     SAFE_MARGIN_X,
     SAFE_MARGIN_Y,
     ENDING_HEART_ADVANCE_RATIO,
+    ENDING_HEART_GAP_RATIO,
+)
+from anchor_resolve import (
+    compute_text_fit,
+    ensure_anchored_heart_for,
+    remove_anchored_heart_for,
+    resolve_anchored_hearts,
 )
 
 
@@ -324,6 +331,19 @@ def _short_dt(iso: str | None) -> str:
         return f"{date[5:]} {rest[:5]}".strip() or str(iso)
     except Exception:
         return str(iso)
+
+
+def target_box_piece_count(order: dict) -> int:
+    """库订单需雕刻的「件数」= 各目标盒子行 quantity 之和（每行至少计 1 件）。
+
+    其他商品（is_target_box=False，如赠品/卡片）不雕刻、不计；items 缺失 → 0（未知，按单件处理）。
+    >1 时表示一单多件，文件名需加「-k」后缀（见 _with_piece_suffix），避免逐件生成互相覆盖。
+    """
+    total = 0
+    for it in order.get("items") or []:
+        if it.get("is_target_box", True):
+            total += max(int(it.get("quantity") or 0), 1)
+    return total
 
 
 def order_row_view(order: dict) -> dict:
@@ -1264,6 +1284,7 @@ class BirthFlowerApp:
         # 生成成功后该单 ai_status→recognized 自动掉出队列（订单不删，留表里带「AI已处理」标），队首前进到下一单。
         self._db_order_active_id: str | None = None  # 当前已载入的库订单号（reload-on-change 守卫，避免每轮重刷同一单）
         self._db_order_after_id: str | None = None   # 库轮询的 Tk after 句柄
+        self._db_order_piece_count: int = 0  # 当前库订单需雕刻件数（items[] 目标盒子和），>1 时文件名加「-k」后缀防覆盖
         # 「抓取订单」面板（操作员配置端，2026-06-19）：驱动 inbox-service 的自动抓开关 ScrapeControl。
         self.fetch_status_var: tk.StringVar | None = None
         self.scrape_from_var: tk.StringVar | None = None
@@ -3953,10 +3974,12 @@ class BirthFlowerApp:
         order_id = imported.order_id.strip()
         remark = " ".join(imported.remark.split())
         self._db_order_active_id = order_id or None
+        self._db_order_piece_count = target_box_piece_count(order)  # 一单多件时供文件名「-k」后缀
         # 已知库订单号 → 写进 current_order_number，供生成后标记回写 + 文件名兜底（即便不自动解析也成立）。
         if order_id:
             self.current_order_number = order_id
             self.filename_template_var.set(order_id)
+            self._update_piece_filename()  # 多件库单：把文件名刷成 订单号-1，逐笔切换/生成时各自后缀
         self._set_remark_text(f"{order_id}\n{remark}" if order_id else remark)
         self._set_warnings([])
         self.status_var.set(f"📥 已从库载入订单 {order_id or '(无单号)'}（复核后点「生成」；生成成功后自动载入下一单）")
@@ -4678,6 +4701,7 @@ class BirthFlowerApp:
         self._apply_results_to_fields(result)  # 映射 B：把解析值回填进各 info 字段的只读结果框
         # 解析可观测③：本单识别结果刷进「解析结果」只读框（操作员/管理员端常驻，异常才弹窗）。
         self._render_parse_result_box(result, self._parsed_order_index, len(self.parsed_orders))
+        self._update_piece_filename()  # 逐笔切换时把文件名刷成 订单号-k（一单多件防覆盖）
         self._refresh_flower_choices()
         self._select_flower_by_current_fields()
         self._select_font_by_current_field()
@@ -5255,6 +5279,45 @@ class BirthFlowerApp:
             LOGGER.warning("读取模板物理宽度失败,DXF 用默认尺寸: %s", exc)
             return None
 
+    def _piece_index_total(self) -> tuple[int, int]:
+        """(k, n)：当前是「第 k 件 / 共 n 件」。n>1 才需要文件名后缀。
+
+        n 优先取数据库订单 items[] 目标盒子件数（仅当当前单号 == 库载入单号时可信），回退解析队列长度；
+        k = 解析队列当前位置（逐笔「上一笔/下一笔」切换即换件）。手填粘贴单无库件数时用队列长度。
+        """
+        queue_n = len(self.parsed_orders)
+        active = self._db_order_active_id
+        # 库件数可信：当前单还是这条库订单（单号相同，或逐件解析把 order_number 留空时按库单号兜底）。
+        db_trusted = bool(active) and (not self.current_order_number or self.current_order_number == active)
+        db_n = self._db_order_piece_count if db_trusted else 0
+        n = db_n if db_n > 1 else queue_n
+        k = (self._parsed_order_index + 1) if queue_n else 1
+        if n <= 0:
+            return 1, 0
+        return max(1, min(k, n)), n
+
+    def _with_piece_suffix(self, base: str) -> str:
+        """一单多件（n>1）时给文件名主干加「-k」后缀，单件原样返回。"""
+        base = base.strip()
+        if not base:
+            return base
+        k, n = self._piece_index_total()
+        return f"{base}-{k}" if n > 1 else base
+
+    def _update_piece_filename(self) -> None:
+        """把「文件名」框刷成 订单号-k（多件）/ 订单号（单件）。
+
+        仅当框还是「自动值」（订单号本身或 订单号-数字）时覆盖；操作员手改成别的名字则保留不动。
+        """
+        base = sanitize_filename_stem(self.current_order_number or self._db_order_active_id or "")
+        if not base:
+            return
+        target = self._with_piece_suffix(base)
+        current = self.filename_template_var.get().strip()
+        if not current or re.fullmatch(rf"{re.escape(base)}(-\d+)?", current):
+            if current != target:
+                self.filename_template_var.set(target)
+
     def _resolve_output_basename(self, base_output_path: Path) -> str:
         """决定导出文件名主干（不含扩展名），按优先级回退：
 
@@ -5267,10 +5330,10 @@ class BirthFlowerApp:
             return typed
         order_no = sanitize_filename_stem(self.current_order_number)
         if order_no:
-            return order_no
+            return self._with_piece_suffix(order_no)  # 文件名框被清空时兜底也带「-k」防多件覆盖
         db_order_no = sanitize_filename_stem(self._db_order_active_id or "")
         if db_order_no:
-            return db_order_no
+            return self._with_piece_suffix(db_order_no)  # 多件库单兜底也带「-k」
         if self._inbox_active is not None:
             inbox_stem = sanitize_filename_stem(self._inbox_active.stem)
             if inbox_stem:
@@ -5540,7 +5603,9 @@ class BirthFlowerApp:
 
     def _on_layer_list_double_click(self, event) -> None:
         layer = self._layer_from_listbox_event(event)
-        if isinstance(layer, ImageLayer):
+        if isinstance(layer, AnchoredHeartLayer):
+            self._open_heart_anchor_dialog(layer)
+        elif isinstance(layer, ImageLayer):
             self.open_selected_material_editor()
         elif layer is not None:
             self.status_var.set("文本图层暂不使用素材编辑；请使用文本属性区域。")
@@ -5667,7 +5732,9 @@ class BirthFlowerApp:
         return s if len(s) <= limit else s[: max(1, limit - 1)] + "…"
 
     def _layer_icon_spec(self, layer) -> tuple[str, str]:
-        """类型小图标：文本=蓝底 T，素材/图片=绿底 ▣。"""
+        """类型小图标：文本=蓝底 T，末尾爱心=粉底 ♥，素材/图片=绿底 ▣。"""
+        if isinstance(layer, AnchoredHeartLayer):
+            return ("♥", "#e0556f")
         if isinstance(layer, TextLayer):
             return ("T", APP_COLORS["accent"])
         return ("▣", "#3fb27f")
@@ -6005,9 +6072,13 @@ class BirthFlowerApp:
     def _layer_menu(self, layer, event=None) -> None:
         self._select_layer_row(layer)
         menu = tk.Menu(self.root, tearoff=False)
-        menu.add_command(label="位置 / 尺寸…", command=lambda layer_ref=layer: self._open_layer_geometry_dialog(layer_ref))
+        # 锚定爱心：调相对文字的 mm 参数（绝对 X/Y 每帧被 resolve 覆盖，不在此调）。
+        if isinstance(layer, AnchoredHeartLayer):
+            menu.add_command(label="爱心间距 / 大小…", command=lambda layer_ref=layer: self._open_heart_anchor_dialog(layer_ref))
+        else:
+            menu.add_command(label="位置 / 尺寸…", command=lambda layer_ref=layer: self._open_layer_geometry_dialog(layer_ref))
         # 改库 / 改素材或字体：行内不放下拉，统一收进右键菜单（候选来自 active_bundle）。
-        if isinstance(layer, ImageLayer):
+        if isinstance(layer, ImageLayer) and not isinstance(layer, AnchoredHeartLayer):
             lib_labels = list(self._image_lib_by_label)
             if lib_labels:
                 lib_menu = tk.Menu(menu, tearoff=False)
@@ -6081,6 +6152,75 @@ class BirthFlowerApp:
 
         def apply_and_close() -> None:
             self._apply_layer_production()
+            win.destroy()
+
+        self._btn(win, "应用", apply_and_close, primary=True).grid(
+            row=len(rows), column=0, columnspan=2, padx=10, pady=10, sticky="ew"
+        )
+        win.update_idletasks()
+        win.grab_set()
+
+    def _open_heart_anchor_dialog(self, layer) -> None:
+        """末尾爱心 mm 调节框：与文字的间距 / 上下偏移 / 大小（mm）。
+
+        爱心是锚定文字的从属图层，位置每帧由 anchor_resolve 重算，故不调绝对 X/Y，改调相对
+        文字的 mm 参数。预填「当前有效 mm」：显式值直接显示，自动(None)时按已 resolve 的实际像素反算。
+        """
+        if not isinstance(layer, AnchoredHeartLayer):
+            return
+        self.document.selected_layer_id = layer.id
+        try:
+            layout = layout_from_values(self.layout_vars)
+        except ValueError:
+            layout = EngravingLayout()
+        phys_w = self._template_physical_size_mm(layout)[0] or 80.0
+        px_per_mm = (self.document.canvas_width / phys_w) if phys_w else 1.0
+        anchor = self.document.layer_by_id(layer.anchor_layer_id)
+        if layer.size_mm is not None:
+            size_mm = float(layer.size_mm)
+        else:
+            size_mm = (layer.height / px_per_mm) if px_per_mm else 0.0
+        if layer.gap_mm is not None:
+            gap_mm = float(layer.gap_mm)
+        else:
+            try:
+                fit = compute_text_fit(anchor) if isinstance(anchor, TextLayer) else None
+                gap_px = ENDING_HEART_GAP_RATIO * fit.font_size if fit is not None else 0.0
+            except Exception:
+                gap_px = 0.0
+            gap_mm = (gap_px / px_per_mm) if px_per_mm else 0.0
+        offset_mm = float(layer.offset_y_mm or 0.0)
+
+        gap_var = tk.StringVar(value=f"{gap_mm:.2f}")
+        offset_var = tk.StringVar(value=f"{offset_mm:.2f}")
+        size_var = tk.StringVar(value=f"{size_mm:.2f}")
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("末尾爱心")
+        win.transient(self.root)
+        win.columnconfigure(1, weight=1)
+        rows = [("与文字间距 (mm)", gap_var), ("上下偏移 (mm)", offset_var), ("大小 (mm)", size_var)]
+        for i, (lbl, var) in enumerate(rows):
+            ctk.CTkLabel(win, text=lbl).grid(row=i, column=0, padx=10, pady=6, sticky="w")
+            ctk.CTkEntry(win, textvariable=var, width=120).grid(row=i, column=1, padx=10, pady=6, sticky="ew")
+
+        def apply_and_close() -> None:
+            try:
+                gap = float(gap_var.get())
+                off = float(offset_var.get())
+                size = float(size_var.get())
+            except ValueError:
+                messagebox.showerror("末尾爱心", "间距 / 偏移 / 大小必须是数字")
+                return
+            if size <= 0:
+                messagebox.showerror("末尾爱心", "大小必须大于 0")
+                return
+            layer.gap_mm = gap
+            layer.offset_y_mm = off
+            layer.size_mm = size
+            self.status_var.set("末尾爱心参数已应用")
+            self._redraw_preview()
+            self._refresh_layers_panel()
             win.destroy()
 
         self._btn(win, "应用", apply_and_close, primary=True).grid(
@@ -6371,9 +6511,17 @@ class BirthFlowerApp:
         self._select_font_by_current_field()
 
     def _merge_additional_library_assets(self) -> None:
-        """单库时空操作；多库时把「首库之外」的 image/font 库 entries 转成资产并入候选。"""
+        """把素材库 entries 里 scan_flower_assets 没覆盖到的素材并入候选。
+
+        - 图像库：遍历**全部**库（含主库）。主库里带月份名的花已由 scan_flower_assets 收录，
+          这里把**无月份名**的素材（如 X.svg、png 图层）按 entry 补进来（month/flower 兜底，
+          见 _entry_to_flower_asset），使界面素材列表与文件夹实际内容一致——否则主库里
+          不带月份名的新素材两条扫描路都收不到（这是「读 25 文件、列表只 24」的根因）。
+        - 字体库：scan_font_assets 已覆盖主库全部字体，故只并「首库之外」的附加字体库。
+        按 path.name 去重，不会与 scan 结果重复。
+        """
         existing = {asset.path.name for asset in self.flower_assets}
-        for library in self.active_bundle.image_libraries[1:]:
+        for library in self.active_bundle.image_libraries:
             for entry in library.entries:
                 if entry.path.name not in existing:
                     self.flower_assets.append(self._entry_to_flower_asset(entry))
@@ -6550,6 +6698,12 @@ class BirthFlowerApp:
         layer.glyph_overrides = overrides
         # Font 4 等字体末尾改用独立实心爱心：显式置位（非该字体则清零，便于切字体时去掉爱心）。
         layer.ending_heart = bool(wants_ending_heart)
+        # 末尾爱心改造成独立锚定图层：选 Font 4 自动补建爱心图层（面板可单独选中、调 mm），
+        # 切走则移除该文字的爱心图层。几何由 resolve_anchored_hearts 每次重绘/导出前重算。
+        if layer.ending_heart:
+            ensure_anchored_heart_for(self.document, layer)
+        else:
+            remove_anchored_heart_for(self.document, layer.id)
         if applied:
             self.current_glyph_overrides = dict(overrides)
             self.status_var.set("已自动应用字形")
@@ -6759,11 +6913,17 @@ class BirthFlowerApp:
         canvas.create_rectangle(sx(0), sy(0), sx(layout.canvas_width), sy(layout.canvas_height), outline="#cccccc")
         self.document.canvas_width = layout.canvas_width
         self.document.canvas_height = layout.canvas_height
+        # 渲染前统一解析锚定爱心：按锚定文字墨迹 + mm 偏移重算每个爱心图层几何，并给被接管文字置
+        # ending_heart_detached（文字端不再自贴爱心，避免双爱心）。mm↔px 用模板物理宽度。
+        resolve_anchored_hearts(self.document, physical_width_mm=self._template_physical_size_mm(layout)[0])
         # 画布刷新只读取 Document：先清空，再按图层顺序逐层渲染可见图层。
         for layer in self.document.sorted_layers():
             if not layer.visible:
                 continue
-            if isinstance(layer, ImageLayer):
+            # AnchoredHeartLayer 是 ImageLayer 子类，必须先判，否则会走读盘的圆弧版折线分支。
+            if isinstance(layer, AnchoredHeartLayer):
+                self._draw_anchored_heart_preview(canvas, layer, scale, offset_x, offset_y)
+            elif isinstance(layer, ImageLayer):
                 self._draw_image_layer_preview(canvas, layer, sx, sy)
             elif isinstance(layer, TextLayer):
                 self._draw_text_layer_preview(canvas, layer, scale, offset_x, offset_y)
@@ -6785,6 +6945,27 @@ class BirthFlowerApp:
             self.inline_text_window = None
             self._place_inline_text_editor()
         self._redraw_preview_rulers(layout, scale, offset_x, offset_y)
+
+    def _heart_px_per_mm(self, layout: EngravingLayout) -> float:
+        """画布像素/mm：与 resolve_anchored_hearts 同一基准（canvas_width / 模板物理宽度 mm）。"""
+        phys_w = self._template_physical_size_mm(layout)[0] or 80.0
+        return (self.document.canvas_width / phys_w) if phys_w else 1.0
+
+    def _effective_gap_mm(self, heart, px_per_mm: float) -> float:
+        """爱心当前“有效水平间距(mm)”：显式 gap_mm 直接用；自动(None)时按旧 ratio*字号反算。
+
+        拖动时先用它把 None 物化成具体 mm，再叠加位移增量——第一帧之后 gap_mm 已是显式值。
+        """
+        if heart.gap_mm is not None:
+            return float(heart.gap_mm)
+        anchor = self.document.layer_by_id(heart.anchor_layer_id)
+        if not isinstance(anchor, TextLayer):
+            return 0.0
+        try:
+            fit = compute_text_fit(anchor)
+            return (ENDING_HEART_GAP_RATIO * fit.font_size) / px_per_mm if px_per_mm else 0.0
+        except Exception:
+            return 0.0
 
     def _template_physical_size_mm(self, layout: EngravingLayout) -> tuple[float, float]:
         """返回当前模板的输出物理尺寸(mm)。读取失败时按既有 DXF 默认宽度 80mm 等比派生高度。"""
@@ -6972,6 +7153,36 @@ class BirthFlowerApp:
             return
         self.preview_text_images.append(photo)
         canvas.create_image(sx(layer.x), sy(layer.y), image=photo, anchor="nw", tags=("layer_art", f"layer:{layer.id}"))
+
+    def _draw_anchored_heart_preview(self, canvas: tk.Canvas, layer: AnchoredHeartLayer, scale: float, offset_x: float, offset_y: float) -> None:
+        """预览锚定末尾爱心：用归一化 heart_svg_markup 栅格化（与导出 inlineSvg、文字端贴图同一几何），
+
+        贴到 resolve 算好的画布绝对位置/尺寸。避免读磁盘圆弧版导致预览与导出不一致。
+        """
+        try:
+            from PIL import ImageTk
+        except Exception:
+            return
+        from text_renderer import _rasterize_heart
+
+        target_width = max(1, round(layer.width * layer.scale_x * scale))
+        target_height = max(1, round(layer.height * layer.scale_y * scale))
+        fill = getattr(layer, "fill_color", "") or "#111111"
+        image = _rasterize_heart(fill, target_width, target_height)
+        if image is None:
+            return
+        try:
+            photo = ImageTk.PhotoImage(image, master=canvas)
+        except Exception:
+            return
+        self.preview_text_images.append(photo)
+        canvas.create_image(
+            offset_x + layer.x * scale,
+            offset_y + layer.y * scale,
+            image=photo,
+            anchor="nw",
+            tags=("layer_art", f"layer:{layer.id}"),
+        )
 
     def _draw_text_layer_preview(self, canvas: tk.Canvas, layer: TextLayer, scale: float, offset_x: float, offset_y: float) -> None:
         """普通状态只显示 TextRenderer 输出的透明文字图；输入控件不进入最终画布。"""
@@ -7576,13 +7787,28 @@ class BirthFlowerApp:
         dx = screen_dx / scale
         dy = screen_dy / scale
         if self._drag_mode == "resize":
-            if isinstance(layer, TextLayer):
+            if isinstance(layer, AnchoredHeartLayer):
+                # 锚定爱心几何每帧被 resolve 覆盖：把缩放手柄拖动折成 size_mm（大小），才会“记住”。
+                px_per_mm = self._heart_px_per_mm(layout)
+                if px_per_mm:
+                    layer.size_mm = max(0.5, (layer.height + dy) / px_per_mm)
+            elif isinstance(layer, TextLayer):
                 CanvasTextItem(layer).resize_by(dx, dy)
             else:
                 layer.width = max(20, layer.width + dx)
                 layer.height = max(20, layer.height + dy)
         else:
-            if isinstance(layer, TextLayer):
+            if isinstance(layer, AnchoredHeartLayer):
+                # 锚定爱心 x/y 每帧被 resolve 覆盖：把拖动位移折成相对文字的 mm 偏移
+                # （gap_mm 左右、offset_y_mm 上下），既能自由拖动、又保持锚定跟随文字。
+                px_per_mm = self._heart_px_per_mm(layout)
+                anchor = self.document.layer_by_id(layer.anchor_layer_id)
+                anchor_sx = float(getattr(anchor, "scale_x", 1.0) or 1.0) if anchor is not None else 1.0
+                anchor_sy = float(getattr(anchor, "scale_y", 1.0) or 1.0) if anchor is not None else 1.0
+                if px_per_mm:
+                    layer.gap_mm = self._effective_gap_mm(layer, px_per_mm) + (dx / anchor_sx) / px_per_mm
+                    layer.offset_y_mm = float(layer.offset_y_mm or 0.0) + (dy / anchor_sy) / px_per_mm
+            elif isinstance(layer, TextLayer):
                 CanvasTextItem(layer).move_by(dx, dy)
             else:
                 layer.x = max(0, layer.x + dx)

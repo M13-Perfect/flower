@@ -59,6 +59,22 @@ def test_zero_config_generic_images(tmp_path: Path):
     assert "month" not in border.tags  # 非花朵素材无月份标签
 
 
+def test_zero_config_mixes_birth_flower_and_generic(tmp_path: Path):
+    """并集扫描：带月份的花与不带月份的新素材在同一文件夹里共存，都要进库。"""
+    _write(tmp_path / "March_Daffodil.svg")  # 带月份名 → 保留 month/flower 标签
+    _write(tmp_path / "X.svg")  # 不带月份名 → 旧逻辑会被丢弃，现按文件名收
+    (tmp_path / "lens-clear.png").write_bytes(b"\x89PNG\r\n")
+
+    library = MaterialLibrary.from_folder(tmp_path, kind="image")
+    keys = {entry.key for entry in library.entries}
+    assert keys == {"daffodil", "x", "lens-clear"}  # 三个都进库，无重复
+
+    daffodil = library.by_key("daffodil")
+    assert daffodil is not None and daffodil.tags.get("month") == 3  # 花仍带月份标签
+    x = library.by_key("x")
+    assert x is not None and "month" not in x.tags  # 非花素材无月份标签
+
+
 # ---------------------------------------------------------------- 清单驱动
 def test_manifest_drives_keys_aliases_and_defaults(tmp_path: Path):
     _write(tmp_path / "leo.svg")

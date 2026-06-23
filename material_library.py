@@ -3,9 +3,10 @@
 一个 **素材库** = 一个文件夹，可选放一份 ``library.json`` 清单：
 
 - 有清单：按清单声明 key/显示名/别名/标签/每素材默认生产参数（最灵活，支持非花朵素材）。
-- 无清单（零配置）：扫文件夹自动成库。对图像库优先复用 ``asset_resolver`` 的
-  birth-flower 月份/花朵识别（保留旧链路标签 ``tags={"month","flower"}``）；
-  识别不到月份则退化为「按文件名取 key」的通用图像库。
+- 无清单（零配置）：扫文件夹自动成库。图像库取「并集」——带月份名的文件复用
+  ``asset_resolver`` 的 birth-flower 月份/花朵识别（保留旧链路标签
+  ``tags={"month","flower"}``），其余 png/svg 一律按文件名取 key 收录；月份识别只决定
+  带不带标签，不再当过滤闸门，故文件夹下任意图片都会进库。
 
 库对外暴露两类视图：
 - ``by_key`` / ``match``：UI / 解析器据 key 或别名定位具体素材 → 文件路径。
@@ -221,26 +222,32 @@ def _from_manifest(
 # 零配置扫描
 # ---------------------------------------------------------------------- #
 def _scan_image_entries(root: Path) -> tuple[MaterialEntry, ...]:
-    """先试 birth-flower 月份识别（保留旧标签），识别不到再做通用图像扫描。"""
-    flower_assets = scan_flower_assets(root)
-    if flower_assets:
-        return tuple(
-            MaterialEntry(
-                key=asset.asset_key or _asset_key(asset.path.stem),
-                name=asset.display_name or asset.name,
-                path=asset.path,
-                aliases=_dedupe((asset.display_name, asset.name)),
-                tags={"month": asset.month, "flower": asset.flower},  # 兼容旧 month/flower 定位
-                kind="image",
-                is_vector_safe=asset.is_vector_safe,
-                warnings=asset.embedded_raster_warnings,
-            )
-            for asset in flower_assets
-        )
+    """并集扫描：带月份名的 birth-flower 保留 month/flower 标签，其余图片按文件名收。
 
-    entries: list[MaterialEntry] = []
+    旧逻辑是「扫到任一带月份的花就只返回这些花」（全有或全无），导致同文件夹里
+    不带月份名的素材（如 X.svg、眼镜片图）永远进不来。现改为并集：月份识别只决定
+    「带不带 month/flower 标签」，不再当过滤闸门——文件夹下任意 png/svg 都会进库，
+    而生日花卡的「月份→花」标签照常保留（供 GPT catalog 按月份选花）。
+    """
+    flower_assets = scan_flower_assets(root)
+    entries: list[MaterialEntry] = [
+        MaterialEntry(
+            key=asset.asset_key or _asset_key(asset.path.stem),
+            name=asset.display_name or asset.name,
+            path=asset.path,
+            aliases=_dedupe((asset.display_name, asset.name)),
+            tags={"month": asset.month, "flower": asset.flower},  # 兼容旧 month/flower 定位
+            kind="image",
+            is_vector_safe=asset.is_vector_safe,
+            warnings=asset.embedded_raster_warnings,
+        )
+        for asset in flower_assets
+    ]
+
+    # 带月份名的花已收录（带标签）；其余图片按文件名补进来，月份识别不再当过滤闸门。
+    seen = {asset.path for asset in flower_assets}
     for path in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
-        if not path.is_file() or path.suffix.casefold() not in IMAGE_EXTENSIONS:
+        if path in seen or not path.is_file() or path.suffix.casefold() not in IMAGE_EXTENSIONS:
             continue
         entries.append(
             MaterialEntry(

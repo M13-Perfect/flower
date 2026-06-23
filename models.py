@@ -9,6 +9,10 @@ from production import ProductionParams
 
 logger = logging.getLogger(__name__)
 
+# 末尾爱心独立图层的素材文件（磁盘手绘圆弧版，仅作预览/旧 SVG 导出的回退引用；
+# 矢量 DXF/纯矢量 SVG 走 heart_symbol.heart_svg_markup 的归一化版，见 desktop_export._anchored_heart_layer）。
+_HEART_SVG_PATH = Path(__file__).resolve().parent / "assets" / "symbols" / "heart.svg"
+
 
 @dataclass
 class ParseResult:
@@ -197,6 +201,27 @@ class ImageLayer(Layer):
 
 
 @dataclass
+class AnchoredHeartLayer(ImageLayer):
+    """末尾独立实心爱心图层：锚定某 TextLayer，位置由文字墨迹 + mm 偏移每单自动重算。
+
+    取代旧「死贴在文字墨迹后」的 textLayout.endingHeart：爱心成为图层面板里可单独选中、
+    可调 mm 间距/上下偏移/大小的独立图层，但仍跟随锚定文字（不同名字宽度都对齐）。几何由
+    ``anchor_resolve.resolve_anchored_hearts`` 在「预览/seed/导出」前统一就地重算写回 x/y/width/height。
+
+    gap_mm / size_mm 为 None 时回落旧 ratio（``ENDING_HEART_*_RATIO * 字号``）——与旧烘焙路径
+    逐像素一致（零回归）；非 None 时按 mm 显式取值（mm→px 用画布物理尺寸换算）。
+    """
+
+    type: str = "anchored_heart"
+    anchor_layer_id: str = ""        # 锚定到哪个 TextLayer.id
+    anchor_mode: str = "text_end"    # 预留扩展；当前仅 text_end（贴末行末字右侧、竖直居中）
+    gap_mm: float | None = None      # 与文字水平间距(mm)；None=自动(ENDING_HEART_GAP_RATIO*字号)
+    offset_y_mm: float = 0.0         # 上下偏移(mm)，正=下移；0=竖直居中于末行墨迹
+    size_mm: float | None = None     # 爱心高(mm)；None=自动(ENDING_HEART_SIZE_RATIO*字号)
+    fill_color: str = "#111111"      # 爱心填充色（resolve 时从锚定文字色同步）
+
+
+@dataclass
 class TextLayer(Layer):
     """可编辑文本图层；保留原始文字，并用 render_text 承载字形替换后的视觉输出。"""
 
@@ -230,6 +255,9 @@ class TextLayer(Layer):
     # Font 4 等字体：末行末尾追加独立实心爱心符号（见 heart_symbol / glyph_service.font_uses_symbol_heart）。
     # 由 ui_app/批量在套用自动字形规则时按字体置位；预览与导出据此追加爱心，保持字体无感知。
     ending_heart: bool = False
+    # 派生缓存（由 anchor_resolve.resolve_anchored_hearts 置位）：本文字图层的末尾爱心已交给独立
+    # AnchoredHeartLayer 处理 → 预览/导出此处不再贴/烘爱心（但仍按 ending_advance 给爱心让位，名字位置不变）。
+    ending_heart_detached: bool = False
 
     def __post_init__(self) -> None:
         """兼容旧 TextLayer：旧数据只有 text 时，迁移出 original_text/render_text。"""
@@ -516,6 +544,38 @@ def add_text_layer(
     )
     document.layers.append(layer)
     document.selected_layer_id = layer.id
+    document.normalize_z_indexes()
+    return layer
+
+
+def add_anchored_heart_layer(
+    document: Document,
+    *,
+    anchor_layer_id: str,
+    name: str = "末尾爱心",
+    gap_mm: float | None = None,
+    offset_y_mm: float = 0.0,
+    size_mm: float | None = None,
+    fill_color: str = "#111111",
+    path: Path | str | None = None,
+) -> AnchoredHeartLayer:
+    """新建锚定末尾爱心图层（从属图层，**不**抢占 selected——建后仍应保持选中文字）。
+
+    几何（x/y/width/height）留给 ``anchor_resolve.resolve_anchored_hearts`` 按锚定文字每单重算。
+    ``path`` 缺省指向磁盘 heart.svg，仅作预览/旧 SVG 导出回退；权威矢量导出走归一化 inlineSvg。
+    """
+    layer = AnchoredHeartLayer(
+        name=name,
+        path=Path(path) if path else _HEART_SVG_PATH,
+        anchor_layer_id=anchor_layer_id,
+        gap_mm=gap_mm,
+        offset_y_mm=offset_y_mm,
+        size_mm=size_mm,
+        fill_color=fill_color or "#111111",
+        z_index=len(document.layers),
+        lock_aspect_ratio=True,
+    )
+    document.layers.append(layer)
     document.normalize_z_indexes()
     return layer
 
