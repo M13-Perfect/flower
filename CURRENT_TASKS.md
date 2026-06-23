@@ -1,7 +1,19 @@
 # CURRENT_TASKS — flower
 
 > 配 `PROJECT_INDEX.md` 一起读。导出/EzCad 细节看 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
-> 更新：2026-06-18。
+> 更新：2026-06-23。
+
+## 本轮（2026-06-23）引用字段系统 UI 修复 · 待 Codex 执行
+
+> **执行计划（自包含，交给 Codex 直接做）**：`docs/superpowers/plans/2026-06-23-reference-field-ui-fix-execplan.md`。
+> 设计基线：`docs/superpowers/plans/2026-06-23-reference-field-system.md`。
+
+修两个已确认 bug（均在 `ui_app.py` UI 集成层，后端 `prompt_references.py` 已完成有测试）：
+- **现象1**：背景提示词编辑器直显 `{{field:UUID}}`，缺 token→`/名称` 显示层（`render_template_view` 只接预览框）。
+- **现象2**：字段名仅 `<Return>` 提交到 `product.reference_fields`，斜杠菜单读权威态 → 读旧名 `info3`；且 `_reference_fields_from_field_defs` 回写不读 `name_var` → 改名未回车被静默丢失。
+- 固定序号稳定/不复用、预览==实发(OpenAI) **已正确**，无需改。
+
+执行顺序：A=现象2（失焦提交+回写补名，零编辑器风险，先发）→ B=现象1（tk.Text tag 显示层）→ C=可选收尾。决策已拍板见执行计划 §0.3（维持拒绝重名 / 不自动改 info3 / MVP 不做 chip 原子性 / 不清理 background_prompt / DeepSeek-strip 预览口径选做）。
 
 ## 本轮（2026-06-18）素材映射改为「按花名」（不再用月份选花）
 
