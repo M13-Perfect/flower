@@ -1,0 +1,117 @@
+{
+  "canvas": {
+    "background": {
+      "type": "transparent"
+    },
+    "height": 1280,
+    "unit": "px",
+    "width": 1732
+  },
+  "exportSettings": {
+    "dxf": {
+      "textMode": "paths",
+      "units": "mm"
+    },
+    "physical": {
+      "widthMm": 80.0
+    },
+    "png": {
+      "background": "transparent",
+      "scale": 1
+    },
+    "schemaVersion": "1.0",
+    "svg": {
+      "includeMetadata": true,
+      "preserveText": false,
+      "preserveVector": true
+    },
+    "text": {
+      "fill": "solid"
+    }
+  },
+  "layers": [
+    {
+      "exportable": true,
+      "height": 1120.4215190957877,
+      "id": "baseline-image",
+      "inlineSvg": "<sha256:26290cd90fdd2ca29b8bcb7bd2cd1b4408a7e20b0a6747e031fc7e9a3d399e7c len:47248>",
+      "locked": false,
+      "name": "CherryMarch",
+      "opacity": 1.0,
+      "preserveVector": true,
+      "rotation": 0.0,
+      "scaleX": 1.0,
+      "scaleY": 1.0,
+      "tags": [],
+      "type": "svg",
+      "viewBox": {
+        "height": 3000.0,
+        "width": 3000.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "visible": true,
+      "width": 1120.4215190957877,
+      "x": -165.71723383012693,
+      "y": -172.23362896539265,
+      "zIndex": 0
+    },
+    {
+      "exportable": true,
+      "fontRef": {
+        "family": "Birthmonth_font",
+        "path": "Birthmonth_font.ttf"
+      },
+      "height": 200.0,
+      "id": "baseline-text",
+      "layout": {
+        "mode": "box",
+        "overflow": "visible",
+        "verticalAlign": "middle"
+      },
+      "locked": false,
+      "name": "Text",
+      "opacity": 1.0,
+      "rotation": 0.0,
+      "scaleX": 1.0,
+      "scaleY": 1.0,
+      "style": {
+        "align": "center",
+        "bold": false,
+        "boldStrength": 0.0,
+        "fill": "#111111",
+        "fontSize": 155.0,
+        "letterSpacing": 0.0,
+        "lineHeight": 1.2,
+        "underline": false
+      },
+      "tags": [],
+      "text": "Mia",
+      "textLayout": {
+        "fontSize": 155,
+        "lineHeight": 1.2,
+        "lines": [
+          "Mia"
+        ],
+        "origins": [
+          [
+            172.5,
+            132.5
+          ]
+        ]
+      },
+      "type": "text",
+      "visible": true,
+      "width": 600.0,
+      "x": 200.0,
+      "y": 900.0,
+      "zIndex": 1
+    }
+  ],
+  "metadata": {
+    "appVersion": "",
+    "orderId": "",
+    "templateId": "desktop"
+  },
+  "schemaVersion": "1.0"
+}
