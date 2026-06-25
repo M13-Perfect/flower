@@ -3482,11 +3482,11 @@ class BirthFlowerApp:
         # self._btn(
         #     action_row, "+ 通用图层", self._add_universal_layer, primary=True
         # ).grid(row=0, column=1, padx=(0, 6))
+        # Packet 2：合并「+ 文字图层 / + 图片图层」为单一「+ 添加图层」入口（修 P3 入口割裂）。
+        # 点击弹原生 tk.Menu（文字/图片素材/空白内容层/普通组合/自动布局组合），各项复用现有
+        # add_* / group_layers 处理器，不另写逻辑。组合项 <2 选层时置灰（复用右键同款 guard）。
         self._btn(
-            action_row, "+ 文字图层", self._add_text_layer_from_fields
-        ).grid(row=0, column=2, padx=(0, 6))
-        self._btn(
-            action_row, "+ 图片图层", self._add_selected_flower_to_canvas
+            action_row, "+ 添加图层", self._show_add_layer_menu, primary=True
         ).grid(row=0, column=3)
 
         library_box = ctk.CTkFrame(body, fg_color="transparent")
@@ -8061,6 +8061,68 @@ class BirthFlowerApp:
         self._refresh_layers_panel()
         self._redraw_preview()
 
+    def _show_add_layer_menu(self) -> None:
+        """Packet 2：单一「+ 添加图层」入口。弹原生 tk.Menu（复用 _layer_menu/资源选择器的
+        tk.Menu 惯用法，避开 CustomTkinter 引用泄漏），各项复用现有处理器，不另写逻辑。"""
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(label="文字图层", command=self._add_text_layer_from_fields)
+        menu.add_command(label="图片素材", command=self._add_selected_flower_to_canvas)
+        menu.add_command(label="空白内容层", command=self._add_blank_content_layer)
+        menu.add_separator()
+        # 组合两项复用 codex（Packet 5）的右键处理器，并沿用其「同级 ≥2 才可组合」guard：
+        # 不足 2 个有效选层时置灰（点击也会被处理器内同款判断兜底）。
+        can_group = len(self._selected_layer_ids_for_group()) >= 2
+        menu.add_command(
+            label="普通组合（所选）",
+            command=lambda: self._group_selected_layers(),
+            state="normal" if can_group else "disabled",
+        )
+        menu.add_command(
+            label="自动布局组合（所选）",
+            command=lambda: self._auto_layout_selected_layers(),
+            state="normal" if can_group else "disabled",
+        )
+        try:
+            x = self.root.winfo_pointerx()
+            y = self.root.winfo_pointery()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _add_blank_content_layer(self) -> None:
+        """Packet 2：最小空白内容层 = 未绑素材的 ImageLayer（path=None, material_key=''）。
+
+        选 ImageLayer 而非 TextLayer：path 本就默认 None、资源选择器与预览路径已支持图片层，
+        命中走 bounds（非零占位框）；改动最小。给非零默认占位框（不堆零尺寸隐形层），
+        画布画虚线占位框 + 「空白内容层」标签（见 _draw_image_layer_preview）；选中后可经
+        现有资源选择器绑素材/字体。删除/撤销与普通层一致（add 时压一次 history）。"""
+        try:
+            layout = self._active_layout_defaults()
+        except ValueError:
+            layout = EngravingLayout()
+        # 占位框尺寸复用版式素材默认（与「图片素材」入口落点一致），坏值兜底成 300×200。
+        width = float(getattr(layout, "flower_width", 0) or 0) or 300.0
+        height = float(getattr(layout, "flower_height", 0) or 0) or 200.0
+        x = float(getattr(layout, "flower_x", 0) or 0)
+        y = float(getattr(layout, "flower_y", 0) or 0)
+        self._push_document_history()
+        layer = ImageLayer(
+            name="空白内容层",
+            path=None,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            z_index=len(self.document.layers),
+        )
+        self.document.layers.append(layer)
+        self.document.selected_layer_id = layer.id
+        self.document.normalize_z_indexes()
+        self.selected_preview_item = layer.id
+        self.status_var.set("已添加空白内容层（可经「资源」绑定素材）")
+        self._refresh_layers_panel()
+        self._redraw_preview()
+
     def _add_universal_layer(self) -> None:
         """通用图层：把当前选中的素材 +/或字体合成一个图层（底座=图组，见 models.add_universal_layer）。
 
@@ -8489,6 +8551,8 @@ class BirthFlowerApp:
     def _draw_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
         """预览素材图层；每个 ImageLayer 独立绘制，不再读取单一 current_asset。"""
         if layer.path is None or not layer.path.exists():
+            # Packet 2：未绑素材的空白内容层 → 画虚线占位框 + 标签（不是真空，给可见包围盒）。
+            self._draw_blank_layer_placeholder(canvas, layer, sx, sy)
             return
         if layer.path.suffix.casefold() in IMPORTABLE_BITMAP_SUFFIXES:
             self._draw_bitmap_image_layer_preview(canvas, layer, sx, sy)
@@ -8511,6 +8575,22 @@ class BirthFlowerApp:
                 points.extend((sx(x), sy(y)))
             if len(points) >= 4:
                 canvas.create_line(*points, fill="#555555", width=1, smooth=False, tags=("layer_art", f"layer:{layer.id}"))
+
+    def _draw_blank_layer_placeholder(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
+        """Packet 2：未绑素材的空白内容层占位 —— 虚线矩形 + 居中「空白内容层」标签。
+
+        走 layer.bounds（非零占位框），保证有可见包围盒、可命中、可经资源选择器绑素材。"""
+        left, top, right, bottom = layer.bounds
+        canvas.create_rectangle(
+            sx(left), sy(top), sx(right), sy(bottom),
+            outline="#888888", dash=(4, 3), width=1,
+            tags=("layer_art", f"layer:{layer.id}"),
+        )
+        canvas.create_text(
+            sx((left + right) / 2), sy((top + bottom) / 2),
+            text="空白内容层", fill="#888888", anchor="center",
+            tags=("layer_art", f"layer:{layer.id}"),
+        )
 
     def _draw_bitmap_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
         try:

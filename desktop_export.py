@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import re
 import sys
 from pathlib import Path
@@ -26,6 +27,8 @@ from heart_symbol import (
 )
 from models import AnchoredHeartLayer, Document, ImageLayer, Layer, TextLayer, layer_text_style, resolve_auto_layout
 from text_layout import place_ending_heart
+
+LOGGER = logging.getLogger(__name__)
 
 # services/api(导出权威所在)未必已安装为包,确保它在 sys.path 上,
 # 这样下面函数里惰性 import app.domain.exports.* 一定可用(否则按钮点击会 ImportError 崩溃)。
@@ -118,7 +121,10 @@ def _document_to_layer_document(
         if isinstance(layer, AnchoredHeartLayer):
             layers.append(_anchored_heart_layer(layer))
         elif isinstance(layer, ImageLayer):
-            layers.append(_image_layer(layer))
+            # Packet 2：_image_layer 对未绑素材的空白内容层返回 None（跳过 + warning），不崩。
+            schema = _image_layer(layer)
+            if schema is not None:
+                layers.append(schema)
         elif isinstance(layer, TextLayer):
             layers.append(_text_layer(layer))
         # 其它图层(GlyphLayer 等)暂不支持矢量导出,静默跳过,保持向后兼容。
@@ -150,8 +156,13 @@ def _document_to_layer_document(
     }
 
 
-def _image_layer(layer: ImageLayer) -> dict[str, Any]:
+def _image_layer(layer: ImageLayer) -> dict[str, Any] | None:
     path = layer.path
+    # Packet 2：未绑资源的空白内容层（无 path 且无 material_key）→ 跳过 + warning，不让整文档导不出。
+    # 仅覆盖「从未绑过」的空白层；已绑但磁盘缺失仍按旧逻辑报错。Packet 4 will extend（统一占位/资源失效）。
+    if path is None and not getattr(layer, "material_key", ""):
+        LOGGER.warning("跳过未绑定素材的空白内容层:layer_id=%s name=%s", layer.id, layer.name)
+        return None
     if path is None or not Path(path).exists():
         raise ValueError(f"素材文件不存在:{path}")
     asset_path = Path(path)
