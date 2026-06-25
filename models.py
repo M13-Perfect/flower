@@ -473,12 +473,43 @@ class HistoryManager:
 
     undo_stack: list[Document] = field(default_factory=list)
     redo_stack: list[Document] = field(default_factory=list)
+    # 事务态：把「一次连续编辑」（拖动 / Inspector 改值）合并成单条 undo。
+    _txn_active: bool = False
+    _txn_snapshot: Document | None = None
 
     def push(self, document: Document, *, limit: int = 50) -> None:
         self.undo_stack.append(deepcopy(document))
         if len(self.undo_stack) > limit:
             del self.undo_stack[: len(self.undo_stack) - limit]
         self.redo_stack.clear()
+
+    def begin_transaction(self, document: Document, *, limit: int = 50) -> None:
+        """进入事务：压一次快照（= 拖动首帧逻辑）并暂存 rollback 快照。
+
+        可重入：事务已开则直接返回，连续改值不会重复压栈。
+        """
+        if self._txn_active:
+            return
+        self.push(document, limit=limit)
+        self._txn_active = True
+        self._txn_snapshot = deepcopy(document)
+
+    def commit_transaction(self) -> None:
+        """提交事务：进入时的快照已在栈里，只需清事务态。"""
+        self._txn_active = False
+        self._txn_snapshot = None
+
+    def rollback_transaction(self, restore_callback) -> None:
+        """回滚事务：弹掉进入时压入的快照，用暂存快照还原文档。"""
+        if not self._txn_active:
+            return
+        snapshot = self._txn_snapshot
+        if self.undo_stack:
+            self.undo_stack.pop()
+        self._txn_active = False
+        self._txn_snapshot = None
+        if snapshot is not None and restore_callback is not None:
+            restore_callback(snapshot)
 
     def undo(self, current: Document) -> Document | None:
         if not self.undo_stack:

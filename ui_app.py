@@ -206,6 +206,11 @@ RULER_GUIDE_COLOR = "#3a7afe"
 TEXT_CASE_ORDER = ("default", "upper", "lower")
 TEXT_CASE_LABELS = {"default": "默认", "upper": "大写", "lower": "小写"}
 SERVICES_API_DIR = Path(__file__).resolve().parent / "services" / "api"
+
+# Packet 1 回滚开关：默认走非模态属性栏 overlay；置 0（或环境变量 INSPECTOR_OVERLAY=0）
+# 退回旧 grab_set 模态对话框（已去掉 grab_set，仍可作回滚路径）。
+INSPECTOR_OVERLAY = os.environ.get("INSPECTOR_OVERLAY", "1").strip().lower() not in {"0", "false", "off", "no"}
+
 # 深色工作台配色（CustomTkinter 迁移，阶段1）。画板本身保持浅色（代表浅色木料，
 # 雕刻预览是深灰折线 + 黑墨字），故 preview_canvas 仍用白底，不读这里的 panel 色。
 APP_COLORS = {
@@ -1252,6 +1257,12 @@ class BirthFlowerApp:
         self.inline_text_is_closing = False
         self.floating_text_editor: FloatingTextEditor | None = None
         self.section_frames: dict[str, tk.Widget] = {}
+        # Packet 1：非模态属性栏 overlay 状态。
+        self._inspector_frame = None
+        self._inspector_entries: list = []
+        self._inspector_traces: list = []
+        self._inspector_layer_id: str | None = None
+        self._inspector_suppress_trace: bool = False
         self._drag_target: str | None = None
         self._drag_start: tuple[int, int] | None = None
         self._drag_mode: str = "move"
@@ -4947,6 +4958,9 @@ class BirthFlowerApp:
         focus = self.root.focus_get()
         if focus is None:
             return False
+        # Packet 1：属性栏 overlay 的 Entry 也算文字输入，焦点在栏内时画布快捷键（Ctrl+Z/Delete）让路。
+        if focus in self._inspector_entry_widgets():
+            return True
         try:
             return focus.winfo_class() in {"Entry", "Text", "TEntry"} or isinstance(focus, (tk.Entry, tk.Text, ttk.Entry))
         except tk.TclError:
@@ -7174,8 +7188,167 @@ class BirthFlowerApp:
             self.status_var.set(f"对齐 → {key}")
             self._redraw_preview()
 
+    # --- Packet 1：非模态属性栏 overlay（替换 grab_set 模态对话框，§11 状态机）---
+
+    @staticmethod
+    def _clamp_overlay_position(x: float, y: float, bar_w: float, bar_h: float,
+                               win_w: float, win_h: float, margin: float = 8.0) -> tuple[float, float]:
+        """把属性栏夹紧在主窗内，永不离开视口（纯坐标计算，§11）。"""
+        max_x = max(margin, win_w - bar_w - margin)
+        max_y = max(margin, win_h - bar_h - margin)
+        return min(max(x, margin), max_x), min(max(y, margin), max_y)
+
+    def _inspector_entry_widgets(self) -> tuple:
+        """属性栏内的 Entry 控件（供 _focus_is_text_input 让出画布快捷键）。"""
+        return tuple(getattr(self, "_inspector_entries", ()) or ())
+
+    def _open_inspector_overlay(self, layer) -> None:
+        """非模态属性栏：普通 CTkFrame，**不 grab_set / 不 wait_window**，绑现有共享 var。
+
+        落在画布上的事件照常进 _on_canvas_*；只有点进栏内 Entry 才消费事件（§11）。
+        """
+        self.document.selected_layer_id = layer.id
+        self._inspector_layer_id = layer.id
+        self._inspector_suppress_trace = True   # _sync 写 var 不应触发事务/重绘
+        self._sync_layer_properties(layer)
+        self._inspector_suppress_trace = False
+
+        # 已开则只刷新内容（选别的层时复用同一栏）。
+        existing = getattr(self, "_inspector_frame", None)
+        if existing is not None:
+            try:
+                existing.destroy()
+            except Exception:
+                pass
+
+        parent = self.root
+        frame = ctk.CTkFrame(parent, corner_radius=8) if ctk is not None else tk.Frame(parent, bd=1, relief="solid")
+        frame.columnconfigure(1, weight=1)
+        self._inspector_frame = frame
+        self._inspector_entries = []
+        self._inspector_traces = []
+
+        rows = [("位置 X", self.layer_x_var), ("位置 Y", self.layer_y_var),
+                ("宽", self.layer_w_var), ("高", self.layer_h_var)]
+        if isinstance(layer, TextLayer):
+            rows.append(("字号", self.layer_font_size_var))
+
+        for i, (lbl, var) in enumerate(rows):
+            if ctk is not None:
+                ctk.CTkLabel(frame, text=lbl).grid(row=i, column=0, padx=8, pady=4, sticky="w")
+                entry = ctk.CTkEntry(frame, textvariable=var, width=110)
+            else:
+                tk.Label(frame, text=lbl).grid(row=i, column=0, padx=8, pady=4, sticky="w")
+                entry = tk.Entry(frame, textvariable=var, width=12)
+            entry.grid(row=i, column=1, padx=8, pady=4, sticky="ew")
+            entry.bind("<FocusOut>", lambda _e: self._inspector_commit())
+            entry.bind("<Return>", lambda _e: self._inspector_commit())
+            entry.bind("<Escape>", lambda _e: self._inspector_rollback())
+            self._inspector_entries.append(entry)
+            trace_id = var.trace_add("write", self._on_inspector_var_write)
+            self._inspector_traces.append((var, trace_id))
+
+        if ctk is not None:
+            ctk.CTkButton(frame, text="关闭", width=60, command=self._close_inspector_overlay).grid(
+                row=len(rows), column=0, columnspan=2, padx=8, pady=(2, 6), sticky="ew"
+            )
+        else:
+            tk.Button(frame, text="关闭", command=self._close_inspector_overlay).grid(
+                row=len(rows), column=0, columnspan=2, padx=8, pady=(2, 6), sticky="ew"
+            )
+
+        # 夹紧到视口内（栏自身坐标，绝不写进 layer，§11）。
+        frame.update_idletasks()
+        try:
+            bar_w = frame.winfo_reqwidth()
+            bar_h = frame.winfo_reqheight()
+            win_w = parent.winfo_width() or parent.winfo_reqwidth()
+            win_h = parent.winfo_height() or parent.winfo_reqheight()
+        except tk.TclError:
+            bar_w, bar_h, win_w, win_h = 160, 200, 1000, 700
+        px, py = self._clamp_overlay_position(win_w - bar_w - 24, 80, bar_w, bar_h, win_w, win_h)
+        frame.place(x=px, y=py)
+        frame.lift()
+
+    def _on_inspector_var_write(self, *_args) -> None:
+        """var trace：首次改值开事务，之后每次写 layer + 重绘（去抖），不重复压栈（§11/§12）。"""
+        if getattr(self, "_inspector_suppress_trace", False):
+            return
+        layer = self.document.layer_by_id(getattr(self, "_inspector_layer_id", None))
+        if layer is None:
+            return
+        # 首次改值 → 进入编辑事务（压一次快照）。
+        self.history_manager.begin_transaction(self.document)
+        if not self._write_inspector_vars_to_layer(layer):
+            return
+        # 实时预览：复用 25ms 去抖全量重绘。
+        self._schedule_canvas_render()
+
+    def _write_inspector_vars_to_layer(self, layer) -> bool:
+        """把栏内 var 写回 layer 几何；非法值（空/非数字/<=0）静默忽略，返回是否写成功。
+
+        绝不写 preview_pan_x/y 或栏自身坐标到 layer（移动栏不移动图层，§11）。
+        """
+        try:
+            x = float(self.layer_x_var.get())
+            y = float(self.layer_y_var.get())
+            width = float(self.layer_w_var.get())
+            height = float(self.layer_h_var.get())
+        except (ValueError, tk.TclError):
+            return False
+        if width <= 0 or height <= 0:
+            return False
+        layer.x, layer.y, layer.width, layer.height = x, y, width, height
+        font_size: int | None = None
+        if isinstance(layer, TextLayer):
+            try:
+                font_size = max(1, int(float(self.layer_font_size_var.get())))
+                layer.font_size = font_size
+            except (ValueError, tk.TclError):
+                font_size = None
+        # 与 _apply_layer_production 一致：记录图层级生产 override（随层走）。
+        layer.production = ProductionParams(x=x, y=y, width=width, height=height, font_size=font_size)
+        return True
+
+    def _inspector_commit(self) -> None:
+        """失焦 / 回车：提交事务（连续编辑合并为一条 undo）。"""
+        history = getattr(self, "history_manager", None)
+        if history is not None:
+            history.commit_transaction()
+
+    def _inspector_rollback(self) -> None:
+        """Escape：回滚到进入编辑前快照。"""
+        history = getattr(self, "history_manager", None)
+        if history is not None:
+            history.rollback_transaction(self._restore_document_snapshot)
+
+    def _close_inspector_overlay(self) -> None:
+        self._inspector_commit()
+        frame = getattr(self, "_inspector_frame", None)
+        for var, trace_id in getattr(self, "_inspector_traces", ()) or ():
+            try:
+                var.trace_remove("write", trace_id)
+            except Exception:
+                pass
+        self._inspector_traces = []
+        self._inspector_entries = []
+        self._inspector_layer_id = None
+        if frame is not None:
+            try:
+                frame.destroy()
+            except Exception:
+                pass
+        self._inspector_frame = None
+
     def _open_layer_geometry_dialog(self, layer) -> None:
-        """位置/尺寸小对话框：复用 layer_x/y/w/h(+字号) var 与 _apply_layer_production 写回。"""
+        """位置/尺寸小对话框：复用 layer_x/y/w/h(+字号) var 与 _apply_layer_production 写回。
+
+        Packet 1：默认走非模态属性栏 overlay（INSPECTOR_OVERLAY=1，不阻塞画布、实时预览）；
+        关掉 flag 时退回此对话框，但已去掉 grab_set，故即便走旧路径也不再独占输入。
+        """
+        if INSPECTOR_OVERLAY:
+            self._open_inspector_overlay(layer)
+            return
         self.document.selected_layer_id = layer.id
         self._sync_layer_properties(layer)
         win = ctk.CTkToplevel(self.root)
@@ -7198,7 +7371,6 @@ class BirthFlowerApp:
             row=len(rows), column=0, columnspan=2, padx=10, pady=10, sticky="ew"
         )
         win.update_idletasks()
-        win.grab_set()
 
     def _open_heart_anchor_dialog(self, layer) -> None:
         """末尾爱心 mm 调节框：与文字的间距 / 上下偏移 / 大小（mm）。
@@ -7267,7 +7439,7 @@ class BirthFlowerApp:
             row=len(rows), column=0, columnspan=2, padx=10, pady=10, sticky="ew"
         )
         win.update_idletasks()
-        win.grab_set()
+        # Packet 1：去掉 grab_set，末尾爱心调节框不再独占输入（画布仍可拖/缩/选）。
 
     def _refresh_layers_panel(self) -> None:
         """刷新右下角图层面板，显示名称、类型、显隐和锁定状态。"""
@@ -7277,20 +7449,26 @@ class BirthFlowerApp:
         self._on_layers_tree_select(_event)
 
     def _sync_layer_properties(self, layer) -> None:
-        if isinstance(layer, TextLayer):
-            self.layer_text_var.set(layer.original_text)
-            self.layer_font_size_var.set(str(layer.font_size))
-            self.layer_color_var.set(layer.fill_color or layer.color)
-            self.layer_bold_var.set(bool(getattr(layer, "bold", None) or False))
-            self.layer_underline_var.set(bool(getattr(layer, "underline", None) or False))
-            self.layer_letter_spacing_var.set(f"{float(getattr(layer, 'letter_spacing', 0) or 0):g}")
-        else:
-            self.layer_text_var.set("")
-        # 增量4：几何字段显示该图层当前有效几何（live = 用户在画布上看到的位置/尺寸）。
-        self.layer_x_var.set(f"{layer.x:g}")
-        self.layer_y_var.set(f"{layer.y:g}")
-        self.layer_w_var.set(f"{layer.width:g}")
-        self.layer_h_var.set(f"{layer.height:g}")
+        # Packet 1：layer→var 是程序性写入（选层/画布拖动同步栏），不应触发属性栏事务/重绘。
+        prev_suppress = getattr(self, "_inspector_suppress_trace", False)
+        self._inspector_suppress_trace = True
+        try:
+            if isinstance(layer, TextLayer):
+                self.layer_text_var.set(layer.original_text)
+                self.layer_font_size_var.set(str(layer.font_size))
+                self.layer_color_var.set(layer.fill_color or layer.color)
+                self.layer_bold_var.set(bool(getattr(layer, "bold", None) or False))
+                self.layer_underline_var.set(bool(getattr(layer, "underline", None) or False))
+                self.layer_letter_spacing_var.set(f"{float(getattr(layer, 'letter_spacing', 0) or 0):g}")
+            else:
+                self.layer_text_var.set("")
+            # 增量4：几何字段显示该图层当前有效几何（live = 用户在画布上看到的位置/尺寸）。
+            self.layer_x_var.set(f"{layer.x:g}")
+            self.layer_y_var.set(f"{layer.y:g}")
+            self.layer_w_var.set(f"{layer.width:g}")
+            self.layer_h_var.set(f"{layer.height:g}")
+        finally:
+            self._inspector_suppress_trace = prev_suppress
 
     def _slot_defaults(self, layer) -> ProductionParams:
         """图层「槽位」的产品级生产默认，取自当前布局默认 EngravingLayout（回落链最低层）。"""
