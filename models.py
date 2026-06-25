@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import math
+import os
 from pathlib import Path
 from typing import Any
 import logging
@@ -136,6 +137,26 @@ class FontAsset:
     family_name: str = ""
     file_size: int = 0
     has_ending_glyphs: bool = False
+
+
+@dataclass(frozen=True)
+class ResourceRef:
+    """统一的字体/素材引用（Layer System v2 · Packet 4 · §8）。
+
+    现状：``TextLayer.font_*`` 与 ``ImageLayer.material_*`` 各存「库 + key + path」，缺统一结构。
+    本结构把它们抽象成一个 ref，便于资源依赖统计、失效处理与（未来的）跨机器分发。
+
+    **本 Packet 只声明结构 + 提供 reader（resource_dependencies），不重构现有字段**（避免无收益的
+    churn）：``revision`` / ``link_mode`` / ``fallback_snapshot`` 三个字段**声明不填**（§8 明确）。
+    """
+
+    kind: str                       # 'font' | 'image' | 'svg'
+    library_id: str = ""            # 复用现有 font_library_id / library_id
+    item_key: str = ""             # 复用现有 font_key / material_key
+    path: Path | None = None       # 当前主引用（linked 解析结果）
+    revision: str = ""             # §8 声明不填：素材改版标识
+    link_mode: str = "linked"      # §8 声明不填：当前全是 linked
+    fallback_snapshot: dict | None = None  # §8 声明不填：失效占位/降级信息
 
 
 def _new_layer_id() -> str:
@@ -399,6 +420,18 @@ class Document:
     canvas_height: int = 1280
     layers: list[Layer] = field(default_factory=list)
     selected_layer_id: str | None = None
+    # Packet 4（§15 / ADR-005）：v2 序列化版本号。运行时默认 2；legacy（无版本/无序列化）视为 v1，
+    # 加载时经 migrate_v1_to_v2 升级。该字段不进导出 dict（导出走 desktop_export，与此无关）。
+    schema_version: int = 2
+
+    def serialize(self) -> dict[str, Any]:
+        """Packet 4：Document → v2 文档 dict（§15）。落盘/读档专用，**不影响导出字节**。"""
+        return serialize_document(self)
+
+    @classmethod
+    def deserialize(cls, raw: dict[str, Any]) -> "Document":
+        """Packet 4：v2 文档 dict → Document；版本<2 时先 migrate_v1_to_v2（§15）。"""
+        return deserialize_document(raw)
 
     def sorted_layers(self) -> list[Layer]:
         """按 z_index 和列表顺序得到顶层渲染顺序，低层先画，高层后画（仅顶层，不摊平图组）。"""
@@ -1113,3 +1146,201 @@ def validate_document(document: Document) -> list[str]:
 
     walk(document.layers)
     return problems
+
+
+# ===========================================================================
+# Packet 4：Document v2 序列化 + 加载时迁移（§15 / ADR-005）
+# ---------------------------------------------------------------------------
+# 设计要点（懒版 B）：
+#   * 通用 dataclasses.fields 序列化，复用 ProductionParams.to_dict 范式，不写逐字段代码；
+#   * 每层带 type/provider_id 判别符，deserialize 按表 dispatch 到对应 dataclass；
+#   * 未知 type/provider_id 或单层迁移失败 → UnknownLayer 占位（保留原始 dict），不丢数据不崩；
+#   * 迁移复用现有 __post_init__（material_id→material_key、font_key from stem）。
+# ===========================================================================
+
+# feature flag（§15）：默认 ON。OFF 时调用方应跳过 v2 落盘（当前无打开文档工作流，
+# 故 OFF 仅意味着 serialize/deserialize 不被使用；保持简单，不在此模块强行短路）。
+DOC_SCHEMA_V2 = os.environ.get("DOC_SCHEMA_V2", "1").strip().lower() not in {"0", "false", "off", "no"}
+
+CURRENT_SCHEMA_VERSION = 2
+
+# type 判别符 → dataclass。新内容类型只需在此登记一行。
+_LAYER_TYPES: dict[str, type[Layer]] = {
+    "base": Layer,
+    "image": ImageLayer,
+    "anchored_heart": AnchoredHeartLayer,
+    "text": TextLayer,
+    "glyph": GlyphLayer,
+    "group": GroupLayer,
+    "auto_layout_group": AutoLayoutGroupLayer,
+}
+
+
+@dataclass
+class UnknownLayer(Layer):
+    """占位层（§16）：未知 provider_id / 未知 type / 单层迁移失败时，保留原始 dict 不丢数据。
+
+    渲染/导出端无对应 provider → 被静默跳过（get_provider 返回 None）；下次升级可从 raw 还原。
+    """
+
+    type: str = "unknown"
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+def _encode_value(value: Any) -> Any:
+    """把单个字段值编码成 JSON 友好形态（Path→str、ProductionParams→dict、嵌套层/容器递归）。"""
+    if isinstance(value, Path):
+        return {"__path__": str(value)}
+    if isinstance(value, ProductionParams):
+        return value.to_dict(drop_none=True)
+    if isinstance(value, Layer):
+        return serialize_layer(value)
+    if isinstance(value, dict):
+        # glyph_overrides 的 int key 不能直接进 JSON：统一转 str key（解码侧复原）。
+        return {str(k): _encode_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_value(v) for v in value]
+    return value
+
+
+def serialize_layer(layer: Layer) -> dict[str, Any]:
+    """单层 → dict：记录 type（判别符）+ 所有 dataclass 字段（children 递归）。
+
+    UnknownLayer 直接吐回它保存的原始 raw（无损往返，便于未来版本还原）。
+    """
+    if isinstance(layer, UnknownLayer):
+        return deepcopy(layer.raw)
+    out: dict[str, Any] = {"type": getattr(layer, "type", "base")}
+    if getattr(layer, "provider_id", ""):
+        out["provider_id"] = layer.provider_id
+    for spec in fields(layer):
+        if spec.name in ("type", "provider_id"):
+            continue
+        out[spec.name] = _encode_value(getattr(layer, spec.name))
+    return out
+
+
+def _decode_field_value(spec_name: str, value: Any) -> Any:
+    """把编码后的字段值还原为构造 dataclass 所需的 Python 值。"""
+    if isinstance(value, dict) and "__path__" in value:
+        return Path(value["__path__"])
+    if spec_name == "production":
+        # __post_init__ 会 _coerce_production，这里保持 dict 即可（容忍反序列化）。
+        return value
+    if spec_name == "children" and isinstance(value, list):
+        return [deserialize_layer(child) for child in value]
+    if spec_name == "glyph_overrides" and isinstance(value, dict):
+        # 还原 int key（__post_init__ 会再规整一次，这里只做 key 类型还原）。
+        restored: dict[Any, Any] = {}
+        for k, v in value.items():
+            try:
+                restored[int(k)] = v
+            except (TypeError, ValueError):
+                restored[k] = v
+        return restored
+    if spec_name == "padding" and isinstance(value, list):
+        return tuple(value)
+    return value
+
+
+def deserialize_layer(raw: dict[str, Any]) -> Layer:
+    """dict → 单层：按 type/provider_id dispatch 到 dataclass。未知/失败 → UnknownLayer 占位（§16）。"""
+    if not isinstance(raw, dict):
+        logger.warning("图层数据非 dict，占位保留：%r", raw)
+        return UnknownLayer(name="未知内容", raw={"__nondict__": repr(raw)})
+    key = raw.get("provider_id") or raw.get("type") or ""
+    cls = _LAYER_TYPES.get(key)
+    if cls is None:
+        logger.warning("未知图层 type/provider_id=%r → 占位层（保留原始 dict）", key)
+        return UnknownLayer(name=str(raw.get("name", "未知内容")), raw=deepcopy(raw))
+    try:
+        known = {spec.name for spec in fields(cls)}
+        kwargs: dict[str, Any] = {}
+        for spec in fields(cls):
+            if spec.name in raw:
+                kwargs[spec.name] = _decode_field_value(spec.name, raw[spec.name])
+        # 未知键忽略（config_store 范式）：不在 known 的键被丢弃，不报错。
+        _ = known
+        return cls(**kwargs)
+    except Exception as exc:  # 单层迁移/构造失败 → 占位，不中断整文档（§15）。
+        logger.warning("图层反序列化失败（%s），占位保留：%s", key, exc)
+        return UnknownLayer(name=str(raw.get("name", "未知内容")), raw=deepcopy(raw))
+
+
+def serialize_document(document: Document) -> dict[str, Any]:
+    """Document → v2 文档 dict（§15）。"""
+    return {
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "canvas_width": int(document.canvas_width),
+        "canvas_height": int(document.canvas_height),
+        "selected_layer_id": document.selected_layer_id,
+        "layers": [serialize_layer(layer) for layer in document.layers],
+    }
+
+
+def migrate_v1_to_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    """legacy 文档 dict（无 schema_version 或 ==1）→ v2 形态（§15）。
+
+    字段级迁移**复用各 dataclass 的 __post_init__**（material_id→material_key、font_key from stem 等），
+    因此这里只需打上版本号 + 透传 layers；真正的字段补全发生在 deserialize_layer 构造对象时。
+    未知键被忽略（config_store 范式）。
+    """
+    migrated = dict(raw)
+    migrated["schema_version"] = CURRENT_SCHEMA_VERSION
+    migrated.setdefault("layers", raw.get("layers", []))
+    return migrated
+
+
+def deserialize_document(raw: dict[str, Any]) -> Document:
+    """v2 文档 dict → Document；版本<2 时先 migrate_v1_to_v2（§15）。未知层 → 占位，不崩。"""
+    if not isinstance(raw, dict):
+        raise TypeError("文档数据必须是 dict")
+    version = raw.get("schema_version", 1)
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        version = 1
+    if version < CURRENT_SCHEMA_VERSION:
+        raw = migrate_v1_to_v2(raw)
+    document = Document(
+        canvas_width=int(raw.get("canvas_width", 1732)),
+        canvas_height=int(raw.get("canvas_height", 1280)),
+        selected_layer_id=raw.get("selected_layer_id"),
+        schema_version=CURRENT_SCHEMA_VERSION,
+    )
+    document.layers = [deserialize_layer(item) for item in raw.get("layers", [])]
+    document.normalize_z_indexes()
+    return document
+
+
+def resource_dependencies(layer: Layer) -> list[ResourceRef]:
+    """Packet 4（§8）：读现有 font_*/material_* 字段，返回该层引用的 ResourceRef 列表。
+
+    **只读，不重构现有字段**——结构存在且可测，但 TextLayer/ImageLayer 仍用各自的 font_*/material_*。
+    text → font ref；image/anchored_heart → image(svg) ref；group → 递归子层；其余 → []。
+    """
+    refs: list[ResourceRef] = []
+    if isinstance(layer, TextLayer):
+        refs.append(
+            ResourceRef(
+                kind="font",
+                library_id=getattr(layer, "font_library_id", ""),
+                item_key=getattr(layer, "font_key", ""),
+                path=getattr(layer, "font_path", None),
+            )
+        )
+    elif isinstance(layer, ImageLayer):
+        path = getattr(layer, "path", None)
+        kind = "svg" if path is not None and Path(path).suffix.casefold() == ".svg" else "image"
+        refs.append(
+            ResourceRef(
+                kind=kind,
+                library_id=getattr(layer, "library_id", ""),
+                item_key=getattr(layer, "material_key", "") or getattr(layer, "material_id", ""),
+                path=path,
+            )
+        )
+    if isinstance(layer, GroupLayer):
+        for child in layer.children:
+            refs.extend(resource_dependencies(child))
+    return refs

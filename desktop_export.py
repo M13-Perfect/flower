@@ -163,12 +163,19 @@ def _document_to_layer_document(
 def _image_layer(layer: ImageLayer) -> dict[str, Any] | None:
     path = layer.path
     # Packet 2：未绑资源的空白内容层（无 path 且无 material_key）→ 跳过 + warning，不让整文档导不出。
-    # 仅覆盖「从未绑过」的空白层；已绑但磁盘缺失仍按旧逻辑报错。Packet 4 will extend（统一占位/资源失效）。
     if path is None and not getattr(layer, "material_key", ""):
         LOGGER.warning("跳过未绑定素材的空白内容层:layer_id=%s name=%s", layer.id, layer.name)
         return None
+    # Packet 4（§8/§16）：已绑素材但文件丢失/改名/删除 → 跳过 + warning（不再抛 ValueError 崩整文档）。
+    # 与字体缺失的 _load_font 优雅回退对称：删一个素材文件后文档仍可导出（仅该层缺席）。
     if path is None or not Path(path).exists():
-        raise ValueError(f"素材文件不存在:{path}")
+        LOGGER.warning(
+            "跳过缺失素材图层(文件不存在):layer_id=%s key=%s path=%s",
+            layer.id,
+            getattr(layer, "material_key", "") or getattr(layer, "material_id", ""),
+            path,
+        )
+        return None
     asset_path = Path(path)
     suffix = asset_path.suffix.casefold()
     if suffix in BITMAP_SUFFIXES:

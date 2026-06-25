@@ -62,12 +62,22 @@ class ContentProvider:
         return NotImplemented
 
     def resource_dependencies(self, layer):  # noqa: ANN001, ANN201
-        """Packet 4：text→字体 / image→素材 SVG（见 §8）。本轮未实现。"""
-        return NotImplemented
+        """Packet 4：text→字体 / image→素材 SVG（见 §8）。委托 models.resource_dependencies（只读现有字段）。"""
+        import models
+
+        return models.resource_dependencies(layer)
 
     def serialize(self, layer):  # noqa: ANN001, ANN201
-        """Packet 4：文档落盘（§15），复用 ProductionParams.to_dict 范式。本轮未实现。"""
-        return NotImplemented
+        """Packet 4：单层 → dict（§15）。委托 models.serialize_layer（dataclasses.fields 范式）。"""
+        import models
+
+        return models.serialize_layer(layer)
+
+    def deserialize(self, raw):  # noqa: ANN001, ANN201
+        """Packet 4：dict → 单层（§15）。委托 models.deserialize_layer（按 type/provider_id dispatch）。"""
+        import models
+
+        return models.deserialize_layer(raw)
 
 
 # --- 模块级注册表（懒版：一个 dict，不造工厂/插件加载器）---

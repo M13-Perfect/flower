@@ -8565,8 +8565,13 @@ class BirthFlowerApp:
     def _draw_image_layer_preview(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
         """预览素材图层；每个 ImageLayer 独立绘制，不再读取单一 current_asset。"""
         if layer.path is None or not layer.path.exists():
-            # Packet 2：未绑素材的空白内容层 → 画虚线占位框 + 标签（不是真空，给可见包围盒）。
-            self._draw_blank_layer_placeholder(canvas, layer, sx, sy)
+            material_key = getattr(layer, "material_key", "") or getattr(layer, "material_id", "")
+            if material_key or layer.path is not None:
+                # Packet 4（§8）：已绑素材但磁盘缺失/改名/删除 → 画「素材缺失」占位框（区别于空白未绑层）。
+                self._draw_missing_material_placeholder(canvas, layer, sx, sy)
+            else:
+                # Packet 2：从未绑素材的空白内容层 → 画虚线占位框 + 标签（不是真空，给可见包围盒）。
+                self._draw_blank_layer_placeholder(canvas, layer, sx, sy)
             return
         if layer.path.suffix.casefold() in IMPORTABLE_BITMAP_SUFFIXES:
             self._draw_bitmap_image_layer_preview(canvas, layer, sx, sy)
@@ -8603,6 +8608,24 @@ class BirthFlowerApp:
         canvas.create_text(
             sx((left + right) / 2), sy((top + bottom) / 2),
             text="空白内容层", fill="#888888", anchor="center",
+            tags=("layer_art", f"layer:{layer.id}"),
+        )
+
+    def _draw_missing_material_placeholder(self, canvas: tk.Canvas, layer: ImageLayer, sx, sy) -> None:
+        """Packet 4（§8）：已绑素材但文件缺失的占位 —— 虚线红框 + 「素材缺失: {key}」标签。
+
+        与「空白内容层」区分：这层曾绑过素材但文件丢失/改名/删除，需提示用户重新绑定；
+        导出端 _image_layer 对同一情况跳过 + warning，文档仍可打开/导出（仅该层缺席）。"""
+        left, top, right, bottom = layer.bounds
+        key = getattr(layer, "material_key", "") or getattr(layer, "material_id", "") or "?"
+        canvas.create_rectangle(
+            sx(left), sy(top), sx(right), sy(bottom),
+            outline="#c0392b", dash=(4, 3), width=1,
+            tags=("layer_art", f"layer:{layer.id}"),
+        )
+        canvas.create_text(
+            sx((left + right) / 2), sy((top + bottom) / 2),
+            text=f"素材缺失: {key}", fill="#c0392b", anchor="center",
             tags=("layer_art", f"layer:{layer.id}"),
         )
 
