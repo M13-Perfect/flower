@@ -3,10 +3,10 @@
 > 配 `PROJECT_INDEX.md` + `AGENTS.md` 一起读。导出/EzCad 细节看 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
 > 更新：2026-06-25（移除 GIMP 轨道后）。
 
-## 测试基线（2026-06-25，Layer System v2 Packet 5 后）
+## 测试基线（2026-06-25，Layer System v2 全部 Packet 完成后）
 
 `PYTHONPATH=".;services\api" .\.venv-win\Scripts\python.exe -m pytest tests services/api/tests -q`
-→ **499 passed / 5 failed / 80 skipped**（本轮用 `--basetemp .pytest-tmp-run -o cache_dir=.pytest-cache-run` 避开 Windows Temp 清理权限问题）。5 个失败全在 `tests/test_ui_app.py`，均为预存在的 preview 标尺/缩放 `without_display` 数值断言与缺 `_on_canvas_pan_press`，与自动布局无关。`ruff`、`py_compile`、限定 mypy clean。
+→ **622 passed / 0 failed / 33 skipped**（Windows 上加 `--basetemp .pytest-tmp-run` 避开 Temp 清理权限问题）。迁移期遗留的 7 个 `test_ui_app.py` 失败已在 Packet 7 全部修复/订正。`ruff`、`py_compile` clean。分支 `layer-system-v2-rest`（未 merge/push）。
 
 ## 最近改动
 
@@ -26,10 +26,10 @@
 - 若填不上：flower 端把文字每条轮廓导成**一条闭合 POLYLINE**（`add_polyline2d(pts, close=True)` + `path.flattening`），让 EzCad 识别闭合区域。
 
 ### C. flower 端杂项
-- **图层系统剩余 Packet**：非模态属性栏/实时属性事务（Packet 1）、统一「+ 添加图层」入口和空白占位层（Packet 2）、Content Provider/序列化迁移/资源占位（Packet 3/4）、文字工具扩展接口与 Inspector sections（Packet 6）、错误恢复完整回归（Packet 7）。Packet 5 的普通组合与自动布局核心已接，但 UI 仍需真机测。
+- **图层系统 Layer System v2：全部 Packet 已落地**（Packet 0/1/2/3/4/5/6/7，分支 `layer-system-v2-rest`）。**剩真机手测 + 增量收尾**（详见 `AGENTS.md`「已知问题」）：①非模态栏/添加菜单/缺素材占位/中键平移等需关 App 重开实测；②悬浮栏字距/行距/对齐/颜色/字体已声明未接 write-back（增量）；③Document v2 序列化已可用但无存盘 UI（待接按钮）；④内联编辑 history 未并入新事务 API。验证通过后再决定合回 main。
 - **导出朝向「文字在上、花在下」**（2026-06-14 用户 EzCad 实测仍反，合成测试未复现）——待用户给具体导出按钮 + 哪朵花 + 实际文档再定位。
 - **订单截图视觉解析** `screenshot_parser.py`（后端已做、UI 未接、未用真图+真 key 验）：准了再给「导入」按钮接识图（小改 `ui_app`），不准就删，零成本。
-- **修迁移期遗留的 `test_ui_app.py` 失败**：补 `_on_canvas_pan_press`（或更新测试）；核对 preview 标尺/缩放 without_display 断言；`case_button` 死引用仍需专项确认。
+- ~~修迁移期遗留的 `test_ui_app.py` 失败~~ **已在 Packet 7 完成**：补 `_on_canvas_pan_press`（中键平移）、订正 preview 标尺/缩放/滚轮 without_display 断言、`case_button` 孤儿防御。全量 0 失败。
 
 ### D. Electron「新编辑器」（`apps/desktop`）—— 已暂缓
 - 半成品，对无头批量量产几乎无加成。仅多人/远程/更强交互编辑器时才值得做。用户当前不用。

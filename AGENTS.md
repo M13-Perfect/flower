@@ -1,7 +1,8 @@
 # AGENTS.md — flower（纯 Python 桌面版）
 
 > 新对话先读本文件 + `PROJECT_INDEX.md` + `CURRENT_TASKS.md`。
-> 最近一次实质改动：**2026-06-25 Layer System v2 Packet 5：普通组合与自动布局组合**（见下「本次改动」）。未 commit。
+> 最近一次实质改动：**2026-06-25 Layer System v2 — 完成全部剩余 Packet（0/1/2/3/4/6/7）**（见下「本次改动」）。
+> 分支 `layer-system-v2-rest`，逐 Packet 提交（基线 snapshot + 8 条 Packet 提交）。**未 merge 回 main、未 push。** RFC 全文见 `docs/rfcs/layer-system-v2.md`。
 
 ## 背景 / 当前生产链路
 
@@ -11,15 +12,27 @@
 - **导出权威在 `services/api`**（`app/domain/exports/dxf.py`/`svg.py`/`png.py`），桌面经 `desktop_export.py` in-process 调用；DXF = R2018 + SPLINE/POLYLINE + 单层色7，单次 Y 翻转在 `dxf.py`。所见即所得（预览==导出，`_apply_canvas_fit` 把 contain-fit 烘进导出）。
 - 素材：花按 `BirthMonth flowers/` 下 `*.svg` 文件名扫；字体 `Front1-4.ttf`（index 从文件名数字推，全链路用 `"Font N"` 字符串作身份）。**无月份/序号映射**。
 
-## 本次改动（2026-06-25）：Layer System v2 Packet 5 自动布局组合
+## 本次改动（2026-06-25）：Layer System v2 完成剩余全部 Packet
 
-本轮按 `docs/rfcs/layer-system-v2.md` 的 Packet 5 落地，因任务消息里的 `{{PACKET_NUMBER}}` / `{{PACKET_NAME}}` 未替换，依据用户给的「横向自动布局组合」精确验收场景映射为 Packet 5；未补做 Packet 3/4/6/7。
+按 `docs/rfcs/layer-system-v2.md` 落地 Packet 0/1/2/3/4/6/7（Packet 5 由 codex 先行，见「上次改动」）。逐 Packet 子代理实现 + 逐 Packet 提交，每包跑 ruff/py_compile + 全量回归零退化。**核心红线全程守住：导出字节稳定（Packet 0 门禁）、桌面单一布局来源、未替换画布/渲染器/文字排版大脑/anchor。**
 
-- `models.py`：新增 `AutoLayoutGroupLayer`、`auto_layout_group_layers()`、`convert_group_to_auto_layout()`、`resolve_auto_layout()`。自动布局为重绘/导出前的幂等 pass，支持 horizontal/vertical、gap、padding、align、justify、hug/fixed；隐藏子层不占位，坏尺寸压到 1px，循环/过深转 warning。普通组创建时也记录子层 union bounds，选框不再落默认 100x100。
-- `ui_app.py`：图层 Treeview 改 `selectmode="extended"`；右键菜单新增「组合所选」「自动布局组合所选」「转换为自动布局组合」「解除组合」。预览前先 `resolve_auto_layout()` 再 `resolve_anchored_hearts()`，并改用 `flat_render_layers()` 画叶子层。inline 文本编辑首次实际修改时只压一次 history，Esc 取消会弹掉该快照，保证长文本编辑可一次 Ctrl+Z 回退。
-- `desktop_export.py` / `renderer.py`：矢量导出、PNG/SVG 导出前走同一 `resolve_auto_layout()` pass，避免预览与导出布局漂移；未改 `_apply_canvas_fit`、文字排版大脑或导出服务算法。
-- 测试：新增 `tests/test_layer_auto_layout.py` 覆盖横向 gap、纵向 padding/align、长文本尺寸变化、隐藏/删除子层、嵌套、解组保持视觉位置、复制、单快照撤销；在既有 `tests/test_canvas_layer_redesign.py` 追加 inline 编辑撤销边界测试。
-- 验证：相关测试 `36 passed`；`ruff` clean；`py_compile` clean；限定 `mypy --follow-imports=skip` clean。全量 `pytest tests services/api/tests` = **499 passed / 5 failed / 80 skipped**；5 个失败均是预存在的 `tests/test_ui_app.py` 预览标尺/缩放断言与缺 `_on_canvas_pan_press`，与本轮自动布局无关。
+- **Packet 0**（`tests/test_layer_baseline.py` + golden）：内存构造生产形态 Document，连导两次 DXF/矢量 SVG 规整元数据（ezdxf GUID、`@ISO` 戳、`$TD*` 儒略日时间戳）后逐字节一致 + 导出 dict 结构金标。作为后续所有 Packet 的字节门禁。
+- **Packet 1**（修 P1/P2，`models.py`/`ui_app.py`）：`HistoryManager` 加 `begin/commit/rollback_transaction`（幂等，cap 50）；新增**非模态属性栏 overlay**（`_open_inspector_overlay`，`CTkFrame` 不 `grab_set`/不 `wait_window`），绑现有共享 var，var trace→实时重绘，进入编辑 begin、失焦/回车/松手 commit、Esc rollback，位置夹紧视口；`_open_layer_geometry_dialog`/`_open_heart_anchor_dialog` 去 `grab_set`。flag `INSPECTOR_OVERLAY`（env=0 回退旧对话框）。
+- **Packet 2**（修 P3，`ui_app.py`/`desktop_export.py`）：两个添加按钮合并为单一「+ 添加图层」→ 原生 `tk.Menu`（文字/图片素材/空白内容层/普通组合/自动布局组合，组合两项复用 codex Packet 5 处理器、<2 选中置灰）；空白内容层 = 未绑 `ImageLayer`，非零占位 + 虚线占位渲染；`_image_layer` 对从未绑过的空白层导出跳过+warning（不再崩）。
+- **Packet 3**（ADR-001，新增 `providers.py`）：薄 `ContentProvider` + 模块级 `PROVIDERS` 注册表 + `get_provider`；`TextProvider`/`ImageProvider` 的 `render_export`/`render_preview` **委托既有函数**（算法零改动）；`models.Layer` 加 `provider_id`（不进导出 dict）；`_document_to_layer_document`/`_redraw_preview` 改查表分发；AnchoredHeart 保留专用路径。其余 §7 方法留 stub。
+- **Packet 4**（§8/§15/§16，`models.py`/`providers.py`/`desktop_export.py`/`ui_app.py`）：**修复资源缺失崩溃**——已绑但磁盘缺失的素材导出跳过+warning、预览画「素材缺失」红框；`Document.schema_version` + `serialize`/`deserialize_document`（provider seam + `dataclasses.fields` 通用编解码、组递归）；`migrate_v1_to_v2`（复用 `__post_init__`）；未知 provider_id/构造失败 → `UnknownLayer` 持原始 dict 无损保留；最小 `ResourceRef`（未重构现有 font/material 字段）；flag `DOC_SCHEMA_V2`。
+- **Packet 6**（§9/§10/§14，新增 `tools.py`）：`SelectTool`/`TextTool` 委托既有 `_on_canvas_*`/内联编辑（thin-registry，画布绑定不变，零回归）；provider 声明 `inspector_sections`/`capabilities`，悬浮栏改 `_inspector_rows_from_provider` 数据驱动；`TextLayer` 加 `layout_mode="box"`（= 当前行为不分支）+ `runs=None`（声明不填）。
+- **Packet 7**（§16/§17，`providers.py`/`ui_app.py`）：填 `ContentProvider.validate`（有限正数尺寸 / 字号 / 缺素材）+ Inspector 写回 `math.isfinite` 拒绝 NaN/inf/负值；新增 `_on_canvas_pan_press`（中键平移）+ 绑定；**修复全部 7 个迁移期基线失败**（3 个真实缺口改实现：中键平移×2、`case_button` 孤儿；4 个陈旧期望订正：标尺 `target_px` 72→40、缩放步进 0.25→0.05、滚轮改纯缩放，均带注释）。
+
+- 新增文件：`providers.py`、`tools.py`、`tests/test_{layer_baseline,inspector_packet1,add_layer_menu_packet2,providers_packet3,doc_serialize_packet4,tools_inspector_packet6,error_recovery_packet7}.py` + `tests/fixtures/layer_baseline_doc.json`。
+- 验证：`ruff`/`py_compile` 全绿；全量 `pytest tests services/api/tests` = **622 passed / 0 failed / 33 skipped**（基线 547→599→622，**0 回归**，迁移期 7 失败全清）。
+
+## 上次改动（2026-06-25，codex）：Layer System v2 Packet 5 自动布局组合
+
+- `models.py`：新增 `AutoLayoutGroupLayer`、`auto_layout_group_layers()`、`convert_group_to_auto_layout()`、`resolve_auto_layout()`。自动布局为重绘/导出前的幂等 pass，支持 horizontal/vertical、gap、padding、align、justify、hug/fixed；隐藏子层不占位，坏尺寸压到 1px，循环/过深转 warning。普通组创建时也记录子层 union bounds。
+- `ui_app.py`：图层 Treeview 改 `selectmode="extended"`；右键菜单新增「组合所选」「自动布局组合所选」「转换为自动布局组合」「解除组合」。预览前先 `resolve_auto_layout()` 再 `resolve_anchored_hearts()`，改用 `flat_render_layers()` 画叶子层。inline 文本编辑首次实改只压一次 history，Esc 取消弹掉该快照。
+- `desktop_export.py` / `renderer.py`：矢量/PNG/SVG 导出前走同一 `resolve_auto_layout()` pass；未改 `_apply_canvas_fit`、文字排版大脑或导出服务算法。
+- 测试：`tests/test_layer_auto_layout.py` + `tests/test_canvas_layer_redesign.py` inline 撤销边界。
 
 ## 上次改动（2026-06-25）：移除全部 GIMP 残留
 
@@ -38,9 +51,12 @@
 
 ## 已知问题 / 未解决（诚实）
 
-- `tests/test_ui_app.py` 当前 5 个失败均**预存在、与本轮无关**：preview 标尺/缩放 `without_display` 数值断言，以及测试期望 `_on_canvas_pan_press`（当前只有 `_on_canvas_press`）。需单独修迁移期预览交互测试/实现。
-- `case_button` 迁移期死引用仍未专项处理；本轮全量测试未命中，但 `CURRENT_TASKS.md` 仍保留待办。
-- 真机手测仍待做：Tkinter 改动无法纯自动化，改完务必**完全关掉 App 重开**再测。
+- **真机 Tkinter 手测全部待做**（无头测不到，逐 Packet 的子代理报告里有详细清单）。关键项：①非模态属性栏开时画布仍可拖/缩/选其他层、改值实时重绘、连续改值一次 Ctrl+Z 复原、Esc 回滚；②「+添加图层」菜单五项 + 空白内容层占位 + 可后绑素材；③缺素材时画红色「素材缺失」占位框且导出不崩；④中键平移（`_on_canvas_pan_press`）；⑤改完务必**完全关掉 App 重开**再测（旧进程缓存旧模块）。
+- **Inspector 悬浮栏目前只渲染 x/y/w/h/font_size**（= 旧「位置/尺寸」对话框字段集，手感一致）。字距/行距/对齐/颜色/字体已由 `TextProvider.inspector_sections` **声明**，但悬浮栏 write-back 白名单未接这些 key，故暂不在栏内显示（仍走右键 picker/内联编辑）。Packet 6 边界——给 `_write_inspector_vars_to_layer` 接新 key + 加进白名单即可显示，无需改 overlay 渲染循环（§14 扩展点已就绪）。
+- **内联文字编辑仍走 codex Packet 5 的即兴 history 机制**（`inline_text_history_pushed` + 弹快照），未并入 Packet 1 的 `HistoryManager` 事务 API；两者不同入口、互不冲突。若要统一，把 `_start/_commit/_cancel_inline_text_edit` 改调 `begin/commit/rollback_transaction`。
+- **AnchoredHeart 仍走专用导出/预览路径**，未 provider 化（设计如此，§20 保留）。
+- **Document v2 序列化是新增能力但尚无「打开/保存文档」UI**（每次启动仍空白画布）。`serialize`/`deserialize_document` 已可用且有 round-trip 测试，待后续接存盘按钮（`DOC_SCHEMA_V2` flag 默认 ON）。
+- **分支未 merge/push**：`layer-system-v2-rest`，逐 Packet 提交，待真机验证后再决定合回 main。基线 snapshot 提交把迁移期既有未提交工作（含 codex Packet 5）一并固化。
 - `birth_flower_config.json` 历史上有明文 OpenAI key 误填风险；若仍在，建议改环境变量并轮换。
 
 ## 怎么跑 / 怎么测
