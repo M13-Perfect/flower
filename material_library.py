@@ -3,9 +3,10 @@
 一个 **素材库** = 一个文件夹，可选放一份 ``library.json`` 清单：
 
 - 有清单：按清单声明 key/显示名/别名/标签/每素材默认生产参数（最灵活，支持非花朵素材）。
-- 无清单（零配置）：扫文件夹自动成库。对图像库优先复用 ``asset_resolver`` 的
-  birth-flower 月份/花朵识别（保留旧链路标签 ``tags={"month","flower"}``）；
-  识别不到月份则退化为「按文件名取 key」的通用图像库。
+- 无清单（零配置）：扫文件夹自动成库。图像库取「并集」——带月份名的文件复用
+  ``asset_resolver`` 的 birth-flower 月份/花朵识别（保留旧链路标签
+  ``tags={"month","flower"}``），其余 png/svg 一律按文件名取 key 收录；月份识别只决定
+  带不带标签，不再当过滤闸门，故文件夹下任意图片都会进库。
 
 库对外暴露两类视图：
 - ``by_key`` / ``match``：UI / 解析器据 key 或别名定位具体素材 → 文件路径。
@@ -32,7 +33,8 @@ from production import ProductionParams
 logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "library.json"
-IMAGE_EXTENSIONS = {".svg", ".png", ".jpg", ".jpeg", ".webp"}
+# 与 ui_app.IMPORTABLE_ASSET_SUFFIXES 对齐：位图素材（含 .bmp）也算素材，文件夹零配置扫描时一并收。
+IMAGE_EXTENSIONS = {".svg", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
 @dataclass(frozen=True)
@@ -220,26 +222,29 @@ def _from_manifest(
 # 零配置扫描
 # ---------------------------------------------------------------------- #
 def _scan_image_entries(root: Path) -> tuple[MaterialEntry, ...]:
-    """先试 birth-flower 月份识别（保留旧标签），识别不到再做通用图像扫描。"""
-    flower_assets = scan_flower_assets(root)
-    if flower_assets:
-        return tuple(
-            MaterialEntry(
-                key=asset.asset_key or _asset_key(asset.path.stem),
-                name=asset.display_name or asset.name,
-                path=asset.path,
-                aliases=_dedupe((asset.display_name, asset.name)),
-                tags={"month": asset.month, "flower": asset.flower},  # 兼容旧 month/flower 定位
-                kind="image",
-                is_vector_safe=asset.is_vector_safe,
-                warnings=asset.embedded_raster_warnings,
-            )
-            for asset in flower_assets
-        )
+    """零配置扫描：文件夹下每个图片按文件名收成一个素材（key=文件名 slug），不再识别月份/花序号。
 
-    entries: list[MaterialEntry] = []
+    .svg 走 scan_flower_assets 拿矢量安全检查，其余图片类型直接按文件名补进来。素材只按
+    key / 花名定位（见 order_catalog.enrich_parse_result），月份不再参与选素材。
+    """
+    flower_assets = scan_flower_assets(root)
+    entries: list[MaterialEntry] = [
+        MaterialEntry(
+            key=asset.asset_key or _asset_key(asset.path.stem),
+            name=asset.display_name or asset.name,
+            path=asset.path,
+            aliases=_dedupe((asset.display_name, asset.name)),
+            kind="image",
+            is_vector_safe=asset.is_vector_safe,
+            warnings=asset.embedded_raster_warnings,
+        )
+        for asset in flower_assets
+    ]
+
+    # .svg 已收录；其余图片类型按文件名补进来。
+    seen = {asset.path for asset in flower_assets}
     for path in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
-        if not path.is_file() or path.suffix.casefold() not in IMAGE_EXTENSIONS:
+        if path in seen or not path.is_file() or path.suffix.casefold() not in IMAGE_EXTENSIONS:
             continue
         entries.append(
             MaterialEntry(

@@ -1,5 +1,12 @@
 # PROJECT_INDEX — flower（订单驱动的雕刻素材生成器）
 
+> ⚠️ **本副本 = 纯桌面+服务侧子集（2026-06-25 从 `Documents\flower`(claude/desktop-tkinter) 迁移而来）。**
+> 仅保留：Tkinter 桌面（根目录 .py）+ 运行素材（BirthMonth flowers/、字体、templates/、glyph_maps/、assets/、birth_flower_config.json）+ `services/api` 后端 + tests + `tools/build_windows_exe.py`。
+> **已移除（范围外）**：`apps/`(Electron)、`packages/`(TS)、`automation/`(店小秘扩展+inbox-service)、`editor*/`+`gimp_*/`+`vector_binding.py`+`preview_render.py`+`psd_probe*.py`(GIMP-VB 实验轨道)、`packaging/`、Node 工作区文件(package*.json/pnpm/tsconfig)。下文凡提及这些的段落仅作历史参考，本目录已无对应文件。
+> **2026-06-25 GIMP 残留已全部移除**：原 GIMP 编辑/模板注册中心的死代码、`gimp_template_id` 配置字段、`docs/gimp/` 与相关 ADR/GPL 文档均已删除；旧 Tkinter 画板为唯一生产编辑器，无遗留报错入口。详见 `AGENTS.md`。
+> **验收**：`PYTHONPATH=".;services\api" .\.venv-win\Scripts\python.exe -m pytest tests services/api/tests -q` → 534 passed / 9 failed / 33 skipped；这 9 个失败全在 `tests/test_ui_app.py`，均为预存在的无头 Tkinter / 迁移期功能缺口（与本次移除无关）。
+> 下面是迁移前原文，「两套 UI」中的 Electron 段已不适用本目录。
+
 > 新对话先读这份 + `CURRENT_TASKS.md`。导出/EzCad 细节看 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
 > 本文档对比并校正了 `AGENTS.md`（见下「重要：两套 UI」）。最后更新：2026-06-13。
 

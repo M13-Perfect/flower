@@ -16,10 +16,16 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from glyph_service import rebuild_render_text
-from heart_symbol import HEART_ASPECT, HEART_VIEW_H, HEART_VIEW_W, heart_path_d_transformed
-from models import Document, ImageLayer, Layer, TextLayer, layer_text_style
-from text_layout import ENDING_HEART_ADVANCE_RATIO, fit_text_box, place_ending_heart
+from anchor_resolve import compute_text_fit, resolve_anchored_hearts
+from heart_symbol import (
+    HEART_ASPECT,
+    HEART_VIEW_H,
+    HEART_VIEW_W,
+    heart_path_d_transformed,
+    heart_svg_markup,
+)
+from models import AnchoredHeartLayer, Document, ImageLayer, Layer, TextLayer, layer_text_style, resolve_auto_layout
+from text_layout import place_ending_heart
 
 # services/api(导出权威所在)未必已安装为包,确保它在 sys.path 上,
 # 这样下面函数里惰性 import app.domain.exports.* 一定可用(否则按钮点击会 ImportError 崩溃)。
@@ -100,11 +106,18 @@ def _document_to_layer_document(
     # 物理宽度优先用调用方(按钮)从产品模板读到的值;缺省退回 80mm。
     width_mm = float(physical_width_mm) if physical_width_mm and physical_width_mm > 0 else DEFAULT_PHYSICAL_WIDTH_MM
     fill_mode = "outline" if str(text_fill).lower() == "outline" else "solid"
+    resolve_auto_layout(document)
+    # 导出前统一解析锚定爱心：按锚定文字墨迹 + mm 偏移就地重算每个爱心图层的绝对几何，
+    # 并给被接管的文字图层置 ending_heart_detached（下面 _text_layer 据此不再自烘爱心）。
+    resolve_anchored_hearts(document, physical_width_mm=width_mm)
     layers: list[dict[str, Any]] = []
     for layer in document.flat_render_layers():
         if not getattr(layer, "visible", True):
             continue
-        if isinstance(layer, ImageLayer):
+        # AnchoredHeartLayer 是 ImageLayer 子类，必须先于 ImageLayer 判断，否则会走读盘的圆弧版分支。
+        if isinstance(layer, AnchoredHeartLayer):
+            layers.append(_anchored_heart_layer(layer))
+        elif isinstance(layer, ImageLayer):
             layers.append(_image_layer(layer))
         elif isinstance(layer, TextLayer):
             layers.append(_text_layer(layer))
@@ -155,6 +168,28 @@ def _image_layer(layer: ImageLayer) -> dict[str, Any]:
     schema["preserveVector"] = True
     # 让导出定位与画布预览/PNG 完全一致(所见即所得);失败时退回声明 viewBox。见 _apply_canvas_fit。
     _apply_canvas_fit(schema, layer, asset_path, inline_svg)
+    return schema
+
+
+def _anchored_heart_layer(layer: AnchoredHeartLayer) -> dict[str, Any]:
+    """锚定末尾爱心 → svg 图层 dict。直接喂归一化 inlineSvg（仅 M/C/Q/Z，DXF 安全），
+
+    绕开磁盘手绘圆弧版（DXF 不可解析）。resolve 已把 x/y/width/height 设成爱心紧致盒在画布的
+    绝对位置、scale 归 1，且 heart_svg_markup 的 viewBox 恰为 (0,0,HEART_VIEW_W,HEART_VIEW_H)，
+    故导出端「viewBox→layer 框」映射 1:1 重现紧致盒 → 与预览/PNG 落点一致，无需 _apply_canvas_fit。
+    """
+    fill = getattr(layer, "fill_color", "") or "#111111"
+    schema = _layer_base(layer, "svg")  # x/y/width/height 取自 layer（resolve 已写好绝对几何）
+    schema["inlineSvg"] = heart_svg_markup(fill)
+    schema["preserveVector"] = True
+    schema["viewBox"] = {
+        "x": 0.0,
+        "y": 0.0,
+        "width": float(HEART_VIEW_W),
+        "height": float(HEART_VIEW_H),
+    }
+    schema["scaleX"] = 1.0
+    schema["scaleY"] = 1.0
     return schema
 
 
@@ -236,36 +271,13 @@ def _text_layer(layer: TextLayer) -> dict[str, Any]:
     vertical_align = (getattr(layer, "vertical_align", "middle") or "middle").casefold()
     line_spacing = float(layer.line_spacing or 1)
     letter_spacing = float(layer.letter_spacing or layer.tracking or 0)
-    # 统一适配:和预览/PNG 共用 fit_text_box —— 把"自适应字号 + 断行 + 每行基线锚点"算一次,
-    # 烘进 textLayout 让矢量端(dxf/svg)逐字复用,从而所见即所得。layer.font_size 作字号上限。
-    # render_text 与 TextRenderer 同源现算(rebuild_render_text),不信任可能过期的 layer.render_text,
-    # 保证两端 name/message 分类与字形替换完全一致。
-    source_text = layer.original_text or layer.text or ""
-    try:
-        render_text, _clean_overrides, _rebuild_warnings = rebuild_render_text(
-            source_text,
-            layer.glyph_overrides or {},
-            font_path=layer.font_path,
-            text_layer_id=str(layer.id),
-        )
-    except Exception:
-        render_text = layer.render_text or source_text
-    # Font 4 等：末尾缀独立爱心时在末行预留推进量，名字+爱心一起适配字号（与预览同一套）。
+    # 统一适配:和预览/PNG/锚定爱心解析共用 compute_text_fit —— 把"自适应字号 + 断行 + 每行基线锚点"
+    # 算一次,烘进 textLayout 让矢量端(dxf/svg)逐字复用,从而所见即所得。layer.font_size 作字号上限。
+    # ending_heart 时按 ENDING_HEART_ADVANCE_RATIO 给末尾爱心预留推进量(名字让位,位置与旧路径不变)。
     wants_heart = bool(getattr(layer, "ending_heart", False))
-    ending_advance_ratio = ENDING_HEART_ADVANCE_RATIO if wants_heart else 0.0
-    fit = fit_text_box(
-        render_text,
-        box_width,
-        box_height,
-        layer.font_path,
-        personalization_type="auto",
-        font_size_cap=float(layer.font_size or 0) or None,
-        align=align,
-        vertical_align=vertical_align,
-        line_spacing=line_spacing,
-        letter_spacing=letter_spacing,
-        ending_advance_ratio=ending_advance_ratio,
-    )
+    # 末尾爱心已交给独立 AnchoredHeartLayer（resolve 置位）时，此处不再自烘 endingHeart，避免双爱心。
+    detached = bool(getattr(layer, "ending_heart_detached", False))
+    fit = compute_text_fit(layer)
     # 字体样式（加粗/下划线）解析后烘进 style，供 svg/dxf 矢量端消费（与预览同一套 layer_text_style）。
     tstyle = layer_text_style(layer)
     schema["style"] = {
@@ -288,7 +300,8 @@ def _text_layer(layer: TextLayer) -> dict[str, Any]:
     }
     # Font 4 等：把末尾独立实心爱心烘成 box 本地的闭合矢量 path（已 scale+translate），
     # svg/dxf 端原样消费、套图层矩阵即可，导出服务保持通用（不感知“爱心”概念）。
-    if wants_heart:
+    # detached=True（已有独立爱心图层）时跳过——爱心改由 _anchored_heart_layer 走 image 管线导出。
+    if wants_heart and not detached:
         placement = place_ending_heart(fit, layer.font_path)
         if placement is not None:
             hx, hy, hscale = placement
@@ -383,10 +396,10 @@ def _asset_view_box(inline_svg: str) -> dict[str, float]:
                 return default
             if width > 0 and height > 0:
                 return {"x": x, "y": y, "width": width, "height": height}
-    width = _svg_dimension(root.get("width"))
-    height = _svg_dimension(root.get("height"))
-    if width and height:
-        return {"x": 0.0, "y": 0.0, "width": width, "height": height}
+    svg_width = _svg_dimension(root.get("width"))
+    svg_height = _svg_dimension(root.get("height"))
+    if svg_width and svg_height:
+        return {"x": 0.0, "y": 0.0, "width": svg_width, "height": svg_height}
     return default
 
 

@@ -1,6 +1,0 @@
-﻿# Auto session log (pending fold into AGENTS.md)
-
-> Appended by the Stop hook on each stop. A new conversation folds these changes into
-> AGENTS.md per global CLAUDE.md rule 14, then CLEARS this file. Suggest gitignoring it.
-- 2026-06-18 12:31 | changed: AGENTS.md, CURRENT_TASKS.md, config_store.py, desktop_export.py, docs/superpowers/plans/2026-06-17-operator-admin-role-split.md, glyph_service.py, gpt_parser.py, models.py, order_batch.py, parse_pipeline.py, services/api/app/domain/exports/dxf.py, services/api/app/domain/exports/svg.py, tests/test_config_store.py, tests/test_glyph_application.py, tests/test_text_layout.py, tests/test_text_wysiwyg_consistency.py, tests/test_ui_app.py, text_layout.py, text_renderer.py, ui_app.py ...(+8 more)
-- 2026-06-18 16:12 | changed: AGENTS.md, CURRENT_TASKS.md, asset_resolver.py, config_store.py, desktop_export.py, docs/superpowers/plans/2026-06-17-operator-admin-role-split.md, glyph_service.py, gpt_parser.py, models.py, order_batch.py, order_catalog.py, parse_pipeline.py, services/api/app/domain/exports/dxf.py, services/api/app/domain/exports/svg.py, tests/test_asset_resolver.py, tests/test_config_store.py, tests/test_glyph_application.py, tests/test_material_library.py, tests/test_order_catalog.py, tests/test_parse_pipeline.py ...(+15 more)

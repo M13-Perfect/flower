@@ -19,7 +19,7 @@ def _write(path: Path, text: str = _SVG) -> Path:
 
 
 # ---------------------------------------------------------------- 零配置：birth-flower
-def test_zero_config_birth_flower_keeps_month_tags(tmp_path: Path):
+def test_zero_config_birth_flower_keys_by_filename(tmp_path: Path):
     _write(tmp_path / "March_Daffodil.svg")
     _write(tmp_path / "March_CherryBlossom.svg")
 
@@ -28,12 +28,12 @@ def test_zero_config_birth_flower_keeps_month_tags(tmp_path: Path):
     assert library.id == "birth-flowers"
     assert library.kind == "image"
     keys = {entry.key for entry in library.entries}
-    assert "daffodil" in keys  # key 取纯花名（已去月份）
+    assert keys == {"march-daffodil", "march-cherryblossom"}  # key 取文件名 slug，不去月份
 
-    daffodil = library.by_key("daffodil")
+    daffodil = library.by_key("march-daffodil")
     assert daffodil is not None
-    assert daffodil.tags.get("month") == 3  # month/flower 仅作上下文标签保留
-    assert daffodil.tags.get("flower") == 1  # daffodil 在三月排第一
+    assert "month" not in daffodil.tags  # 零配置图像 entry 不再带 month/flower 标签
+    assert "flower" not in daffodil.tags
 
 
 def test_zero_config_birth_flower_catalog(tmp_path: Path):
@@ -41,9 +41,9 @@ def test_zero_config_birth_flower_catalog(tmp_path: Path):
     library = MaterialLibrary.from_folder(tmp_path, kind="image")
     catalog = library.catalog()
     assert isinstance(catalog, Catalog)
-    assert "snowdrop" in catalog.keys()  # key 取纯花名（已去月份）
+    assert "january-snowdrop" in catalog.keys()  # key 取文件名 slug，不去月份
     item = next(iter(catalog.items))
-    assert item["tags"].get("month") == 1
+    assert "month" not in item["tags"]  # 图像 entry 不再带 month 标签
 
 
 # ---------------------------------------------------------------- 零配置：通用图像
@@ -57,6 +57,22 @@ def test_zero_config_generic_images(tmp_path: Path):
     border = library.by_key("border-floral")
     assert border is not None
     assert "month" not in border.tags  # 非花朵素材无月份标签
+
+
+def test_zero_config_mixes_svg_and_raster(tmp_path: Path):
+    """并集扫描：svg 与位图在同一文件夹里共存，都按文件名收进库。"""
+    _write(tmp_path / "March_Daffodil.svg")  # 文件名带月份词 → key 保留原始 stem
+    _write(tmp_path / "X.svg")  # 任意命名 → 按文件名收
+    (tmp_path / "lens-clear.png").write_bytes(b"\x89PNG\r\n")
+
+    library = MaterialLibrary.from_folder(tmp_path, kind="image")
+    keys = {entry.key for entry in library.entries}
+    assert keys == {"march-daffodil", "x", "lens-clear"}  # 三个都进库，无重复
+
+    daffodil = library.by_key("march-daffodil")
+    assert daffodil is not None and "month" not in daffodil.tags  # 图像 entry 无 month 标签
+    x = library.by_key("x")
+    assert x is not None and "month" not in x.tags  # 非花素材无月份标签
 
 
 # ---------------------------------------------------------------- 清单驱动

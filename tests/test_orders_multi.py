@@ -11,12 +11,13 @@ import json
 import pytest
 
 from gpt_parser import (
+    DEEPSEEK_ORDERS_JSON_SUFFIX,
     ORDERS_SCHEMA,
     build_orders_system_prompt,
     parse_orders_payload,
     parse_orders_with_gpt,
 )
-from models import AIParseConfig, ParseResult
+from models import AIParseConfig, ParsePromptTrace, ParseResult
 from parse_pipeline import parse_orders_auto, split_order_blocks
 
 
@@ -50,9 +51,7 @@ def test_parse_orders_payload_bounds_and_strips():
             {
                 "order_number": " 4090627965 ",
                 "quantity": 2,
-                "month": 13,  # 越界 → None
                 "flower_name": " Narcissus ",
-                "flower": 2,
                 "font": 9,  # 越界 → None
                 "text": "  Amy  ",
                 "gift_message": " hi ",
@@ -64,8 +63,6 @@ def test_parse_orders_payload_bounds_and_strips():
     [result] = parse_orders_payload(payload)
     assert result.order_number == "4090627965"
     assert result.quantity == 2
-    assert result.month is None
-    assert result.flower == 2
     assert result.font is None
     assert result.text == "Amy"
     assert result.flower_name == "Narcissus"
@@ -84,9 +81,10 @@ def test_parse_orders_payload_collapses_internal_spaces_in_text():
 
 def test_parse_orders_payload_handles_single_object_fallback():
     # 模型偶尔不包 orders 直接返回单条，也要容错成 1 元素列表。
-    [result] = parse_orders_payload({"text": "Lacey", "month": 9, "font": 3, "flower": 1})
+    [result] = parse_orders_payload({"text": "Lacey", "flower_name": "Aster", "font": 3})
     assert result.text == "Lacey"
-    assert result.month == 9
+    assert result.flower_name == "Aster"
+    assert result.font == 3
 
 
 def test_parse_orders_payload_empty_on_garbage():
@@ -117,9 +115,7 @@ def test_parse_orders_with_gpt_openai_wires_schema_and_prompt():
                         {
                             "order_number": "4090627965",
                             "quantity": 1,
-                            "month": 12,
                             "flower_name": "Narcissus",
-                            "flower": 2,
                             "font": 4,
                             "text": "#1 Mom Kicking Ass & Taking Names!",
                             "gift_message": "",
@@ -129,9 +125,7 @@ def test_parse_orders_with_gpt_openai_wires_schema_and_prompt():
                         {
                             "order_number": "4093542955",
                             "quantity": 1,
-                            "month": 6,
                             "flower_name": "Honeysuckle",
-                            "flower": 2,
                             "font": 3,
                             "text": "Esther",
                             "gift_message": "Happy birthday my dearest Esther!",
@@ -146,7 +140,8 @@ def test_parse_orders_with_gpt_openai_wires_schema_and_prompt():
     results = parse_orders_with_gpt(REAL_ORDER, api_key="k", provider="openai", http_post=fake_post)
 
     assert [r.order_number for r in results] == ["4090627965", "4093542955"]
-    assert results[0].month == 12 and results[0].flower == 2 and results[0].font == 4
+    assert results[0].flower_name == "Narcissus" and results[0].font == 4
+    assert results[1].flower_name == "Honeysuckle" and results[1].font == 3
     assert results[1].gift_message == "Happy birthday my dearest Esther!"
     # 发出去的是多订单 schema；系统提示词只含前台内容（此处未传规则 → 空串，无本地脚手架）。
     assert captured["payload"]["text"]["format"]["schema"] is ORDERS_SCHEMA
@@ -172,6 +167,105 @@ def test_parse_orders_with_gpt_uses_custom_prompt():
     assert "【背景】礼品语境" in content
 
 
+def test_parse_orders_with_gpt_fills_trace_with_actual_sent_prompt_openai():
+    # 可观测性 ③：trace 记的「本次提示词」必须**逐字等于**真正发给 OpenAI 的 system 内容。
+    captured: dict = {}
+
+    def fake_post(url, payload, headers, timeout):
+        captured["payload"] = payload
+        return {"output_text": json.dumps({"orders": []})}
+
+    trace = ParsePromptTrace()
+    parse_orders_with_gpt(
+        "  4090627965\nName: Amy  ", api_key="k", provider="openai",
+        system_prompt="只提取名字", background_prompt="礼品语境",
+        http_post=fake_post, trace=trace,
+    )
+
+    assert trace.filled is True
+    assert trace.provider == "openai"
+    assert trace.model  # 解析到的模型名（默认 gpt-5-nano）非空
+    sent_system = captured["payload"]["input"][0]["content"]
+    sent_user = captured["payload"]["input"][1]["content"]
+    assert trace.system_prompt == sent_system  # 显示 == 发送，零漂移
+    assert trace.user_content == sent_user
+
+
+def test_parse_orders_with_gpt_uses_user_content_override_for_resolved_templates():
+    captured: dict = {}
+
+    def fake_post(url, payload, headers, timeout):
+        captured["payload"] = payload
+        return {"output_text": json.dumps({"orders": []})}
+
+    trace = ParsePromptTrace()
+    parse_orders_with_gpt(
+        "raw order",
+        api_key="k",
+        provider="openai",
+        system_prompt="<order_data>raw order</order_data>",
+        user_content="",
+        reference_snapshot=({"id": "field-id", "reference_name": "旧名称"},),
+        http_post=fake_post,
+        trace=trace,
+    )
+
+    sent_user = captured["payload"]["input"][1]["content"]
+    assert sent_user == ""
+    assert trace.user_content == ""
+    assert trace.resolved_prompt == "<order_data>raw order</order_data>"
+    assert trace.reference_snapshot == ({"id": "field-id", "reference_name": "旧名称"},)
+
+
+def test_parse_orders_with_gpt_fills_trace_with_deepseek_json_suffix():
+    # DeepSeek 路径：trace 的 system 提示词必须含真实追加的 JSON 约定后缀，并等于发出去的 content。
+    captured: dict = {}
+
+    def fake_post(url, payload, headers, timeout):
+        captured["payload"] = payload
+        return {"choices": [{"message": {"content": json.dumps({"orders": []})}}]}
+
+    trace = ParsePromptTrace()
+    parse_orders_with_gpt(
+        "note", api_key="k", provider="deepseek",
+        system_prompt="只提取名字", http_post=fake_post, trace=trace,
+    )
+
+    assert trace.provider == "deepseek"
+    assert DEEPSEEK_ORDERS_JSON_SUFFIX in trace.system_prompt
+    sent_system = captured["payload"]["messages"][0]["content"]
+    assert trace.system_prompt == sent_system
+
+
+def test_parse_orders_with_gpt_without_trace_is_unchanged():
+    # 不传 trace 时行为零变化（旧调用方/测试不受影响）。
+    def fake_post(url, payload, headers, timeout):
+        return {"output_text": json.dumps({"orders": [{"text": "Amy", "flower_name": "Aster", "font": 1}]})}
+
+    results = parse_orders_with_gpt("note", api_key="k", provider="openai", http_post=fake_post)
+    assert [r.text for r in results] == ["Amy"]
+
+
+def test_parse_orders_auto_threads_trace_to_parser():
+    # 管线把 trace 透传到解析器；不传 trace 时 fake 解析器 kwargs 里不出现 trace。
+    config = AIParseConfig(enabled=True, system_prompt="SP")
+    seen: dict = {}
+
+    def fake_orders(remark, **kwargs):
+        seen.update(kwargs)
+        if kwargs.get("trace") is not None:
+            kwargs["trace"].filled = True
+        return [ParseResult(text="A", font=1, flower_name="Aster")]
+
+    trace = ParsePromptTrace()
+    parse_orders_auto("note", ai_config=config, gpt_orders_parser=fake_orders, trace=trace)
+    assert seen.get("trace") is trace and trace.filled is True
+
+    seen.clear()
+    parse_orders_auto("note", ai_config=config, gpt_orders_parser=fake_orders)
+    assert "trace" not in seen
+
+
 def test_split_order_blocks_extracts_each_order_number():
     blocks = split_order_blocks(REAL_ORDER)
     assert [number for number, _qty, _text in blocks] == [
@@ -187,19 +281,20 @@ def test_split_order_blocks_reads_quantity_suffix():
 
 def test_parse_orders_auto_uses_orders_gpt_and_threads_prompt():
     config = AIParseConfig(
-        enabled=True, prefer_ai=True, system_prompt="SP", background_prompt="BG"
+        enabled=True, prefer_ai=True, system_prompt="SP", background_prompt="BG", user_content=""
     )
     captured: dict = {}
 
     def fake_orders(remark, **kwargs):
         captured.update(kwargs)
-        return [ParseResult(text="A", month=1, font=1, flower=1, order_number="111")]
+        return [ParseResult(text="A", font=1, flower_name="Aster", order_number="111")]
 
     results = parse_orders_auto("note", ai_config=config, gpt_orders_parser=fake_orders)
 
     assert [r.text for r in results] == ["A"]
     assert captured["system_prompt"] == "SP"
     assert captured["background_prompt"] == "BG"
+    assert captured["user_content"] == ""
 
 
 def test_parse_orders_auto_raises_when_ai_fails():

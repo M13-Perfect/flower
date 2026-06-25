@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 from typing import Any
 import logging
@@ -9,13 +11,15 @@ from production import ProductionParams
 
 logger = logging.getLogger(__name__)
 
+# 末尾爱心独立图层的素材文件（磁盘手绘圆弧版，仅作预览/旧 SVG 导出的回退引用；
+# 矢量 DXF/纯矢量 SVG 走 heart_symbol.heart_svg_markup 的归一化版，见 desktop_export._anchored_heart_layer）。
+_HEART_SVG_PATH = Path(__file__).resolve().parent / "assets" / "symbols" / "heart.svg"
+
 
 @dataclass
 class ParseResult:
     text: str = ""
-    month: int | None = None
     font: int | None = None
-    flower: int | None = None
     warnings: list[str] = field(default_factory=list)
     confidence: float = 0.0
     birth_month: str | None = None
@@ -52,6 +56,27 @@ class AIParseConfig:
     # 前台「提取 / 背景提示词」：非空时作为发给 API 的系统提示词，驱动识别（见 gpt_parser.build_orders_system_prompt）。
     system_prompt: str | None = None
     background_prompt: str | None = None
+    user_content: str | None = None
+    reference_snapshot: tuple[dict[str, str], ...] = ()
+
+
+@dataclass
+class ParsePromptTrace:
+    """记录某次解析「实际发给模型」的提示词全文 + provider/model，供解析页可观测性展示。
+
+    解析路径（gpt_parser.parse_orders_with_gpt / _parse_orders_with_deepseek）把**真正拼装并发出**的
+    system 提示词（含 DeepSeek 的「顶层 orders + 字段列表」JSON 约定后缀）与用户内容写回这里，
+    UI 据此显示「本次提示词」，**不自行重算**，避免界面显示与真实发送内容漂移。
+    可变（非 frozen）：作为「出参」由调用方建空壳传入、解析路径就地填充。
+    """
+
+    provider: str = ""
+    model: str = ""
+    system_prompt: str = ""
+    user_content: str = ""
+    resolved_prompt: str = ""
+    reference_snapshot: tuple[dict[str, str], ...] = ()
+    filled: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,8 +119,6 @@ class BirthFlowerDesign:
 @dataclass(frozen=True)
 class FlowerAsset:
     name: str
-    month: int
-    flower: int
     path: Path
     asset_key: str = ""
     display_name: str = ""
@@ -180,6 +203,27 @@ class ImageLayer(Layer):
 
 
 @dataclass
+class AnchoredHeartLayer(ImageLayer):
+    """末尾独立实心爱心图层：锚定某 TextLayer，位置由文字墨迹 + mm 偏移每单自动重算。
+
+    取代旧「死贴在文字墨迹后」的 textLayout.endingHeart：爱心成为图层面板里可单独选中、
+    可调 mm 间距/上下偏移/大小的独立图层，但仍跟随锚定文字（不同名字宽度都对齐）。几何由
+    ``anchor_resolve.resolve_anchored_hearts`` 在「预览/seed/导出」前统一就地重算写回 x/y/width/height。
+
+    gap_mm / size_mm 为 None 时回落旧 ratio（``ENDING_HEART_*_RATIO * 字号``）——与旧烘焙路径
+    逐像素一致（零回归）；非 None 时按 mm 显式取值（mm→px 用画布物理尺寸换算）。
+    """
+
+    type: str = "anchored_heart"
+    anchor_layer_id: str = ""        # 锚定到哪个 TextLayer.id
+    anchor_mode: str = "text_end"    # 预留扩展；当前仅 text_end（贴末行末字右侧、竖直居中）
+    gap_mm: float | None = None      # 与文字水平间距(mm)；None=自动(ENDING_HEART_GAP_RATIO*字号)
+    offset_y_mm: float = 0.0         # 上下偏移(mm)，正=下移；0=竖直居中于末行墨迹
+    size_mm: float | None = None     # 爱心高(mm)；None=自动(ENDING_HEART_SIZE_RATIO*字号)
+    fill_color: str = "#111111"      # 爱心填充色（resolve 时从锚定文字色同步）
+
+
+@dataclass
 class TextLayer(Layer):
     """可编辑文本图层；保留原始文字，并用 render_text 承载字形替换后的视觉输出。"""
 
@@ -213,6 +257,9 @@ class TextLayer(Layer):
     # Font 4 等字体：末行末尾追加独立实心爱心符号（见 heart_symbol / glyph_service.font_uses_symbol_heart）。
     # 由 ui_app/批量在套用自动字形规则时按字体置位；预览与导出据此追加爱心，保持字体无感知。
     ending_heart: bool = False
+    # 派生缓存（由 anchor_resolve.resolve_anchored_hearts 置位）：本文字图层的末尾爱心已交给独立
+    # AnchoredHeartLayer 处理 → 预览/导出此处不再贴/烘爱心（但仍按 ending_advance 给爱心让位，名字位置不变）。
+    ending_heart_detached: bool = False
 
     def __post_init__(self) -> None:
         """兼容旧 TextLayer：旧数据只有 text 时，迁移出 original_text/render_text。"""
@@ -328,6 +375,19 @@ class GroupLayer(Layer):
 
 
 @dataclass
+class AutoLayoutGroupLayer(GroupLayer):
+    """自动布局图组：子层仍是普通绝对坐标叶子，重绘/导出前由 layout pass 写回派生坐标。"""
+
+    type: str = "auto_layout_group"
+    direction: str = "horizontal"
+    gap: float = 16.0
+    padding: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    align: str = "center"
+    justify: str = "start"
+    sizing: str = "hug"
+
+
+@dataclass
 class Document:
     """多图层文档，替代旧版单素材 current_asset 工作流。"""
 
@@ -409,10 +469,32 @@ class Document:
 
 @dataclass
 class HistoryManager:
-    """预留撤销/重做栈；当前 UI 先接入快捷键，后续可存储 Document 快照。"""
+    """Document 快照撤销栈；只管画布编辑，不碰配置持久化。"""
 
     undo_stack: list[Document] = field(default_factory=list)
     redo_stack: list[Document] = field(default_factory=list)
+
+    def push(self, document: Document, *, limit: int = 50) -> None:
+        self.undo_stack.append(deepcopy(document))
+        if len(self.undo_stack) > limit:
+            del self.undo_stack[: len(self.undo_stack) - limit]
+        self.redo_stack.clear()
+
+    def undo(self, current: Document) -> Document | None:
+        if not self.undo_stack:
+            return None
+        self.redo_stack.append(deepcopy(current))
+        return self.undo_stack.pop()
+
+    def redo(self, current: Document) -> Document | None:
+        if not self.redo_stack:
+            return None
+        self.undo_stack.append(deepcopy(current))
+        return self.redo_stack.pop()
+
+    def clear(self) -> None:
+        self.undo_stack.clear()
+        self.redo_stack.clear()
 
 
 def add_image_layer(
@@ -503,6 +585,38 @@ def add_text_layer(
     return layer
 
 
+def add_anchored_heart_layer(
+    document: Document,
+    *,
+    anchor_layer_id: str,
+    name: str = "末尾爱心",
+    gap_mm: float | None = None,
+    offset_y_mm: float = 0.0,
+    size_mm: float | None = None,
+    fill_color: str = "#111111",
+    path: Path | str | None = None,
+) -> AnchoredHeartLayer:
+    """新建锚定末尾爱心图层（从属图层，**不**抢占 selected——建后仍应保持选中文字）。
+
+    几何（x/y/width/height）留给 ``anchor_resolve.resolve_anchored_hearts`` 按锚定文字每单重算。
+    ``path`` 缺省指向磁盘 heart.svg，仅作预览/旧 SVG 导出回退；权威矢量导出走归一化 inlineSvg。
+    """
+    layer = AnchoredHeartLayer(
+        name=name,
+        path=Path(path) if path else _HEART_SVG_PATH,
+        anchor_layer_id=anchor_layer_id,
+        gap_mm=gap_mm,
+        offset_y_mm=offset_y_mm,
+        size_mm=size_mm,
+        fill_color=fill_color or "#111111",
+        z_index=len(document.layers),
+        lock_aspect_ratio=True,
+    )
+    document.layers.append(layer)
+    document.normalize_z_indexes()
+    return layer
+
+
 def delete_layer(document: Document, layer_id: str | None) -> Layer | None:
     """删除图层（在其所属容器内）并修复 selected_layer_id；锁定图层不可删除。"""
     container, layer = document.container_of(layer_id)
@@ -549,8 +663,43 @@ def move_layer(document: Document, layer_id: str | None, action: str) -> bool:
     return True
 
 
-def group_layers(document: Document, layer_ids: list[str], *, name: str = "图组") -> "GroupLayer | None":
-    """把指定（同一容器内的）图层包成 GroupLayer，插到原最上面成员的位置。返回新组或 None。"""
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _layer_layout_size(layer: Layer) -> tuple[float, float]:
+    """返回自动布局使用的 AABB 尺寸；零/坏尺寸压到 1px，避免不可命中空层。"""
+    width = getattr(layer, "text_box_width", layer.width) if isinstance(layer, TextLayer) else layer.width
+    height = getattr(layer, "text_box_height", layer.height) if isinstance(layer, TextLayer) else layer.height
+    scale_x = _finite_float(getattr(layer, "scale_x", 1.0), 1.0) or 1.0
+    scale_y = _finite_float(getattr(layer, "scale_y", 1.0), 1.0) or 1.0
+    return max(1.0, abs(_finite_float(width, 1.0) * scale_x)), max(
+        1.0,
+        abs(_finite_float(height, 1.0) * scale_y),
+    )
+
+
+def _set_group_bounds_from_children(group: GroupLayer) -> None:
+    children = [child for child in group.children if getattr(child, "visible", True)]
+    if not children:
+        group.width = max(1.0, _finite_float(group.width, 1.0))
+        group.height = max(1.0, _finite_float(group.height, 1.0))
+        return
+    left = min(child.bounds[0] for child in children)
+    top = min(child.bounds[1] for child in children)
+    right = max(child.bounds[2] for child in children)
+    bottom = max(child.bounds[3] for child in children)
+    group.x = left
+    group.y = top
+    group.width = max(1.0, right - left)
+    group.height = max(1.0, bottom - top)
+
+
+def _wrap_layers_in_group(document: Document, layer_ids: list[str], group: GroupLayer) -> GroupLayer | None:
     ids = [lid for lid in layer_ids if lid]
     if not ids:
         return None
@@ -564,11 +713,97 @@ def group_layers(document: Document, layer_ids: list[str], *, name: str = "图�
     insert_at = min(container.index(member) for member in members)
     for member in members:
         container.remove(member)
-    group = GroupLayer(name=name, children=members)
+    group.children = members
+    _set_group_bounds_from_children(group)
     container.insert(insert_at, group)
     document.normalize_z_indexes()
     document.selected_layer_id = group.id
     return group
+
+
+def group_layers(document: Document, layer_ids: list[str], *, name: str = "图组") -> "GroupLayer | None":
+    """把指定（同一容器内的）图层包成 GroupLayer，插到原最上面成员的位置。返回新组或 None。"""
+    return _wrap_layers_in_group(document, layer_ids, GroupLayer(name=name))
+
+
+def auto_layout_group_layers(
+    document: Document,
+    layer_ids: list[str],
+    *,
+    name: str = "自动布局组",
+    direction: str = "horizontal",
+    gap: float = 16.0,
+    padding: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+    align: str = "center",
+    justify: str = "start",
+    sizing: str = "hug",
+) -> AutoLayoutGroupLayer | None:
+    """把同一容器内图层包成自动布局组；少于一个有效成员则不创建空组。"""
+    group = AutoLayoutGroupLayer(
+        name=name,
+        direction=direction,
+        gap=gap,
+        padding=padding,
+        align=align,
+        justify=justify,
+        sizing=sizing,
+    )
+    created = _wrap_layers_in_group(document, layer_ids, group)
+    return created if isinstance(created, AutoLayoutGroupLayer) else None
+
+
+def convert_group_to_auto_layout(
+    document: Document,
+    group_id: str | None,
+    *,
+    direction: str = "horizontal",
+    gap: float = 16.0,
+    padding: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+    align: str = "center",
+    justify: str = "start",
+    sizing: str = "hug",
+) -> AutoLayoutGroupLayer | None:
+    """把普通组原地替换为自动布局组；保留 id 和 children，便于 UI 选择/撤销稳定。"""
+    container, group = document.container_of(group_id)
+    if container is None or not isinstance(group, GroupLayer):
+        return None
+    if isinstance(group, AutoLayoutGroupLayer):
+        group.direction = direction
+        group.gap = gap
+        group.padding = padding
+        group.align = align
+        group.justify = justify
+        group.sizing = sizing
+        resolve_auto_layout(document)
+        return group
+    replacement = AutoLayoutGroupLayer(
+        id=group.id,
+        name=group.name,
+        x=group.x,
+        y=group.y,
+        width=group.width,
+        height=group.height,
+        scale_x=group.scale_x,
+        scale_y=group.scale_y,
+        rotation=group.rotation,
+        opacity=group.opacity,
+        visible=group.visible,
+        locked=group.locked,
+        z_index=group.z_index,
+        children=group.children,
+        collapsed=group.collapsed,
+        direction=direction,
+        gap=gap,
+        padding=padding,
+        align=align,
+        justify=justify,
+        sizing=sizing,
+    )
+    container[container.index(group)] = replacement
+    document.selected_layer_id = replacement.id
+    resolve_auto_layout(document)
+    document.normalize_z_indexes()
+    return replacement
 
 
 def ungroup_layer(document: Document, group_id: str | None) -> list[Layer]:
@@ -576,6 +811,8 @@ def ungroup_layer(document: Document, group_id: str | None) -> list[Layer]:
     container, group = document.container_of(group_id)
     if container is None or not isinstance(group, GroupLayer):
         return []
+    if isinstance(group, AutoLayoutGroupLayer):
+        _layout_auto_group(group)
     at = container.index(group)
     container.remove(group)
     children = list(group.children)
@@ -587,6 +824,137 @@ def ungroup_layer(document: Document, group_id: str | None) -> list[Layer]:
     return children
 
 
+def _padding4(value: Any) -> tuple[float, float, float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return (0.0, 0.0, 0.0, 0.0)
+    top, right, bottom, left = (_finite_float(item, 0.0) for item in value)
+    return (max(0.0, top), max(0.0, right), max(0.0, bottom), max(0.0, left))
+
+
+def _axis_offset(mode: str, available: float, size: float) -> float:
+    extra = max(0.0, available - size)
+    if mode == "end":
+        return extra
+    if mode == "center":
+        return extra / 2
+    return 0.0
+
+
+def _move_layer_to(layer: Layer, x: float, y: float) -> None:
+    """移动图组时同步平移子孙；渲染使用叶子绝对坐标，不能只移动组外壳。"""
+    old_x = _finite_float(layer.x, 0.0)
+    old_y = _finite_float(layer.y, 0.0)
+    dx = x - old_x
+    dy = y - old_y
+    layer.x = x
+    layer.y = y
+    if isinstance(layer, GroupLayer):
+        for child in layer.children:
+            _move_layer_to(child, _finite_float(child.x, 0.0) + dx, _finite_float(child.y, 0.0) + dy)
+
+
+def _layout_auto_group(group: AutoLayoutGroupLayer) -> None:
+    visible_children = [child for child in group.children if getattr(child, "visible", True)]
+    if not visible_children:
+        group.width = max(1.0, _finite_float(group.width, 1.0))
+        group.height = max(1.0, _finite_float(group.height, 1.0))
+        return
+
+    direction = (group.direction or "horizontal").casefold()
+    align = (group.align or "center").casefold()
+    justify = (group.justify or "start").casefold()
+    top, right, bottom, left = _padding4(group.padding)
+    gap = max(0.0, _finite_float(group.gap, 0.0))
+    sizes = [_layer_layout_size(child) for child in visible_children]
+    horizontal = direction != "vertical"
+    main_sizes = [width if horizontal else height for width, height in sizes]
+    cross_sizes = [height if horizontal else width for width, height in sizes]
+    content_main = sum(main_sizes) + gap * max(0, len(main_sizes) - 1)
+    content_cross = max(cross_sizes, default=1.0)
+
+    if horizontal:
+        if (group.sizing or "hug").casefold() != "fixed":
+            group.width = left + content_main + right
+            group.height = top + content_cross + bottom
+        group.width = max(1.0, _finite_float(group.width, 1.0))
+        group.height = max(1.0, _finite_float(group.height, 1.0))
+        available_main = max(content_main, group.width - left - right)
+        available_cross = max(content_cross, group.height - top - bottom)
+        cursor = _finite_float(group.x, 0.0) + left + _axis_offset(justify, available_main, content_main)
+        base_y = _finite_float(group.y, 0.0) + top
+        for child, (width, height) in zip(visible_children, sizes):
+            _move_layer_to(child, cursor, base_y + _axis_offset(align, available_cross, height))
+            cursor += width + gap
+    else:
+        if (group.sizing or "hug").casefold() != "fixed":
+            group.width = left + content_cross + right
+            group.height = top + content_main + bottom
+        group.width = max(1.0, _finite_float(group.width, 1.0))
+        group.height = max(1.0, _finite_float(group.height, 1.0))
+        available_main = max(content_main, group.height - top - bottom)
+        available_cross = max(content_cross, group.width - left - right)
+        cursor = _finite_float(group.y, 0.0) + top + _axis_offset(justify, available_main, content_main)
+        base_x = _finite_float(group.x, 0.0) + left
+        for child, (width, height) in zip(visible_children, sizes):
+            _move_layer_to(child, base_x + _axis_offset(align, available_cross, width), cursor)
+            cursor += height + gap
+
+
+def resolve_auto_layout(document: Document, *, max_depth: int = 16) -> list[str]:
+    """重绘/导出前的幂等自动布局 pass；错误转 warning，避免坏组拖垮整个编辑器。"""
+    warnings: list[str] = []
+    seen: set[str] = set()
+
+    def walk(layers: list[Layer], depth: int) -> None:
+        if depth > max_depth:
+            warnings.append("自动布局嵌套过深，已跳过更深层图组")
+            return
+        for layer in list(layers):
+            if layer.id in seen:
+                warnings.append(f"自动布局检测到重复图层或循环：{layer.name}")
+                continue
+            seen.add(layer.id)
+            if not isinstance(layer, GroupLayer):
+                continue
+            walk(layer.children, depth + 1)
+            try:
+                if isinstance(layer, AutoLayoutGroupLayer):
+                    _layout_auto_group(layer)
+                else:
+                    _set_group_bounds_from_children(layer)
+            except Exception as exc:
+                warnings.append(f"自动布局失败：{layer.name} ({exc})")
+
+    walk(document.layers, 0)
+    return warnings
+
+
+def add_universal_layer(
+    document: Document,
+    *,
+    name: str = "通用图层",
+    material: dict[str, Any] | None = None,
+    text: dict[str, Any] | None = None,
+) -> Layer | None:
+    """通用图层 = 一个图组，含可选「素材子层」+/或「文字子层」。
+
+    底座复用图组：渲染/导出经 ``flat_render_layers()`` 摊平成叶子，无需新图层类型，
+    DXF/SVG/预览/序列化零改动。``material``/``text`` 的键即 ``add_image_layer`` /
+    ``add_text_layer`` 的关键字参数；为 None 即跳过该子层。两者都给→包成图组并返回组；
+    只给一个→直接返回那个叶子（不做无意义的一层嵌套）；都为 None→返回 None。
+    """
+    member_ids: list[str] = []
+    if material is not None:
+        member_ids.append(add_image_layer(document, **material).id)
+    if text is not None:
+        member_ids.append(add_text_layer(document, **text).id)
+    if not member_ids:
+        return None
+    if len(member_ids) == 1:
+        return document.layer_by_id(member_ids[0])
+    return group_layers(document, member_ids, name=name)
+
+
 def hit_test(document: Document, x: float, y: float) -> Layer | None:
     """从顶层向底层命中测试，只选可见且未锁定（含图组级联锁定）的叶子图层包围盒。"""
     for layer, effective_locked in reversed(document._flat_leaves()):
@@ -596,3 +964,117 @@ def hit_test(document: Document, x: float, y: float) -> Layer | None:
         if left <= x <= right and top <= y <= bottom:
             return layer
     return None
+
+
+def _iter_subtree(layer: Layer):
+    """深度优先产出某图层的所有后代（不含自身）；非图组无后代。用于组循环检测与复制改 id。"""
+    if isinstance(layer, GroupLayer):
+        for child in layer.children:
+            yield child
+            yield from _iter_subtree(child)
+
+
+def reparent_layer(
+    document: Document,
+    layer_id: str | None,
+    target_id: str | None,
+    position: str = "before",
+) -> bool:
+    """把图层移到 target 的「前/后/组内」，支持跨组移动。列表序是唯一事实源，移完重算 z_index。
+
+    ``position``：
+    - ``"before"`` / ``"after"``：放进 **target 所在容器**，target 列表索引的前/后一位；
+    - ``"inside"``：target 必须是 ``GroupLayer``，放进其 ``children`` 末尾（z 最高一侧）。
+
+    护栏（任一不满足返回 ``False``，绝不静默损坏树）：
+    - 把一个组拖进它自己或自己的后代 → 组循环检测拦下；
+    - 锁定图层不可拖动（与 ``delete_layer`` 一致）；
+    - target 不存在 / inside 的 target 不是组 / 源容器解析失败。
+
+    before/after 按 **列表索引**定义（与面板显示方向无关）：``before`` 落到 target 当前索引，
+    ``after`` 落到 target 索引 +1。UI 据自身面板方向决定传哪个。
+    """
+    if not layer_id or not target_id or layer_id == target_id:
+        return False
+    if position not in ("before", "after", "inside"):
+        return False
+    src_container, layer = document.container_of(layer_id)
+    if src_container is None or layer is None or layer.locked:
+        return False
+    # 组循环检测：target 落在 layer 自己的子树里 → 拒绝（否则树会成环/丢失）。
+    if any(descendant.id == target_id for descendant in _iter_subtree(layer)):
+        return False
+
+    if position == "inside":
+        target = document.layer_by_id(target_id)
+        if not isinstance(target, GroupLayer):
+            return False
+        src_container.remove(layer)
+        target.children.append(layer)
+    else:
+        dst_container, target = document.container_of(target_id)
+        if dst_container is None or target is None:
+            return False
+        src_container.remove(layer)
+        index = dst_container.index(target)  # 先 remove 再取 index：跨容器/同容器都正确
+        if position == "after":
+            index += 1
+        dst_container.insert(index, layer)
+
+    document.normalize_z_indexes()
+    document.selected_layer_id = layer.id
+    return True
+
+
+def _reassign_ids(layer: Layer, id_map: dict[str, str]) -> None:
+    """递归给图层及所有后代换全新 id，记录 旧→新 映射（供锚点重指向）。"""
+    new_id = _new_layer_id()
+    id_map[layer.id] = new_id
+    layer.id = new_id
+    if isinstance(layer, GroupLayer):
+        for child in layer.children:
+            _reassign_ids(child, id_map)
+
+
+def duplicate_layer(document: Document, layer_id: str | None) -> Layer | None:
+    """复制图层（含整组子树）：换全新 id、插到原图层上方、选中副本。找不到返回 None。
+
+    组内 ``AnchoredHeartLayer.anchor_layer_id`` 随同组一起被复制的文字重指向到副本，保证复制出
+    来的组自洽；指向组外原文字的锚点保持原样（不在 id_map 里）。
+    """
+    container, layer = document.container_of(layer_id)
+    if container is None or layer is None:
+        return None
+    copy = deepcopy(layer)
+    id_map: dict[str, str] = {}
+    _reassign_ids(copy, id_map)
+    for node in (copy, *_iter_subtree(copy)):
+        if isinstance(node, AnchoredHeartLayer) and node.anchor_layer_id in id_map:
+            node.anchor_layer_id = id_map[node.anchor_layer_id]
+    copy.name = f"{layer.name} 副本"
+    container.insert(container.index(layer) + 1, copy)
+    document.normalize_z_indexes()
+    document.selected_layer_id = copy.id
+    return copy
+
+
+def validate_document(document: Document) -> list[str]:
+    """检查文档结构不变量，返回问题列表（空=合法）。显式返回而非静默放过。
+
+    覆盖图层 id 唯一性——重复 id 或结构成环都会在 DFS 中重复命中同一 id 并被记下；
+    DFS 在命中已见 id 时不再下钻，因此成环输入也不会无限递归。
+    """
+    problems: list[str] = []
+    seen: set[str] = set()
+
+    def walk(layers: list[Layer]) -> None:
+        for layer in layers:
+            if layer.id in seen:
+                problems.append(f"图层 id 重复或结构成环：{layer.id}（{layer.name}）")
+                continue
+            seen.add(layer.id)
+            if isinstance(layer, GroupLayer):
+                walk(layer.children)
+
+    walk(document.layers)
+    return problems

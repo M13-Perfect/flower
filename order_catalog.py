@@ -57,21 +57,17 @@ class LibraryBundle:
     def resolve_font(self, query: str) -> tuple[str, MaterialEntry] | None:
         return _resolve(self.font_libraries, query)
 
-    def resolve_material_by_tags(self, **tags: Any) -> tuple[str, MaterialEntry] | None:
-        """按标签（如 birth-flower 的 month+flower）定位素材，用于兼容旧解析输出。"""
-        return _resolve_by_tags(self.image_libraries, tags)
-
     def resolve_font_by_tags(self, **tags: Any) -> tuple[str, MaterialEntry] | None:
         return _resolve_by_tags(self.font_libraries, tags)
 
 
 # ---------------------------------------------------------------------- 解析输出富化
 def enrich_parse_result(result: ParseResult, bundle: LibraryBundle) -> ParseResult:
-    """把 ParseResult 落到具体素材/字体：填 library_id + key + 资产路径，并回填 month/flower。
+    """把 ParseResult 落到具体素材/字体：填 library_id + key + 资产路径。
 
     解析优先级（素材）：已有 material_key（动态枚举校验）→ flower_name 模糊匹配。
-    **不再用出生月份+序号挑素材**：素材只按 key / 花名定位，月份不参与选素材（按需求 2026-06-18 调整）。
-    字体仍按业务编号：font_key → font 编号标签 → font_design 模糊。命中不了不臆造，只在 key 非法时记 warning。
+    **素材只按 key / 花名（文件名）定位，月份/花序号不参与选素材。**
+    字体按编号：font_key → font 编号标签 → font_design 模糊。命中不了不臆造，只在 key 非法时记 warning。
     幂等：重复富化结果不变（catalog GPT 路径内部已富化一次，pipeline 再富化一次也安全）。
     """
     warnings = list(result.warnings)
@@ -80,7 +76,6 @@ def enrich_parse_result(result: ParseResult, bundle: LibraryBundle) -> ParseResu
     material_library_id = result.material_library_id
     material_key = result.material_key
     selected_flower = result.selected_flower_asset
-    month, flower = result.month, result.flower
 
     found: tuple[str, MaterialEntry] | None = None
     if material_key:
@@ -88,17 +83,12 @@ def enrich_parse_result(result: ParseResult, bundle: LibraryBundle) -> ParseResu
         if found is None:
             warnings.append(f"素材 key「{material_key}」不在当前产品素材库中，已忽略")
             material_key = ""
-    # 只按花名匹配：月份不再参与选素材（旧的 resolve_material_by_tags(month,flower) 已移除）。
     if found is None and result.flower_name:
         found = bundle.resolve_material(result.flower_name)
     if found is not None:
         material_library_id, entry = found
         material_key = entry.key
         selected_flower = str(entry.path)
-        if month is None:
-            month = entry.tags.get("month", month)
-        if flower is None:
-            flower = entry.tags.get("flower", flower)
 
     # ---- 字体 ----
     font_library_id = result.font_library_id
@@ -125,8 +115,6 @@ def enrich_parse_result(result: ParseResult, bundle: LibraryBundle) -> ParseResu
 
     return replace(
         result,
-        month=month,
-        flower=flower,
         font=font_num,
         material_library_id=material_library_id,
         material_key=material_key,

@@ -17,18 +17,16 @@ def test_parse_gpt_payload_returns_parse_result():
     result = parse_gpt_payload(
         {
             "text": "Vivian",
-            "month": 6,
+            "flower_name": "Rose",
             "font": 1,
-            "flower": 1,
             "warnings": [],
             "confidence": 0.96,
         }
     )
 
     assert result.text == "Vivian"
-    assert result.month == 6
+    assert result.flower_name == "Rose"
     assert result.font == 1
-    assert result.flower == 1
     assert result.confidence == 0.96
 
 
@@ -57,17 +55,17 @@ def test_parse_order_remark_with_gpt_uses_structured_outputs():
                     "content": [
                         {
                             "type": "output_text",
-                            "text": '{"text":"Louise","month":6,"font":1,"flower":1,"warnings":[],"confidence":0.94}',
+                            "text": '{"text":"Louise","flower_name":"Rose","font":1,"warnings":[],"confidence":0.94}',
                         }
                     ]
                 }
             ]
         }
 
-    result = parse_order_remark_with_gpt("for Louise, June flower one", api_key="sk-test", http_post=fake_http_post)
+    result = parse_order_remark_with_gpt("for Louise, Rose font one", api_key="sk-test", http_post=fake_http_post)
 
     assert result.text == "Louise"
-    assert result.month == 6
+    assert result.flower_name == "Rose"
     assert calls[0][0].endswith("/v1/responses")
     assert calls[0][1]["text"]["format"]["type"] == "json_schema"
     assert calls[0][1]["text"]["format"]["strict"] is True
@@ -85,14 +83,14 @@ def test_parse_order_remark_with_gpt_can_call_deepseek_chat_completions():
             "choices": [
                 {
                     "message": {
-                        "content": '{"text":"Chen","month":6,"font":1,"flower":1,"warnings":[],"confidence":0.88}'
+                        "content": '{"text":"Chen","flower_name":"Rose","font":1,"warnings":[],"confidence":0.88}'
                     }
                 }
             ]
         }
 
     result = parse_order_remark_with_gpt(
-        "Name: Chen June font 1 flower 1",
+        "Name: Chen Rose font 1",
         api_key="ds-test",
         model="deepseek-v4-flash",
         provider="deepseek",
@@ -101,7 +99,7 @@ def test_parse_order_remark_with_gpt_can_call_deepseek_chat_completions():
     )
 
     assert result.text == "Chen"
-    assert result.month == 6
+    assert result.flower_name == "Rose"
     assert calls[0][0] == "https://api.deepseek.com/chat/completions"
     assert calls[0][1]["model"] == "deepseek-v4-flash"
     assert calls[0][1]["response_format"]["type"] == "json_object"
@@ -116,10 +114,10 @@ def test_parse_order_remark_with_gpt_omits_reasoning_for_non_reasoning_models():
 
     def fake_http_post(url, payload, headers, timeout):
         calls.append((url, payload, headers, timeout))
-        return {"output_text": '{"text":"Louise","month":6,"font":1,"flower":1,"warnings":[],"confidence":0.94}'}
+        return {"output_text": '{"text":"Louise","flower_name":"Rose","font":1,"warnings":[],"confidence":0.94}'}
 
     parse_order_remark_with_gpt(
-        "for Louise, June flower one",
+        "for Louise, Rose font one",
         api_key="sk-test",
         model="gpt-4o-mini",
         http_post=fake_http_post,
@@ -135,9 +133,9 @@ def test_parse_order_remark_with_gpt_can_send_project_and_org_headers(monkeypatc
 
     def fake_http_post(url, payload, headers, timeout):
         calls.append((url, payload, headers, timeout))
-        return {"output_text": '{"text":"Louise","month":6,"font":1,"flower":1,"warnings":[],"confidence":0.94}'}
+        return {"output_text": '{"text":"Louise","flower_name":"Rose","font":1,"warnings":[],"confidence":0.94}'}
 
-    parse_order_remark_with_gpt("for Louise, June flower one", api_key="sk-test", http_post=fake_http_post)
+    parse_order_remark_with_gpt("for Louise, Rose font one", api_key="sk-test", http_post=fake_http_post)
 
     assert calls[0][2]["OpenAI-Project"] == "proj_test"
     assert calls[0][2]["OpenAI-Organization"] == "org_test"
@@ -156,7 +154,7 @@ def test_parse_order_remark_with_gpt_includes_openai_error_body():
         )
 
     with pytest.raises(RuntimeError) as exc_info:
-        parse_order_remark_with_gpt("Name: Vivian June font 1 flower 1", api_key="sk-test", http_post=rate_limited)
+        parse_order_remark_with_gpt("Name: Vivian Rose font 1", api_key="sk-test", http_post=rate_limited)
 
     message = str(exc_info.value)
     assert "OpenAI API HTTP 429" in message
@@ -174,7 +172,7 @@ def test_parse_order_remark_with_gpt_reports_incomplete_response_reason():
         }
 
     with pytest.raises(ValueError) as exc_info:
-        parse_order_remark_with_gpt("Name: Vivian June font 1 flower 1", api_key="sk-test", http_post=incomplete)
+        parse_order_remark_with_gpt("Name: Vivian Rose font 1", api_key="sk-test", http_post=incomplete)
 
     message = str(exc_info.value)
     assert "max_output_tokens" in message
@@ -188,10 +186,10 @@ def test_parse_order_remark_with_gpt_prefers_explicit_project_and_org(monkeypatc
 
     def fake_http_post(url, payload, headers, timeout):
         calls.append((url, payload, headers, timeout))
-        return {"output_text": '{"text":"Mina","month":5,"font":1,"flower":1,"warnings":[],"confidence":0.9}'}
+        return {"output_text": '{"text":"Mina","flower_name":"Tulip","font":1,"warnings":[],"confidence":0.9}'}
 
     parse_order_remark_with_gpt(
-        "Mina May font 1 flower 1",
+        "Mina Tulip font 1",
         api_key="sk-test",
         model="gpt-5-nano",
         project="proj_ui",

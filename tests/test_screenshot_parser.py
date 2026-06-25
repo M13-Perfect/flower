@@ -16,7 +16,8 @@ _SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 
 def _bundle(tmp_path: Path) -> LibraryBundle:
     img = tmp_path / "flowers"
     img.mkdir()
-    (img / "March_Daffodil.svg").write_text(_SVG, encoding="utf-8")
+    # 零配置命名：key = 文件名 slug（Daffodil → "daffodil"），不再识别月份前缀。
+    (img / "Daffodil.svg").write_text(_SVG, encoding="utf-8")
     fonts = tmp_path / "fonts"
     fonts.mkdir()
     (fonts / "MalovelyScript.ttf").write_bytes(b"fake-font")
@@ -33,7 +34,7 @@ def _legacy_response(_url, _payload, _headers, _timeout):
                 "content": [
                     {
                         "type": "output_text",
-                        "text": '{"text":"Vivian","month":6,"font":1,"flower":1,"warnings":[],"confidence":0.9}',
+                        "text": '{"text":"Vivian","flower_name":"Daffodil","font":1,"warnings":[],"confidence":0.9}',
                     }
                 ]
             }
@@ -59,13 +60,15 @@ def test_screenshot_openai_legacy_sends_image_and_parses(tmp_path: Path):
 
     result = parse_order_screenshot_with_gpt(img, api_key="sk-test", http_post=fake)
     assert result.text == "Vivian"
-    assert result.month == 6 and result.font == 1 and result.flower == 1
+    assert result.flower_name == "Daffodil" and result.font == 1
 
     user_content = calls[0]["input"][1]["content"]
     image_parts = [p for p in user_content if p.get("type") == "input_image"]
     assert image_parts and image_parts[0]["image_url"].startswith("data:image/png;base64,")
-    # 不传 bundle → 旧 schema（month 1-12）
-    assert calls[0]["text"]["format"]["schema"]["properties"]["month"]["maximum"] == 12
+    # 不传 bundle → 文字/花名/字体 schema（按花名配素材，无 month/flower）
+    schema_props = calls[0]["text"]["format"]["schema"]["properties"]
+    assert "month" not in schema_props and "flower" not in schema_props
+    assert set(schema_props) == {"text", "flower_name", "font", "warnings", "confidence"}
 
 
 def test_screenshot_openai_catalog_mode(tmp_path: Path):

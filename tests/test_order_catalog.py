@@ -23,10 +23,11 @@ _SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 
 
 @pytest.fixture
 def bundle(tmp_path: Path) -> LibraryBundle:
+    # 零配置：素材 key = 文件名 slug（不再剥离月份），故文件名即裸花名。
     img = tmp_path / "flowers"
     img.mkdir()
-    (img / "March_Daffodil.svg").write_text(_SVG, encoding="utf-8")
-    (img / "March_CherryBlossom.svg").write_text(_SVG, encoding="utf-8")
+    (img / "Daffodil.svg").write_text(_SVG, encoding="utf-8")
+    (img / "CherryBlossom.svg").write_text(_SVG, encoding="utf-8")
     fonts = tmp_path / "fonts"
     fonts.mkdir()
     (fonts / "MalovelyScript.ttf").write_bytes(b"fake-font")
@@ -37,16 +38,14 @@ def bundle(tmp_path: Path) -> LibraryBundle:
 
 
 def test_bundle_keys(bundle: LibraryBundle):
-    assert "daffodil" in bundle.image_keys()  # key 取纯花名（已去月份）
+    assert "daffodil" in bundle.image_keys()  # key 取文件名 slug
     assert bundle.font_keys()
 
 
-def test_resolve_material_by_key_and_tags(bundle: LibraryBundle):
+def test_resolve_material_by_key(bundle: LibraryBundle):
     lib_id, entry = bundle.resolve_material("daffodil")
     assert lib_id == "birth-flowers"
-    assert entry.tags.get("month") == 3  # month/flower 仅作上下文标签保留
-    found = bundle.resolve_material_by_tags(month=3, flower=2)
-    assert found is not None and "cherry" in found[1].key
+    assert entry.key == "daffodil"  # 图像 entry 不再带 month/flower 标签
 
 
 def test_resolve_font_by_tags(bundle: LibraryBundle):
@@ -83,8 +82,7 @@ def test_parse_catalog_payload_valid_key_enriches(bundle: LibraryBundle):
     assert result.text == "Vivian"
     assert result.material_key == "daffodil"
     assert result.material_library_id == "birth-flowers"
-    assert result.selected_flower_asset and result.selected_flower_asset.endswith("March_Daffodil.svg")
-    assert result.month == 3 and result.flower == 1  # 命中 key 后从标签回填 month/flower
+    assert result.selected_flower_asset and result.selected_flower_asset.endswith("Daffodil.svg")
     assert result.font_key == "malovelyscript"
     assert result.selected_font_asset
 
@@ -98,12 +96,12 @@ def test_parse_catalog_payload_rejects_hallucinated_key(bundle: LibraryBundle):
     assert any("不在素材库目录" in w for w in result.warnings)
 
 
-def test_enrich_matches_by_flower_name_not_month(bundle: LibraryBundle):
-    # 月份+序号不再选素材：只有 month/flower 时不落素材（字体仍按 index 命中）。
-    month_only = enrich_parse_result(ParseResult(text="Mona", month=3, flower=1, font=1), bundle)
-    assert month_only.material_key == ""
-    assert month_only.selected_flower_asset is None
-    assert month_only.font_key  # font=1 → 字体标签 index 1 命中
+def test_enrich_matches_by_flower_name(bundle: LibraryBundle):
+    # 没有花名/material_key 时不落素材（字体仍按 index 命中）。
+    no_flower = enrich_parse_result(ParseResult(text="Mona", font=1), bundle)
+    assert no_flower.material_key == ""
+    assert no_flower.selected_flower_asset is None
+    assert no_flower.font_key  # font=1 → 字体标签 index 1 命中
 
     # 按花名匹配：flower_name 命中具体素材。
     by_name = enrich_parse_result(ParseResult(text="Mona", flower_name="Daffodil", font=1), bundle)
@@ -138,7 +136,7 @@ def test_gpt_catalog_call_injects_catalog_and_enriches(bundle: LibraryBundle):
         }
 
     result = parse_order_remark_with_gpt_catalog(
-        "for Vivian, March daffodil", bundle, api_key="sk-test", http_post=fake_http_post
+        "for Vivian, daffodil", bundle, api_key="sk-test", http_post=fake_http_post
     )
     assert result.material_key == "daffodil"
     assert result.selected_flower_asset
@@ -150,7 +148,7 @@ def test_gpt_catalog_call_injects_catalog_and_enriches(bundle: LibraryBundle):
 
 def test_pipeline_enriches_when_bundle_passed(bundle: LibraryBundle):
     def local(_remark):
-        return ParseResult(text="Mona", month=3, flower=1, flower_name="Daffodil", font=1, confidence=1.0)
+        return ParseResult(text="Mona", flower_name="Daffodil", font=1, confidence=1.0)
 
     result = parse_order_remark_auto(
         "note", gpt_parser=local, bundle=bundle
@@ -161,7 +159,7 @@ def test_pipeline_enriches_when_bundle_passed(bundle: LibraryBundle):
 
 def test_pipeline_without_bundle_is_unchanged():
     def local(_remark):
-        return ParseResult(text="Mona", month=3, flower=1, font=1, confidence=1.0)
+        return ParseResult(text="Mona", flower_name="Daffodil", font=1, confidence=1.0)
 
     result = parse_order_remark_auto(
         "note", gpt_parser=local
@@ -172,7 +170,7 @@ def test_pipeline_without_bundle_is_unchanged():
 def test_library_bundle_from_dirs(tmp_path: Path):
     img = tmp_path / "flowers"
     img.mkdir()
-    (img / "March_Daffodil.svg").write_text(_SVG, encoding="utf-8")
+    (img / "Daffodil.svg").write_text(_SVG, encoding="utf-8")
     fonts = tmp_path / "fonts"
     fonts.mkdir()
     (fonts / "MalovelyScript.ttf").write_bytes(b"fake-font")

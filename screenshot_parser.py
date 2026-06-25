@@ -7,7 +7,7 @@
 刻意不改 gpt_parser.py / ui_app.py：
 - 复用 gpt_parser 的 HTTP 辅助（headers/post/extract/error）；
 - UI 上的「选截图」按钮由 UI 线接（调本函数 → 复用 _apply_parse_result）；
-- 不传 bundle：用旧 schema（text/month/font/flower），即时兼容现有人工确认面板；
+- 不传 bundle：用 text/flower_name/font schema（只按花名配素材）；
 - 传 bundle（order_catalog.LibraryBundle）：用 catalog 动态枚举 schema（material_key/font_key）。
 
 注意：模型必须是**支持视觉**的型号（如 gpt-4o-mini）；纯文本型（gpt-5-nano 等）会拒图。
@@ -45,7 +45,7 @@ _MIME_BY_SUFFIX = {
 
 VISION_SYSTEM_PROMPT = (
     "你是 Birth Flower 订单截图解析器。看图，只提取客户要雕刻的信息，输出 JSON。"
-    "字段：text=姓名或要雕刻文字，month=1-12，font=字体编号，flower=同月份第几个花朵素材 1-2。"
+    "字段：text=姓名或要雕刻文字，flower_name=客户选用的花名，font=字体编号。"
     "缺失或不确定时填 null 并写入中文 warnings。"
 )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib
 import json
 import math
@@ -210,6 +211,73 @@ class _LayerPath:
     fill: bool = False
 
 
+@dataclass(frozen=True)
+class CompiledVector:
+    """单个非 group 图层(path/svg/text)编译后的几何,停在传入 matrix 空间
+    (template-canvas, Y 向下),**不含** root_matrix 的 Y 翻转/单位缩放。
+
+    持有原始 ezdxf.path.Path(权威几何):DXF 适配器经 to_ezdxf_paths() 零重建直取,
+    保证行为与重构前逐点一致。路径语义的规范视图(CanonicalVector)留给 VB-2 在此之上提取。
+    """
+
+    layer_id: str
+    source_type: str          # "text" | "svg" | "path"
+    units: str                # 仅元数据;几何仍在 matrix 空间
+    fill: bool                # text=True,其余 False(沿用 _LayerPath.fill 语义)
+    source_hash: str          # sha256(canonical-json(layer));不参与几何,供快照/缓存
+    applied_matrix: Matrix    # 编译时累计矩阵(parent_matrix ∘ layer_matrix),溯源用
+    ez_paths: tuple[Any, ...] = field(default=(), compare=False)
+
+    def to_ezdxf_paths(self) -> list[Any]:
+        """DXF 终端适配器:返回缓存的原始 ezdxf Path(零重建、零浮点漂移)。"""
+        return list(self.ez_paths)
+
+
+def _layer_source_hash(layer: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        layer, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compile_layer_geometry(
+    layer: dict[str, Any],
+    matrix: Matrix,
+    context: ExportContext,
+) -> CompiledVector:
+    """把单个非 group 图层(path/svg/text)编译为保留贝塞尔的 CompiledVector。
+
+    几何停在传入 matrix 空间(template-canvas, Y 向下),不含 root_matrix 的 Y 翻转/单位缩放。
+    这是 DXF 导出的**唯一**几何编译入口。
+    group 不经本函数(无几何,由 _collect_layer_paths 递归处理)。
+    """
+    layer_type = layer.get("type")
+    if layer_type == "path":
+        ez_paths = _parse_path_objects(
+            str(layer.get("pathData", "")), matrix, str(layer.get("id", "path"))
+        )
+        fill = False
+    elif layer_type == "svg":
+        ez_paths = _svg_layer_paths(layer, matrix, context)
+        fill = False
+    elif layer_type == "text":
+        ez_paths = _text_layer_paths(layer, matrix, context)
+        fill = True
+    else:
+        raise _unsupported_layer(
+            layer, f"DXF export does not support layer type {layer_type!r}."
+        )
+    return CompiledVector(
+        layer_id=str(layer.get("id", layer_type or "layer")),
+        source_type=str(layer_type),
+        units=context.target_units,
+        fill=fill,
+        source_hash=_layer_source_hash(layer),
+        applied_matrix=matrix,
+        ez_paths=tuple(ez_paths),
+    )
+
+
 def _collect_layer_paths(
     layers: list[dict[str, Any]],
     parent_matrix: Matrix,
@@ -227,23 +295,10 @@ def _collect_layer_paths(
             if not isinstance(children, list):
                 raise _unsupported_layer(layer, "Group layer children must be an array.")
             result.extend(_collect_layer_paths(children, matrix, context))
-        elif layer_type == "path":
-            result.extend(
-                _LayerPath(path)
-                for path in _parse_path_objects(
-                    str(layer.get("pathData", "")),
-                    matrix,
-                    str(layer.get("id", "path")),
-                )
-            )
-        elif layer_type == "svg":
-            result.extend(_LayerPath(path) for path in _svg_layer_paths(layer, matrix, context))
-        elif layer_type == "text":
-            # 文字字形输出闭合 SPLINE/POLYLINE 轮廓;DXF 内不填充,实心由 EzCad 导入后原生填充完成。
-            result.extend(
-                _LayerPath(path, fill=True)
-                for path in _text_layer_paths(layer, matrix, context)
-            )
+        elif layer_type in ("path", "svg", "text"):
+            # 经唯一公开几何入口编译(行为保持);DXF 内不填充,实心由 EzCad 导入后原生填充完成。
+            compiled = compile_layer_geometry(layer, matrix, context)
+            result.extend(_LayerPath(p, fill=compiled.fill) for p in compiled.to_ezdxf_paths())
         else:
             raise _unsupported_layer(
                 layer,
