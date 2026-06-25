@@ -63,6 +63,9 @@ def _build_document() -> Document:
 # --- DXF 已知非确定元数据规整（GUID + ezdxf 时间戳，非绘图几何） ---
 _DXF_GUID = re.compile(r"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
 _DXF_EZDXF_STAMP = re.compile(r"@ \d{4}-\d{2}-\d{2}T[\d:.+\-]+")
+# $TDCREATE/$TDUCREATE/$TDUPDATE/$TDUUPDATE 等是儒略日时间戳头变量（随墙钟变化、非绘图几何），
+# 不规整会在跨秒导出时产生罕见 flake。
+_DXF_TIME_VAR = re.compile(r"(\$TD\w*\s*\r?\n\s*40\s*\r?\n\s*)[-\d.eE+]+")
 # --- SVG 已知非确定元数据规整（导出器注入的 exportedAt 时间戳） ---
 _SVG_EXPORTED_AT = re.compile(r'"exportedAt":\s*"[^"]*"')
 
@@ -71,6 +74,7 @@ def _normalize_dxf(raw: bytes) -> bytes:
     text = raw.decode("utf-8", errors="surrogateescape")
     text = _DXF_GUID.sub("{GUID}", text)
     text = _DXF_EZDXF_STAMP.sub("@ TIMESTAMP", text)
+    text = _DXF_TIME_VAR.sub(r"\1TIME", text)
     return text.encode("utf-8", errors="surrogateescape")
 
 
