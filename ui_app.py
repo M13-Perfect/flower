@@ -2915,6 +2915,10 @@ class BirthFlowerApp:
         self.preview_canvas.bind("<Button-3>", self._show_canvas_context_menu)
         self.preview_canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        # 中键 = 视图平移（任意位置都可拖），复用同一 pan 拖动/松开路径（Packet 7）。
+        self.preview_canvas.bind("<Button-2>", self._on_canvas_pan_press)
+        self.preview_canvas.bind("<B2-Motion>", self._on_canvas_drag)
+        self.preview_canvas.bind("<ButtonRelease-2>", self._on_canvas_release)
         self.preview_canvas.bind("<Configure>", lambda _event: self._redraw_preview())
         self.preview_canvas.bind("<Motion>", self._on_canvas_motion)
         self.preview_canvas.bind("<Leave>", self._on_canvas_leave)
@@ -5862,11 +5866,18 @@ class BirthFlowerApp:
         return text  # default:不改变大小写
 
     def _cycle_text_case(self) -> None:
-        """循环切换大小写模式 默认→大写→小写,按钮文字随之变化;改变会触发预览重绘。"""
+        """循环切换大小写模式 默认→大写→小写;改变会触发预览重绘。
+
+        Packet 7：大小写转换逻辑（_content_text_for_render）是活的，但迁移后已无承载它
+        的「内容」编辑卡，`case_button` 控件成了孤儿。这里对缺失按钮做防御（getattr），
+        切换仍正常驱动 text_case_var → trace → 重绘；若未来重建内容卡再把按钮接回来即可。
+        """
         current = self.text_case_var.get()
         index = TEXT_CASE_ORDER.index(current) if current in TEXT_CASE_ORDER else 0
         next_mode = TEXT_CASE_ORDER[(index + 1) % len(TEXT_CASE_ORDER)]
-        self.case_button.configure(text=TEXT_CASE_LABELS[next_mode])
+        case_button = getattr(self, "case_button", None)
+        if case_button is not None:
+            case_button.configure(text=TEXT_CASE_LABELS[next_mode])
         self.text_case_var.set(next_mode)  # 触发 trace → _on_personalization_change 重绘
 
     def _resolve_current_glyph(self) -> GlyphApplyResult:
@@ -7337,6 +7348,10 @@ class BirthFlowerApp:
             height = float(self.layer_h_var.get())
         except (ValueError, tk.TclError):
             return False
+        # §16 数值非法防线：NaN/inf 能通过 float() 但绝不能写进 layer（NaN<=0 为 False，
+        # 会绕过下面的正数检查），这里显式拦截 → 拒绝提交、保留旧值（Packet 7）。
+        if not all(math.isfinite(v) for v in (x, y, width, height)):
+            return False
         if width <= 0 or height <= 0:
             return False
         layer.x, layer.y, layer.width, layer.height = x, y, width, height
@@ -7345,8 +7360,8 @@ class BirthFlowerApp:
             try:
                 font_size = max(1, int(float(self.layer_font_size_var.get())))
                 layer.font_size = font_size
-            except (ValueError, tk.TclError):
-                font_size = None
+            except (ValueError, OverflowError, tk.TclError):
+                font_size = None  # NaN→ValueError / inf→OverflowError：保留旧字号
         # 与 _apply_layer_production 一致：记录图层级生产 override（随层走）。
         layer.production = ProductionParams(x=x, y=y, width=width, height=height, font_size=font_size)
         return True
@@ -9378,6 +9393,25 @@ class BirthFlowerApp:
         canvas.focus_set()
         self._refresh_layers_panel()
         self._redraw_preview()
+
+    def _on_canvas_pan_press(self, event) -> str:
+        """中键按下：直接进入视图平移（pan），不改变选中层、不动任何图层几何（§17/§11）。
+
+        Packet 7：补「中键拖动平移」缺口。左键空白处仍可平移（_on_canvas_press），中键则
+        在任意位置（含图层上方）都平移视图，复用既有 _on_canvas_drag('pan') / _on_canvas_release
+        清理路径——不新增拖动状态机，只切到 pan 模式。返回 "break" 阻止默认中键行为。
+        """
+        if self.inline_text_entry is not None:
+            self._commit_inline_text_edit()
+        self._drag_target = None
+        self._drag_mode = "pan"
+        self._drag_history_pushed = False
+        self._drag_start = (event.x, event.y)
+        canvas = self.preview_canvas
+        if canvas is not None:
+            canvas.focus_set()
+        self._set_preview_cursor("fleur")
+        return "break"
 
     def _set_preview_cursor(self, cursor: str) -> None:
         canvas = self.preview_canvas

@@ -492,12 +492,16 @@ def test_birth_flower_app_initializes_desktop_ui_state():
         assert app.preview_canvas.bind("<Button-3>")
         assert app.preview_canvas.bind("<Button-2>")
         visible_texts = _widget_texts(root)
-        assert "内容" in visible_texts
-        assert "大小写" in visible_texts
+        # Packet 7 更新陈旧期望：迁移期重排面板时，旧「内容/大小写」编辑卡与底部「生产输出」
+        # 栏已删除（见 ui_app._build_output_settings_panel 注释「原底部『生产输出』栏已删」），
+        # 其唯一保留的两项（状态 + 主操作「生成」）并入「输出设置」卡。故这三处可见文本现已
+        # 不在界面上；按当前事实改为「不在 visible_texts」。可见的主操作仍是「生成」「100%」。
+        assert "内容" not in visible_texts
+        assert "大小写" not in visible_texts
         assert "添加" not in visible_texts
         assert "画布宽" not in visible_texts
         assert "画布高" not in visible_texts
-        assert "生产输出" in visible_texts
+        assert "生产输出" not in visible_texts
         assert "生成" in visible_texts
         assert "姓名/文字" not in visible_texts
         assert "重新扫描" not in visible_texts
@@ -540,11 +544,15 @@ def test_preview_mousewheel_zoom_keeps_mouse_anchor():
 
 
 def test_preview_ruler_interval_uses_readable_mm_steps_without_display():
+    # Packet 7 更新陈旧期望：迁移后 _ruler_interval_mm 的目标屏幕间距改为 target_px=40
+    # （原 72），让“看全板/缩小”时刻度更密。选取「使 interval*px_per_mm >= 40 的最小档」，
+    # 档位序列 (1,2,5,10,20,50,...)。故 100px/mm→1mm、10px/mm→5mm、1px/mm→50mm。
+    # 旧断言（1/10/100）来自迁移前的 target_px，与当前实现不符，按现行为更新。
     app = BirthFlowerApp.__new__(BirthFlowerApp)
 
     assert app._ruler_interval_mm(100) == pytest.approx(1)
-    assert app._ruler_interval_mm(10) == pytest.approx(10)
-    assert app._ruler_interval_mm(1) == pytest.approx(100)
+    assert app._ruler_interval_mm(10) == pytest.approx(5)
+    assert app._ruler_interval_mm(1) == pytest.approx(50)
 
 
 def test_preview_physical_size_mm_falls_back_to_scaled_80mm_without_display(monkeypatch):
@@ -608,10 +616,12 @@ def test_preview_mousewheel_zoom_status_reaches_125_percent_without_display(monk
     layout = ui_app_module.EngravingLayout(canvas_width=1000, canvas_height=500)
     monkeypatch.setattr(ui_app_module, "layout_from_values", lambda _vars: layout)
 
+    # Packet 7 更新陈旧期望：当前 PREVIEW_ZOOM_STEP=0.05（线性 5%/tick，迁移前是 0.25），
+    # 故一次上滚 1.00→1.05、状态显示 105%。旧断言 1.25/125% 来自已被改掉的步长，按现行为更新。
     assert app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=120, state=0)) == "break"
 
-    assert app.preview_zoom == pytest.approx(1.25)
-    assert app.preview_zoom_status_var.value == "125%"
+    assert app.preview_zoom == pytest.approx(1.05)
+    assert app.preview_zoom_status_var.value == "105%"
 
 
 def test_preview_mousewheel_zoom_logic_without_display(monkeypatch):
@@ -703,7 +713,10 @@ def test_preview_mousewheel_zoom_out_logic_without_display(monkeypatch):
     assert app.preview_zoom < previous_zoom
 
 
-def test_preview_shift_and_alt_mousewheel_pan_horizontally_without_display(monkeypatch):
+def test_preview_modifier_mousewheel_still_zooms_without_display(monkeypatch):
+    # Packet 7 重写陈旧期望：迁移后滚轮**只负责缩放**（平移交给鼠标拖动 / 中键 pan），
+    # Shift/Alt+滚轮不再做横向平移，PREVIEW_WHEEL_PAN_STEP 常量也已删除。这里把原
+    # 「修饰键滚轮横向平移」用例改为断言现行为：带修饰键的滚轮仍以鼠标为锚点缩放。
     class FakeCanvas:
         def __getitem__(self, key):
             return "720" if key == "width" else "532"
@@ -723,24 +736,22 @@ def test_preview_shift_and_alt_mousewheel_pan_horizontally_without_display(monke
     app.preview_zoom = 1.5
     app.preview_pan_x = 10.0
     app.preview_pan_y = 20.0
+    app.preview_zoom_status_var = None
     redraw_calls = []
     app._redraw_preview = lambda: redraw_calls.append("redraw")
     layout = ui_app_module.EngravingLayout(canvas_width=1000, canvas_height=500)
     monkeypatch.setattr(ui_app_module, "layout_from_values", lambda _vars: layout)
     app.layout_vars = {}
 
+    # Shift+上滚：仍缩放（线性 +5%），不是平移。
     assert app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=120, state=0x0001)) == "break"
+    assert app.preview_zoom == pytest.approx(1.55)
 
-    assert app.preview_zoom == pytest.approx(1.5)
-    assert app.preview_pan_x == pytest.approx(10.0 + ui_app_module.PREVIEW_WHEEL_PAN_STEP)
-    assert app.preview_pan_y == pytest.approx(20.0)
-
+    # Alt+下滚：继续缩放（-5%），回到 1.5。
     assert app._on_canvas_mousewheel(SimpleNamespace(x=320, y=180, delta=-120, state=0x0008)) == "break"
-
     assert app.preview_zoom == pytest.approx(1.5)
-    assert app.preview_pan_x == pytest.approx(10.0)
-    assert app.preview_pan_y == pytest.approx(20.0)
     assert redraw_calls == ["redraw", "redraw"]
+    assert not hasattr(ui_app_module, "PREVIEW_WHEEL_PAN_STEP")
 
 
 def test_preview_middle_press_starts_pan_mode_without_display():
@@ -1333,11 +1344,14 @@ def test_text_case_toggle_controls_render_content_case():
         app.text_case_var.set("lower")
         assert app._content_text_for_render() == "abcd"  # 小写
 
-        # 切换按钮循环 默认→大写→小写,按钮文字同步
+        # Packet 7：大小写转换逻辑（_content_text_for_render）是活的，但迁移后已无承载
+        # `case_button` 的「内容」编辑卡，该控件成了孤儿。_cycle_text_case 仍正确驱动
+        # text_case_var → trace → 重绘（这才是用户可见行为）；故只断言模式循环，不再断言
+        # 已不存在的 case_button 控件。若未来重建内容卡再把按钮接回并补该断言。
         app.text_case_var.set("default")
         app._cycle_text_case()
         assert app.text_case_var.get() == "upper"
-        assert app.case_button.cget("text") == "大写"
+        assert not hasattr(app, "case_button")
     finally:
         root.destroy()
 
