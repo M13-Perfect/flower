@@ -21,7 +21,7 @@ try:
     import customtkinter as ctk
 except ImportError:  # 引导解释器（如 MSYS .venv）可能没装 ctk；容忍导入，交给 _reexec 切到 .venv-win
     ctk = None  # type: ignore[assignment]
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import datetime_picker  # 时间选择器控件（模块级导入；ctk 缺失时类不定义，仅 GUI 期使用）
 from asset_resolver import scan_flower_assets, scan_font_assets
@@ -7203,6 +7203,43 @@ class BirthFlowerApp:
         """属性栏内的 Entry 控件（供 _focus_is_text_input 让出画布快捷键）。"""
         return tuple(getattr(self, "_inspector_entries", ()) or ())
 
+    def _inspector_rows_from_provider(self, layer) -> list:
+        """从 provider 声明的 inspector_sections 推出悬浮栏要渲染的 (label, var) 行（§10/§14）。
+
+        数据驱动：遍历 provider 的 section/field，**只取绑定到现有共享 var 的字段**
+        （field.var_name 命中 App 属性且为合法 var）。这样未来字段只需 provider 多声明一个
+        绑了共享 var 的 field 即出现在栏里，**不必改本组件**（§14 硬要求）。
+
+        provider 缺失/未声明（如 GroupLayer）时回退到通用四几何行，保持改前行为。
+        """
+        # 悬浮栏写回路径（_write_inspector_vars_to_layer）当前只提交这些 key；只渲染它们对应
+        # 的字段，避免出现「能编辑但不写回」的半残字段（与改前栏内字段集完全一致 = 零手感变化）。
+        # 后续 Packet 给 _write_inspector_vars_to_layer 接更多 key 时，把 key 加进本白名单即可，
+        # **仍不必改 provider 声明或 overlay 渲染循环**。
+        committable = {"x", "y", "width", "height", "font_size"}
+        provider = get_provider(layer)
+        rows: list[tuple[str, Any]] = []
+        if provider is not None:
+            try:
+                sections = provider.inspector_sections(layer)
+            except Exception:  # provider 声明异常不应阻断栏打开；回退几何行。
+                sections = None
+            for section in sections or []:
+                for fld in section.fields:
+                    if fld.key not in committable:
+                        continue  # 无共享 var / 写回未接的字段（picker 等）本轮不在栏渲染（边界）。
+                    var = getattr(self, fld.var_name, None) if fld.var_name else None
+                    if var is None:
+                        continue
+                    rows.append((fld.label, var))
+        if not rows:
+            # 兜底：与改前一致的通用几何行（+ 文字层字号）。
+            rows = [("位置 X", self.layer_x_var), ("位置 Y", self.layer_y_var),
+                    ("宽", self.layer_w_var), ("高", self.layer_h_var)]
+            if isinstance(layer, TextLayer):
+                rows.append(("字号", self.layer_font_size_var))
+        return rows
+
     def _open_inspector_overlay(self, layer) -> None:
         """非模态属性栏：普通 CTkFrame，**不 grab_set / 不 wait_window**，绑现有共享 var。
 
@@ -7229,10 +7266,13 @@ class BirthFlowerApp:
         self._inspector_entries = []
         self._inspector_traces = []
 
-        rows = [("位置 X", self.layer_x_var), ("位置 Y", self.layer_y_var),
-                ("宽", self.layer_w_var), ("高", self.layer_h_var)]
-        if isinstance(layer, TextLayer):
-            rows.append(("字号", self.layer_font_size_var))
+        # Packet 6 §10/§14：栏字段由 ContentProvider 声明，不再硬编码。悬浮栏只渲染
+        # provider 的 section 列表 → 未来字段 = provider 多声明一个 section，**无需改本组件**。
+        # 边界：本轮悬浮栏只渲染「绑定到现有共享 var」的字段（number/toggle/color），即位置
+        # X/Y、宽、高、字号——与改前完全一致。select/segmented picker（行距/对齐/字体/素材）
+        # **暂特例化在右键 picker / 内联编辑里**，不在悬浮栏渲染（无共享 var），声明已就位，
+        # 待后续 Packet 补共享 var 后即可在栏内出现，仍无需改本组件。
+        rows: list[tuple[str, Any]] = self._inspector_rows_from_provider(layer)
 
         for i, (lbl, var) in enumerate(rows):
             if ctk is not None:

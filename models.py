@@ -279,6 +279,14 @@ class TextLayer(Layer):
     underline: bool | None = None
     italic: bool | None = None
     bold_strength: float | None = None
+    # Layer System v2 · Packet 6 · §14：文字布局模式（**声明，不填**）。
+    # 'box'=当前唯一行为（固定文本框，text_box_width/height）；'point'/'auto_width'/
+    # 'auto_height'/'fixed_frame' 为未来模式，本轮**不分支任何渲染/测量/导出**——默认 'box'
+    # 与现行为逐字节一致（_text_layer 仍硬编码 "mode":"box"，不读此字段，Packet 0 门禁不动）。
+    layout_mode: str = "box"
+    # §14：富文本片段预留（None=纯文本，向后兼容）。**仅声明，不使用**——未来富文本时携带
+    # 每段字体/颜色/特性，导出/测量遍历 runs；本轮任何路径都不读它。
+    runs: list | None = None
     # Font 4 等字体：末行末尾追加独立实心爱心符号（见 heart_symbol / glyph_service.font_uses_symbol_heart）。
     # 由 ui_app/批量在套用自动字形规则时按字体置位；预览与导出据此追加爱心，保持字体无感知。
     ending_heart: bool = False
