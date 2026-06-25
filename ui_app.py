@@ -115,6 +115,7 @@ from models import (
     resolve_auto_layout,
     ungroup_layer,
 )
+from providers import get_provider
 from order_importer import load_order_from_file, load_order_remark_from_file, order_from_payload
 from parse_pipeline import parse_orders_auto
 import inbox_service_client as inbox_client
@@ -8357,16 +8358,29 @@ class BirthFlowerApp:
         # ending_heart_detached（文字端不再自贴爱心，避免双爱心）。mm↔px 用模板物理宽度。
         resolve_anchored_hearts(self.document, physical_width_mm=self._template_physical_size_mm(layout)[0])
         # 画布刷新只读取 Document：先清空，再按图层顺序逐层渲染可见图层。
+        # ctx 携带 App 自身 + 画布坐标变换（scale/offset + 闭包 sx/sy），provider 据此委托
+        # App 现有 _draw_*_preview 绑定方法（Packet 3：分发查表，绘制算法不变）。
+        ctx = {
+            "app": self,
+            "canvas": canvas,
+            "scale": scale,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "sx": sx,
+            "sy": sy,
+        }
         for layer in self.document.flat_render_layers():
             if not layer.visible:
                 continue
-            # AnchoredHeartLayer 是 ImageLayer 子类，必须先判，否则会走读盘的圆弧版折线分支。
+            # AnchoredHeartLayer 是 ImageLayer 子类，保留专用路径（Packet 3：不强行 provider 化），
+            # 必须先判，否则会被 ImageProvider 当普通素材走读盘的圆弧版折线分支。
             if isinstance(layer, AnchoredHeartLayer):
                 self._draw_anchored_heart_preview(canvas, layer, scale, offset_x, offset_y)
-            elif isinstance(layer, ImageLayer):
-                self._draw_image_layer_preview(canvas, layer, sx, sy)
-            elif isinstance(layer, TextLayer):
-                self._draw_text_layer_preview(canvas, layer, scale, offset_x, offset_y)
+                continue
+            # Packet 3：text/image 经 provider 注册表分发（ADR-001）；委托回 _draw_*_preview。
+            provider = get_provider(layer)
+            if provider is not None:
+                provider.render_preview(layer, ctx)
         if DEBUG_VISUAL_BBOX:
             glyph_result = self._resolve_current_glyph()
             name = glyph_result.render_text.strip() or "Name"

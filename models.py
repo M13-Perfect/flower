@@ -172,6 +172,10 @@ class Layer:
     visible: bool = True
     locked: bool = False
     z_index: int = 0
+    # Content Provider 注册表（Packet 3 / ADR-001）查表用：内容层可填 'text'/'image'/...，
+    # 留空时 providers.get_provider 回退 layer.type（旧内存态兼容）。**不进导出 dict**——
+    # _layer_base 只序列化几何字段，加这个字段不改任何导出字节（Packet 0 门禁）。
+    provider_id: str = ""
 
     @property
     def bounds(self) -> tuple[float, float, float, float]:

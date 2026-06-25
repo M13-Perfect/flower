@@ -26,6 +26,7 @@ from heart_symbol import (
     heart_svg_markup,
 )
 from models import AnchoredHeartLayer, Document, ImageLayer, Layer, TextLayer, layer_text_style, resolve_auto_layout
+from providers import get_provider
 from text_layout import place_ending_heart
 
 LOGGER = logging.getLogger(__name__)
@@ -117,17 +118,20 @@ def _document_to_layer_document(
     for layer in document.flat_render_layers():
         if not getattr(layer, "visible", True):
             continue
-        # AnchoredHeartLayer 是 ImageLayer 子类，必须先于 ImageLayer 判断，否则会走读盘的圆弧版分支。
+        # AnchoredHeartLayer 是 ImageLayer 子类，保留专用路径（Packet 3：不强行 provider 化，
+        # 低风险），必须先于 provider 查表判断，否则会被 ImageProvider 当普通素材走读盘分支。
         if isinstance(layer, AnchoredHeartLayer):
             layers.append(_anchored_heart_layer(layer))
-        elif isinstance(layer, ImageLayer):
-            # Packet 2：_image_layer 对未绑素材的空白内容层返回 None（跳过 + warning），不崩。
-            schema = _image_layer(layer)
-            if schema is not None:
-                layers.append(schema)
-        elif isinstance(layer, TextLayer):
-            layers.append(_text_layer(layer))
-        # 其它图层(GlyphLayer 等)暂不支持矢量导出,静默跳过,保持向后兼容。
+            continue
+        # Packet 3：text/image 经 provider 注册表分发（ADR-001）；provider.render_export
+        # 委托回 _text_layer/_image_layer，算法不变 → 字节稳定。None=跳过（Packet 2 未绑跳过）。
+        provider = get_provider(layer)
+        if provider is None:
+            # 其它图层(GlyphLayer 等)暂不支持矢量导出,静默跳过,保持向后兼容。
+            continue
+        schema = provider.render_export(layer, {})
+        if schema is not None:
+            layers.append(schema)
     if not layers:
         raise ValueError("当前文档没有可导出为矢量的图层。")
 
