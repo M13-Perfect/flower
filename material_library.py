@@ -35,6 +35,41 @@ logger = logging.getLogger(__name__)
 MANIFEST_NAME = "library.json"
 # 与 ui_app.IMPORTABLE_ASSET_SUFFIXES 对齐：位图素材（含 .bmp）也算素材，文件夹零配置扫描时一并收。
 IMAGE_EXTENSIONS = {".svg", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+FONT_EXTENSIONS = {".ttf", ".otf"}
+
+# from_folder 缓存：MaterialLibrary 是 frozen（含 entries），可安全共享缓存实例。
+# 签名 = 目录下相关文件 + library.json 的 (名字, mtime_ns, 大小)；任意增/删/改即失效，
+# 导入新库目录（新文件）天然重建。文件型字体源单独按文件签名缓存。
+_FROM_FOLDER_CACHE_LIMIT = 32
+_FROM_FOLDER_CACHE: dict[tuple, tuple[tuple, "MaterialLibrary"]] = {}
+
+
+def _folder_signature(root: Path, suffixes: set[str]) -> tuple:
+    items: list[tuple[str, int, int]] = []
+    try:
+        for entry in root.iterdir():
+            if not entry.is_file():
+                continue
+            suffix = entry.suffix.casefold()
+            if suffix not in suffixes and entry.name != MANIFEST_NAME:
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            items.append((entry.name.casefold(), st.st_mtime_ns, st.st_size))
+    except OSError:
+        return ()
+    items.sort()
+    return tuple(items)
+
+
+def _path_signature(path: Path) -> tuple:
+    try:
+        st = path.stat()
+    except OSError:
+        return ()
+    return (path.name.casefold(), st.st_mtime_ns, st.st_size)
 
 
 @dataclass(frozen=True)
@@ -126,8 +161,36 @@ class MaterialLibrary:
         name: str | None = None,
         kind: str = "image",
     ) -> "MaterialLibrary":
-        """从文件夹构造库：有 library.json 用清单，否则零配置扫描。"""
+        """从文件夹构造库：有 library.json 用清单，否则零配置扫描。
+
+        带目录签名缓存：目录内容（含 library.json）没变就复用上次构建的不可变库实例，
+        避免切产品时全盘重扫；任意文件增/删/改使签名变化、自动重建。
+        """
         root_path = Path(root)
+        suffixes = FONT_EXTENSIONS if kind == "font" else IMAGE_EXTENSIONS
+        if root_path.is_file():
+            signature = _path_signature(root_path)
+        else:
+            signature = _folder_signature(root_path, suffixes)
+        cache_key = (str(root_path), library_id, name, kind)
+        cached = _FROM_FOLDER_CACHE.get(cache_key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        built = cls._build_from_folder(root_path, library_id=library_id, name=name, kind=kind)
+        if len(_FROM_FOLDER_CACHE) >= _FROM_FOLDER_CACHE_LIMIT and cache_key not in _FROM_FOLDER_CACHE:
+            _FROM_FOLDER_CACHE.pop(next(iter(_FROM_FOLDER_CACHE)))
+        _FROM_FOLDER_CACHE[cache_key] = (signature, built)
+        return built
+
+    @classmethod
+    def _build_from_folder(
+        cls,
+        root_path: Path,
+        *,
+        library_id: str | None,
+        name: str | None,
+        kind: str,
+    ) -> "MaterialLibrary":
         fallback_id = library_id or _slug(root_path.name) or "library"
         fallback_name = name or root_path.name or fallback_id
 

@@ -24,6 +24,8 @@ except ImportError:  # 引导解释器（如 MSYS .venv）可能没装 ctk；容
 from typing import Any, TypeVar
 
 import datetime_picker  # 时间选择器控件（模块级导入；ctk 缺失时类不定义，仅 GUI 期使用）
+import prompts_db
+from prompts_db import PromptSet
 from asset_resolver import scan_flower_assets, scan_font_assets
 from canvas_text_item import CanvasTextItem, FloatingTextEditor
 import config_store
@@ -54,7 +56,6 @@ from prompt_references import (
     ReferenceField,
     SYSTEM_SOURCE_LABELS,
     active_reference_fields,
-    create_reference_field,
     default_prompt_template,
     field_token,
     find_template_references,
@@ -1326,7 +1327,7 @@ class BirthFlowerApp:
 
         self._build_menu()
         self._build_layout()
-        self._scan_assets(show_errors=False)
+        self._scan_assets(show_errors=False, redraw=False)  # 末尾 1333 统一重绘一次
         self._bind_preview_updates()
         self._is_loading = False
         self._redraw_preview()
@@ -1783,7 +1784,7 @@ class BirthFlowerApp:
             self.flower_dir_var.set(str(product.image_library_dirs[0]))
         if product.font_library_dirs:
             self.font_source_var.set(str(product.font_library_dirs[0]))
-        self._scan_assets(show_errors=False)
+        self._scan_assets(show_errors=False, redraw=False)  # 末尾统一重绘，不在扫描里重绘
         self._apply_layout_defaults(product.defaults)
         self._clear_document_history()
         self._load_prompts_into_widgets()  # 载入新产品的提示词
@@ -1872,10 +1873,11 @@ class BirthFlowerApp:
             image_library_dirs=image_dirs,
             font_library_dirs=font_dirs,
             defaults=self._active_layout_defaults(),
+            prompt_set_id=active_product(self.config).prompt_set_id,  # 新产品直接共用全局提示词套
         )
         # 先追加（不激活）再走切换逻辑，复用切换里的重扫/重绘/持久化。
+        # 不在此处 save_config：紧接的 _switch_product 会改 active 并落盘一次，单独存盘是多余 IO。
         self.config = with_added_product(self.config, product, activate=False)
-        save_config(self.config)
         window.destroy()
         self._switch_product(product_id)
 
@@ -1916,12 +1918,20 @@ class BirthFlowerApp:
                                    f"确定删除产品「{product.name}」？\n此操作不可恢复。"):
             return
         remaining = tuple(p for p in self.config.products if p.id != product_id)
-        new_active = self.config.active_product_id
-        if new_active == product_id:
+        if self.config.active_product_id == product_id:
+            # 删的是当前激活产品：先切到另一个产品（_switch_product 内含落盘+重扫+重绘），
+            # 此时被删产品仍在 products 里，故 _switch_product 不会因 active_product 兜底而误判 no-op；
+            # 切完后再把它移除并落盘。
             new_active = remaining[0].id
-        self.config = dataclasses.replace(self.config, products=remaining, active_product_id=new_active)
-        save_config(self.config)
-        self._switch_product(new_active)
+            self._switch_product(new_active)
+            self.config = dataclasses.replace(self.config, products=remaining)
+            save_config(self.config)
+            self._render_product_rail()
+        else:
+            # 删非激活产品：激活产品的素材/字体库没变，无需全量重扫+重绘，只更新配置与产品轨。
+            self.config = dataclasses.replace(self.config, products=remaining)
+            save_config(self.config)
+            self._render_product_rail()
         self.status_var.set(f"已删除产品「{product.name}」。")
 
     def _build_function_panel(self, parent):
@@ -3573,6 +3583,7 @@ class BirthFlowerApp:
         for child in body.winfo_children():
             child.destroy()
         body.columnconfigure(0, weight=1)
+        self._render_prompt_set_selector(body)
         for i, field in enumerate(self.field_defs):
             self._ensure_field_vars(field)
             card = ctk.CTkFrame(
@@ -3649,28 +3660,81 @@ class BirthFlowerApp:
             row=len(self.field_defs) + 1, column=0, sticky="w", pady=(8, 0)
         )
 
+    def _render_prompt_set_selector(self, body) -> None:
+        """字段卡顶部「提示词套」下拉：列出共享库所有套，选中即把当前产品改指该套并重载面板。
+
+        纯共享：选中已有套 = 让本产品引用它（多个产品可共用一套）。set 缺失/空库时不显示。
+        """
+        sets = prompts_db.list_prompt_sets()
+        if not sets:
+            return
+        current_id = active_product(self.config).prompt_set_id
+        id_by_name: dict[str, str] = {}
+        names: list[str] = []
+        current_name = ""
+        for set_id, name in sets:
+            label = name or set_id
+            # 同名套用 id 尾段去歧义，保证 name→id 映射唯一。
+            if label in id_by_name:
+                label = f"{label} ({set_id[:8]})"
+            id_by_name[label] = set_id
+            names.append(label)
+            if set_id == current_id:
+                current_name = label
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.grid(row=0, column=0, sticky="ew", pady=(0, 7))
+        row.columnconfigure(1, weight=1)
+        ctk.CTkLabel(row, text="提示词套", anchor="w", text_color=APP_COLORS["muted"]).grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        self._prompt_set_var = tk.StringVar(value=current_name or (names[0] if names else ""))
+        ctk.CTkOptionMenu(
+            row, variable=self._prompt_set_var, values=names,
+            fg_color=APP_COLORS["input"], button_color=APP_COLORS["input"],
+            button_hover_color=APP_COLORS["accent_soft"], text_color=APP_COLORS["text"],
+            command=lambda label, mapping=id_by_name: self._on_select_prompt_set(mapping.get(label, "")),
+        ).grid(row=0, column=1, sticky="ew")
+
+    def _on_select_prompt_set(self, set_id: str) -> None:
+        """切到选中的提示词套：改当前产品的 prompt_set_id、落盘、重载字段/背景面板。"""
+        if not set_id or set_id == active_product(self.config).prompt_set_id:
+            return
+        target_id = active_product(self.config).id
+        products = tuple(
+            dataclasses.replace(p, prompt_set_id=set_id) if p.id == target_id else p
+            for p in self.config.products
+        )
+        self.config = dataclasses.replace(self.config, products=products)
+        save_config(self.config)
+        self._load_prompts_into_widgets()
+        self.status_var.set("已切换提示词套")
+
     def _add_field(self) -> None:
-        # 编号基于「现有字段数量」+1（chip 实时按位置显示 infoN），不再按点击次数累加。
-        product = active_product(self.config)
+        # 序号原子分配走共享库（prompts_db.allocate_field_in_set，单事务+进程内锁，并发不撞号）。
+        set_id = active_product(self.config).prompt_set_id
+        if not set_id:
+            messagebox.showerror("添加字段", "当前产品未关联提示词套。")
+            return
+        seq_next = self._active_prompt_set().field_seq_max + 1
         try:
-            fields, seq_max, created = create_reference_field(
-                product.reference_fields,
-                field_seq_max=product.field_seq_max,
-                scope_id=product.id,
-                reference_name=f"字段{product.field_seq_max + 1}",
+            created, _seq_max = prompts_db.allocate_field_in_set(
+                set_id,
+                f"字段{seq_next}",
                 prompt="",
+                field_type="文本",
             )
-        except ValueError as exc:
+        except KeyError as exc:
             messagebox.showerror("添加字段", str(exc))
             return
-        self.config = with_product_reference_fields(
-            self.config,
-            reference_fields=fields,
-            field_seq_max=seq_max,
-            prompt_template=self._append_field_to_template_if_empty(created),
-            extraction_prompt=self._serialize_field_defs(),
-            background_prompt=self._current_prompt_template_text(),
-        )
+        # 模板为空时把新字段补进模板（与旧 _append_field_to_template_if_empty 等价）。
+        new_template = self._append_field_to_template_if_empty(created)
+        if new_template != self._stored_prompt_template():
+            with_product_reference_fields(
+                self.config,
+                reference_fields=self._active_reference_fields(),
+                prompt_template=new_template,
+                background_prompt=new_template,
+            )
         self._load_field_defs_into_self()
         self._on_field_changed()
 
@@ -3685,13 +3749,13 @@ class BirthFlowerApp:
     def _save_reference_field_name(self, key: str, var: tk.StringVar, original: str, *, silent: bool = True) -> None:
         if var.get().strip() == original.strip():
             return
-        product = active_product(self.config)
+        prompt_set = self._active_prompt_set()
         try:
             updated_fields = rename_reference_field(
-                product.reference_fields,
+                prompt_set.reference_fields,
                 key,
                 var.get(),
-                scope_id=product.id,
+                scope_id=prompt_set.id,
             )
         except DuplicateReferenceNameError as exc:
             var.set(original)
@@ -3709,36 +3773,34 @@ class BirthFlowerApp:
             self.status_var.set("字段名称保存失败")
             messagebox.showerror("字段名称", str(exc))
             return
-        self.config = with_product_reference_fields(
+        template = self._current_prompt_template_text()
+        with_product_reference_fields(
             self.config,
             reference_fields=updated_fields,
-            field_seq_max=product.field_seq_max,
-            prompt_template=self._current_prompt_template_text(),
-            extraction_prompt=self._serialize_field_defs(),
-            background_prompt=self._current_prompt_template_text(),
+            prompt_template=template,
+            background_prompt=template,
         )
         self.status_var.set("字段名称已保存")
         self._load_field_defs_into_self()
         self._render_fields()
-        save_config(self.config)
 
     def _on_reference_field_more_action(self, key: str, action: str) -> None:
         if action == "更多":
             return
-        product = active_product(self.config)
+        prompt_set = self._active_prompt_set()
         try:
             if action == "删除":
                 updated_fields = soft_delete_reference_field(
-                    product.reference_fields,
+                    prompt_set.reference_fields,
                     key,
                     templates=(self._current_prompt_template_text(),),
                 )
             elif action in {"停用", "启用"}:
                 updated_fields = set_reference_field_enabled(
-                    product.reference_fields,
+                    prompt_set.reference_fields,
                     key,
                     action == "启用",
-                    scope_id=product.id,
+                    scope_id=prompt_set.id,
                 )
             else:
                 return
@@ -3748,18 +3810,16 @@ class BirthFlowerApp:
         except ValueError as exc:
             messagebox.showerror("字段", str(exc))
             return
-        self.config = with_product_reference_fields(
+        template = self._current_prompt_template_text()
+        with_product_reference_fields(
             self.config,
             reference_fields=updated_fields,
-            field_seq_max=product.field_seq_max,
-            prompt_template=self._current_prompt_template_text(),
-            extraction_prompt=self._serialize_field_defs(),
-            background_prompt=self._current_prompt_template_text(),
+            prompt_template=template,
+            background_prompt=template,
         )
         self.status_var.set("字段已更新")
         self._load_field_defs_into_self()
         self._render_fields()
-        save_config(self.config)
 
     def _build_library_panel(self, parent) -> ctk.CTkFrame:
         # 「字体库 / 素材库」=资源库：归操作员配置端（见 _VIEW_CARD_ORDER 的 library）。
@@ -3945,9 +4005,30 @@ class BirthFlowerApp:
         self.background_prompt_text.bind("<Escape>", self._hide_slash_popup)
         return panel
 
+    def _active_prompt_set(self) -> PromptSet:
+        """载出当前产品所引用的共享提示词套（含全部 field）。
+
+        提示词整套已搬进共享库 prompts.db；产品只持有 prompt_set_id（FK）。set 缺失/未迁移时
+        回退一个空 PromptSet，UI 走默认字段链路（与全新产品一致）。
+        """
+        set_id = active_product(self.config).prompt_set_id
+        if set_id:
+            loaded = prompts_db.load_prompt_set(set_id)
+            if loaded is not None:
+                return loaded
+        return PromptSet(
+            id=set_id, name="", prompt_template="", background_prompt="",
+            template_version=1, field_seq_max=0, reference_fields=(),
+        )
+
+    def _active_reference_fields(self) -> tuple[ReferenceField, ...]:
+        return self._active_prompt_set().reference_fields
+
     def _stored_prompt_template(self) -> str:
-        product = active_product(self.config)
-        return product.prompt_template or default_prompt_template(product.reference_fields, product.background_prompt)
+        prompt_set = self._active_prompt_set()
+        return prompt_set.prompt_template or default_prompt_template(
+            prompt_set.reference_fields, prompt_set.background_prompt
+        )
 
     def _tag_prompt_reference(self, kind: str, ref_id: str, start: str, end: str) -> None:
         box = self.background_prompt_text
@@ -3964,8 +4045,8 @@ class BirthFlowerApp:
         if box is None:
             return
         box.delete("1.0", "end")
-        product = active_product(self.config)
-        for segment in iter_template_segments(template, fields=product.reference_fields, scope_id=product.id):
+        prompt_set = self._active_prompt_set()
+        for segment in iter_template_segments(template, fields=prompt_set.reference_fields, scope_id=prompt_set.id):
             if segment[0] == "text":
                 box.insert("insert", segment[1])
                 continue
@@ -4009,7 +4090,6 @@ class BirthFlowerApp:
         return field_token(field.id)
 
     def _prompt_reference_candidates(self, query: str = "") -> list[dict[str, str]]:
-        product = active_product(self.config)
         query_norm = query.strip().casefold()
         source_label = "/" + SYSTEM_SOURCE_LABELS["order_information"]
         candidates = [
@@ -4020,7 +4100,7 @@ class BirthFlowerApp:
                 "ref_id": "order_information",
             }
         ]
-        for field in active_reference_fields(product.reference_fields):
+        for field in active_reference_fields(self._active_reference_fields()):
             candidates.append(
                 {
                     "label": f"/#{field.sequence_number} {field.reference_name}",
@@ -4182,26 +4262,10 @@ class BirthFlowerApp:
             "legacy_key": field.legacy_key,
         }
 
-    @staticmethod
-    def _legacy_json_from_reference_fields(fields: tuple[ReferenceField, ...]) -> str:
-        items = [
-            {
-                "key": field.legacy_key or f"field{field.sequence_number}",
-                "id": field.id,
-                "name": field.reference_name,
-                "type": field.field_type,
-                "instruction": field.prompt,
-                "sequence_number": field.sequence_number,
-                "enabled": field.enabled,
-                "deleted_at": field.deleted_at,
-            }
-            for field in fields
-        ]
-        return json.dumps(items, ensure_ascii=False)
-
     def _reference_fields_from_field_defs(self) -> tuple[ReferenceField, ...]:
-        product = active_product(self.config)
-        working_fields = list(product.reference_fields)
+        prompt_set = self._active_prompt_set()
+        set_id = prompt_set.id
+        working_fields = list(prompt_set.reference_fields)
         fields: list[ReferenceField] = []
         for item in self.field_defs:
             field_id = str(item.get("id") or item.get("key") or "")
@@ -4211,76 +4275,60 @@ class BirthFlowerApp:
             name = item["name_var"].get() if "name_var" in item else str(item.get("name", ""))
             if name.strip() and name.strip() != existing.reference_name:
                 try:
-                    working_fields = list(rename_reference_field(tuple(working_fields), existing.id, name, scope_id=product.id))
+                    working_fields = list(rename_reference_field(tuple(working_fields), existing.id, name, scope_id=set_id))
                     existing = next(field for field in working_fields if field.id == field_id)
                 except ValueError:
                     pass
             prompt = item["inst_var"].get() if "inst_var" in item else str(item.get("instruction", ""))
             field_type = item["type_var"].get() if "type_var" in item else str(item.get("type", "文本"))
-            fields.append(update_reference_field_prompt((existing,), existing.id, prompt, scope_id=product.id)[0])
+            fields.append(update_reference_field_prompt((existing,), existing.id, prompt, scope_id=set_id)[0])
             fields[-1] = dataclasses.replace(fields[-1], field_type=field_type)
         # 软删字段不再回灌：删了就别回来。旧逻辑把 deleted_at 字段也 extend 回去，
         # 导致已删字段的提示词每次保存又写回配置、反复复活（用户根治诉求）。
         known = {field.id for field in fields}
         fields.extend(
-            field for field in product.reference_fields
+            field for field in prompt_set.reference_fields
             if field.id not in known and not field.deleted_at
         )
         return tuple(sorted(fields, key=lambda field: (field.sort_order, field.sequence_number)))
 
-    def _serialize_field_defs(self) -> str:
-        """把字段定义序列化成 JSON 存进 product.extraction_prompt（admin 编辑后持久化）。"""
-        items = []
-        for field in self.field_defs:
-            items.append({
-                "key": field.get("key", ""),
-                "name": field["name_var"].get() if "name_var" in field else field.get("name", ""),
-                "type": field["type_var"].get() if "type_var" in field else field.get("type", "文本"),
-                "instruction": field["inst_var"].get() if "inst_var" in field else field.get("instruction", ""),
-            })
-        return json.dumps(items, ensure_ascii=False)
-
     def _load_field_defs_into_self(self) -> None:
-        """从当前产品配置（extraction_prompt 存的 JSON）载入字段；无/非法 JSON → 用默认完整规则。"""
-        product = active_product(self.config)
-        reference_fields = product.reference_fields
+        """从当前产品所引用共享套（prompts.db）载入字段；套为空 → 用默认完整规则建一套字段写回。"""
+        prompt_set = self._active_prompt_set()
+        reference_fields = prompt_set.reference_fields
         if not reference_fields:
-            raw = product.extraction_prompt or json.dumps(_default_field_defs(), ensure_ascii=False)
-            reference_fields = reference_fields_from_legacy(raw, scope_id=product.id)
-            prompt_template = product.prompt_template or default_prompt_template(reference_fields, product.background_prompt)
-            self.config = with_product_reference_fields(
+            raw = json.dumps(_default_field_defs(), ensure_ascii=False)
+            reference_fields = reference_fields_from_legacy(raw, scope_id=prompt_set.id)
+            prompt_template = prompt_set.prompt_template or default_prompt_template(
+                reference_fields, prompt_set.background_prompt
+            )
+            with_product_reference_fields(
                 self.config,
                 reference_fields=reference_fields,
-                field_seq_max=max((field.sequence_number for field in reference_fields), default=0),
                 prompt_template=prompt_template,
-                extraction_prompt=product.extraction_prompt or self._legacy_json_from_reference_fields(reference_fields),
-                background_prompt=product.background_prompt,
+                background_prompt=prompt_set.background_prompt,
             )
-            product = active_product(self.config)
-        self.field_defs = [self._field_dict_from_reference(field) for field in product.reference_fields if not field.deleted_at]
-        self.field_seq = product.field_seq_max
+            prompt_set = self._active_prompt_set()
+        self.field_defs = [
+            self._field_dict_from_reference(field)
+            for field in prompt_set.reference_fields
+            if not field.deleted_at
+        ]
+        self.field_seq = prompt_set.field_seq_max
 
     def _persist_prompts(self) -> None:
-        """把「字段（提取规则）+ 背景提示词」存回当前产品配置并落盘（失焦/增删/切产品时触发）。"""
+        """把「字段（提取规则）+ 背景提示词」存回当前产品所引用共享套（写 prompts.db；失焦/增删/切产品时触发）。"""
         reference_fields = self._reference_fields_from_field_defs()
-        extraction = self._legacy_json_from_reference_fields(reference_fields)
         prompt_template = self._current_prompt_template_text()
-        product = active_product(self.config)
-        if (
-            extraction == product.extraction_prompt
-            and prompt_template == product.prompt_template
-            and reference_fields == product.reference_fields
-        ):
+        prompt_set = self._active_prompt_set()
+        if prompt_template == prompt_set.prompt_template and reference_fields == prompt_set.reference_fields:
             return  # 无变化不写盘
-        self.config = with_product_reference_fields(
+        with_product_reference_fields(
             self.config,
             reference_fields=reference_fields,
-            field_seq_max=product.field_seq_max,
             prompt_template=prompt_template,
-            extraction_prompt=extraction,
             background_prompt=prompt_template,
         )
-        save_config(self.config)
 
     def _load_prompts_into_widgets(self) -> None:
         """切产品后：把新产品的字段定义 + 背景提示词载入控件。"""
@@ -4299,13 +4347,13 @@ class BirthFlowerApp:
     def _show_generated_prompt(self) -> None:
         """预览真正会发给 API 的内容：字段规则 + 订单文本原样拼接（订单文本不再加 <order_data> 包裹）。"""
         remark = self._current_remark_text().strip()
-        product = active_product(self.config)
+        prompt_set = self._active_prompt_set()
         template = self._current_prompt_template_text()
         try:
             resolved = resolve_prompt_template(
                 template,
-                scope_id=product.id,
-                fields=product.reference_fields,
+                scope_id=prompt_set.id,
+                fields=prompt_set.reference_fields,
                 order_information=remark,
             )
             text = resolved.final_prompt or "（空）"
@@ -5022,13 +5070,13 @@ class BirthFlowerApp:
 
     def _current_ai_config(self, order_information: str | None = None) -> AIParseConfig:
         config = build_ai_parse_config(active_ai_profile(self.config), self.session_api_key_var.get())
-        product = active_product(self.config)
+        prompt_set = self._active_prompt_set()
         template = self._current_prompt_template_text()
         remark = self._current_remark_text() if order_information is None else order_information
         resolved = resolve_prompt_template(
             template,
-            scope_id=product.id,
-            fields=product.reference_fields,
+            scope_id=prompt_set.id,
+            fields=prompt_set.reference_fields,
             order_information=remark,
         )
         refs = find_template_references(template)
@@ -7830,22 +7878,31 @@ class BirthFlowerApp:
         layer.y += dy
         self._redraw_preview()
 
-    def _scan_assets(self, show_errors: bool) -> None:
-        self.flower_assets = scan_flower_assets(Path(self.flower_dir_var.get()))
-        self.font_assets = scan_font_assets(Path(self.font_source_var.get()))
+    def _scan_assets(self, show_errors: bool, *, redraw: bool = True) -> None:
         # 增量5：主库目录仍以单目录入口（flower_dir_var/font_source_var）为准——保证单目录选择器
         # 即时生效；产品配置里「首个之外」的目录作为附加库一起进 bundle（多库）。
+        # 主库（index0）只扫一遍：flower_assets/font_assets 与 bundle 首库共用同一目录，
+        # 各自产出不同视图（FlowerAsset/FontAsset vs MaterialLibrary），磁盘扫描由 asset_resolver /
+        # MaterialLibrary 的目录签名缓存去重，无需在此重复 IO。
         product = active_product(self.config)
         image_dirs = [Path(self.flower_dir_var.get()), *product.image_library_dirs[1:]]
         font_dirs = [Path(self.font_source_var.get()), *product.font_library_dirs[1:]]
+        self.flower_assets = scan_flower_assets(image_dirs[0])
+        self.font_assets = scan_font_assets(font_dirs[0])
         self.active_bundle = LibraryBundle.from_dirs(image_dirs, font_dirs)
-        # 增量3：把「附加库」（首库之外）的素材/字体并入候选，使素材库选择器能切到它们（单库时空操作）。
-        self._merge_additional_library_assets()
-        self.preview_cache.clear()
-        self._refresh_library_choices()
-        self._render_library_rows()
-        self._refresh_flower_choices()
-        self._refresh_font_choices()
+        # 重绘合并：下面多个刷新各自会触发 _redraw_preview，扫描期间统一抑制，末尾只重绘一次。
+        prev_suppress = getattr(self, "_suppress_redraw", False)
+        self._suppress_redraw = True
+        try:
+            # 增量3：把「附加库」（首库之外）的素材/字体并入候选，使素材库选择器能切到它们（单库时空操作）。
+            self._merge_additional_library_assets()
+            self.preview_cache.clear()
+            self._refresh_library_choices()
+            self._render_library_rows()
+            self._refresh_flower_choices()
+            self._refresh_font_choices()
+        finally:
+            self._suppress_redraw = prev_suppress
 
         warnings: list[str] = []
         if not self.flower_assets:
@@ -7858,7 +7915,8 @@ class BirthFlowerApp:
                 messagebox.showwarning("素材扫描", "\n".join(warnings))
         else:
             self._set_warnings([])
-        self._redraw_preview()
+        if redraw:
+            self._redraw_preview()
 
     def _refresh_flower_choices(self) -> None:
         # 刷新素材列表属于程序化 UI 更新，只能同步下拉框与 pending 素材，不能创建新图层。
@@ -8393,6 +8451,10 @@ class BirthFlowerApp:
         self.layout_vars["text_size"].set(str(layout.text_size))
 
     def _redraw_preview(self) -> None:
+        # 重绘合并：_scan_assets 内部多个刷新（花/字体候选）各自会调本方法，切产品时叠加成
+        # 多次全量重绘。批量操作期间置 _suppress_redraw，结束后只重绘一次（见 _scan_assets）。
+        if getattr(self, "_suppress_redraw", False):
+            return
         canvas = self.preview_canvas
         if canvas is None:
             return

@@ -1641,18 +1641,22 @@ def test_parse_remark_reads_current_text_widget_content(monkeypatch):
         root.destroy()
 
 
-def test_field_instructions_drive_ai_system_prompt(monkeypatch):
+def test_field_instructions_drive_ai_system_prompt(monkeypatch, tmp_path):
     # 提示词规则来自前台「字段」区，不来自写死常量。
     try:
         root = tk.Tk()
     except tk.TclError:
         pytest.skip("Tk display is not available")
     try:
-        app = BirthFlowerApp(root)
+        # 提示词已搬进共享库 prompts.db：把配置 + db 落在 tmp，避免读写/污染真实 prompts.db。
+        app_cls = _isolated_prompt_db_app(monkeypatch, tmp_path)
+        app = app_cls(root)
         rules = app._assemble_field_rules()
-        assert "花朵名" in rules  # 默认花朵字段规则进了提示词（月→花对照表已删，零配置按文件名）
+        # 默认「出生花」字段规则进了「字段」区拼出的提取规则正文（名+指令）。
+        assert "出生花" in rules
         cfg = app._current_ai_config("ORDER TEXT")
-        assert "花朵名" in cfg.system_prompt
+        # 字段指令经模板 {{field:uuid}} 解析进 system_prompt（出生花字段指令含 flower_name）。
+        assert "flower_name" in cfg.system_prompt
         assert "ORDER TEXT" in cfg.system_prompt  # 订单文本原样插入，无 <order_data> 包裹
         assert cfg.user_content == ""
         # 编辑某字段 instruction → 立即反映进发给 API 的提示词
@@ -1663,40 +1667,58 @@ def test_field_instructions_drive_ai_system_prompt(monkeypatch):
         root.destroy()
 
 
-def test_field_defs_persist_and_reload(monkeypatch):
-    # 字段（=提示词规则）编辑后按产品落盘，重载恢复。
+def _isolated_prompt_db_app(monkeypatch, tmp_path):
+    """构造一个把配置 + prompts.db 都落在 tmp_path 的 BirthFlowerApp。
+
+    提示词整套已搬进共享库 prompts.db（与配置同目录）。这里：①把 DEFAULT_CONFIG_PATH 指向
+    tmp，使 prompts_db 默认 db 路径=tmp/prompts.db；②让 ui_app.load_config 读 tmp 配置（迁移会
+    在 tmp/prompts.db 建一套），从而测试不触碰真实 prompts.db。
+    """
+    import config_store
+
+    cfg_path = tmp_path / "birth_flower_config.json"
+    config_store.save_config(config_store.AppConfig(), cfg_path)  # 迁移建一套空 set，回填 prompt_set_id
+    monkeypatch.setattr(config_store, "DEFAULT_CONFIG_PATH", cfg_path)
+    monkeypatch.setattr(ui_app_module, "load_config", lambda *_a, **_k: config_store.load_config(cfg_path))
+    monkeypatch.setattr(ui_app_module, "save_config", lambda _cfg: None)
+    return BirthFlowerApp
+
+
+def test_field_defs_persist_and_reload(monkeypatch, tmp_path):
+    # 字段（=提示词规则）编辑后写入共享套（prompts.db），重载恢复。
     try:
         root = tk.Tk()
     except tk.TclError:
         pytest.skip("Tk display is not available")
     try:
-        monkeypatch.setattr(ui_app_module, "save_config", lambda _cfg: None)
-        app = BirthFlowerApp(root)
+        app_cls = _isolated_prompt_db_app(monkeypatch, tmp_path)
+        app = app_cls(root)
         app.field_defs[1]["inst_var"].set("自定义出生花规则")
         app._persist_prompts()
-        assert active_product(app.config).extraction_prompt  # 序列化进 extraction_prompt
+        # 改动落进共享套（不再有 product.extraction_prompt 内嵌字段）。
+        assert app._active_prompt_set().reference_fields
         app._load_field_defs_into_self()
         assert any(f["instruction"] == "自定义出生花规则" for f in app.field_defs)
     finally:
         root.destroy()
 
 
-def test_add_field_sequence_stays_unique_after_delete(monkeypatch):
-    # 加字段编号基于现有字段、key 取最大序号+1：删中间字段后再加不撞已有 key。
+def test_add_field_sequence_stays_unique_after_delete(monkeypatch, tmp_path):
+    # 加字段编号经共享库原子分配（field_seq_max+1）：删中间字段后再加不撞已有序号。
     try:
         root = tk.Tk()
     except tk.TclError:
         pytest.skip("Tk display is not available")
     try:
-        monkeypatch.setattr(ui_app_module, "save_config", lambda _cfg: None)
-        app = BirthFlowerApp(root)
-        start_seq = active_product(app.config).field_seq_max
+        app_cls = _isolated_prompt_db_app(monkeypatch, tmp_path)
+        app = app_cls(root)
+        start_seq = app._active_prompt_set().field_seq_max
         app._add_field()
-        created = max(active_product(app.config).reference_fields, key=lambda field: field.sequence_number)
+        created = max(app._active_prompt_set().reference_fields, key=lambda field: field.sequence_number)
         assert created.sequence_number == start_seq + 1
         app._delete_field(created.id)
         app._add_field()
-        sequences = [field.sequence_number for field in active_product(app.config).reference_fields]
+        sequences = [field.sequence_number for field in app._active_prompt_set().reference_fields]
         assert len(sequences) == len(set(sequences)), f"sequence 出现重复: {sequences}"
         assert max(sequences) == start_seq + 2
     finally:

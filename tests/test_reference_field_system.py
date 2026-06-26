@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+import prompts_db
 from config_store import (
     AppConfig,
     ProductConfig,
@@ -107,6 +108,8 @@ def test_duplicate_reference_names_are_rejected_after_trim_and_casefold():
 def test_concurrent_file_creates_do_not_duplicate_sequence(tmp_path):
     path = tmp_path / "config.json"
     save_config(AppConfig(), path)
+    # 先 load 一次完成提示词迁移（回填 prompt_set_id 并建 set），避免并发线程各自触发迁移。
+    load_config(path)
 
     def create(name: str) -> int:
         _cfg, field = create_product_reference_field_in_file(
@@ -143,12 +146,14 @@ def test_legacy_extraction_prompt_migrates_to_reference_fields(tmp_path):
     }
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
+    # 旧 extraction_prompt 迁移：产品只拿到 prompt_set_id，字段/模板落在共享库的 set 里。
     product = active_product(load_config(path))
+    prompt_set = prompts_db.load_prompt_set(product.prompt_set_id, path.parent / "prompts.db")
 
-    assert [field.sequence_number for field in product.reference_fields] == [1, 2]
-    assert product.field_seq_max == 2
-    assert product.prompt_template.count("{{field:") == 2
-    assert "背景说明" in product.prompt_template
+    assert [field.sequence_number for field in prompt_set.reference_fields] == [1, 2]
+    assert prompt_set.field_seq_max == 2
+    assert prompt_set.prompt_template.count("{{field:") == 2
+    assert "背景说明" in prompt_set.prompt_template
 
 
 def test_resolver_expands_only_referenced_fields_in_original_position():
@@ -276,41 +281,51 @@ def test_soft_delete_referenced_field_is_blocked_with_reference_count():
     assert exc.value.reference_count == 1
 
 
-def test_product_config_round_trips_reference_fields(tmp_path):
+def test_product_prompt_set_round_trips_reference_fields(tmp_path):
+    """提示词整套搬进共享库：产品 prompt_set_id 配置往返不变，字段/模板在 db 往返不变（保 id）。"""
     field = _field()
+    db_path = tmp_path / "prompts.db"
+    set_id = prompts_db.create_prompt_set(
+        "Birth Flower",
+        prompt_template=field_token(field.id),
+        template_version=2,
+        fields=(field,),
+        db_path=db_path,
+    )
     config = AppConfig(
-        products=(
-            ProductConfig(
-                id="birth-flower-card",
-                name="Birth Flower",
-                reference_fields=(field,),
-                field_seq_max=1,
-                prompt_template=field_token(field.id),
-                template_version=2,
-            ),
-        )
+        products=(ProductConfig(id="birth-flower-card", name="Birth Flower", prompt_set_id=set_id),)
     )
 
     path = tmp_path / "config.json"
     save_config(config, path)
-    loaded = load_config(path)
+    product = active_product(load_config(path))
+    assert product.prompt_set_id == set_id
 
-    product = active_product(loaded)
-    assert product.reference_fields == (field,)
-    assert product.field_seq_max == 1
-    assert product.prompt_template == field_token(field.id)
+    prompt_set = prompts_db.load_prompt_set(set_id, db_path)
+    # 写库时 field.scope_id 统一存为 set_id；id 原样保留。
+    assert prompt_set.reference_fields == (replace(field, scope_id=set_id),)
+    assert prompt_set.field_seq_max == 1
+    assert prompt_set.prompt_template == field_token(field.id)
+    assert prompt_set.template_version == 2
 
 
-def test_with_product_reference_fields_updates_current_product_only():
+def test_with_product_reference_fields_updates_only_referenced_set(tmp_path):
+    """整体替换写的是产品所引用的共享 set；只动当前产品引用的那一套，字段保 id。"""
     field = _field()
-    config = with_product_reference_fields(
-        AppConfig(),
-        reference_fields=(field,),
-        field_seq_max=1,
-        prompt_template=field_token(field.id),
+    db_path = tmp_path / "prompts.db"
+    set_id = prompts_db.create_prompt_set("Birth Flower", db_path=db_path)
+    config = AppConfig(
+        products=(ProductConfig(id="birth-flower-card", name="Birth Flower", prompt_set_id=set_id),)
     )
 
-    product = active_product(config)
-    assert product.reference_fields == (field,)
-    assert product.field_seq_max == 1
-    assert product.prompt_template == field_token(field.id)
+    with_product_reference_fields(
+        config,
+        reference_fields=(field,),
+        prompt_template=field_token(field.id),
+        db_path=db_path,
+    )
+
+    prompt_set = prompts_db.load_prompt_set(set_id, db_path)
+    assert prompt_set.reference_fields == (replace(field, scope_id=set_id),)
+    assert prompt_set.field_seq_max == 1
+    assert prompt_set.prompt_template == field_token(field.id)

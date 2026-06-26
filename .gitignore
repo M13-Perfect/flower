@@ -37,7 +37,8 @@ tmp_out/
 build/
 release/
 
-# SQLite runtime / backup files (inbox.db itself already ignored)
+# SQLite runtime / backup files (inbox.db / prompts.db 均为运行期产物，不入库)
+prompts.db
 *.db-shm
 *.db-wal
 *.db.bak-*

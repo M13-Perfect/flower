@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from config_store import AppConfig, ProductConfig, active_product
+from config_store import AppConfig, ProductConfig
 from prompt_references import ReferenceField, field_token, system_token
+from prompts_db import PromptSet
 from ui_app import BirthFlowerApp
 
 
@@ -81,6 +82,9 @@ class _LineBox:
         return f"1.{len(self.line)}"
 
 
+_SET_ID = "set-0000-0000-0000-000000000001"
+
+
 def _field(
     *,
     field_id: str = "11111111-1111-4111-8111-111111111111",
@@ -89,7 +93,7 @@ def _field(
 ) -> ReferenceField:
     return ReferenceField(
         id=field_id,
-        scope_id="birth-flower-card",
+        scope_id=_SET_ID,
         sequence_number=sequence_number,
         reference_name=name,
         prompt="Extract value",
@@ -101,21 +105,32 @@ def _field(
 
 
 def _app_with(field: ReferenceField, box=None):
+    # 提示词整套已搬进共享库；产品只持 prompt_set_id。这里直接桩出 _active_prompt_set，
+    # 让单元测试不依赖真实 prompts.db（行为语义不变：方法吃 set.reference_fields/prompt_template）。
+    prompt_set = PromptSet(
+        id=_SET_ID,
+        name="Birth Flower",
+        prompt_template=field_token(field.id),
+        background_prompt=field_token(field.id),
+        template_version=1,
+        field_seq_max=field.sequence_number,
+        reference_fields=(field,),
+    )
     app = SimpleNamespace(
         config=AppConfig(
             products=(
                 ProductConfig(
                     id="birth-flower-card",
                     name="Birth Flower",
-                    reference_fields=(field,),
-                    field_seq_max=field.sequence_number,
-                    prompt_template=field_token(field.id),
+                    prompt_set_id=_SET_ID,
                 ),
             )
         ),
         background_prompt_text=box,
         field_defs=[],
     )
+    app._active_prompt_set = lambda: prompt_set
+    app._active_reference_fields = lambda: prompt_set.reference_fields
     app._tag_prompt_reference = lambda kind, ref_id, start, end: BirthFlowerApp._tag_prompt_reference(
         app, kind, ref_id, start, end
     )
@@ -221,4 +236,5 @@ def test_reference_fields_from_field_defs_persists_unsubmitted_name_var():
 
     assert updated[0].sequence_number == 3
     assert updated[0].reference_name == "Birthday Month"
-    assert active_product(app.config).reference_fields[0].reference_name == "info3"
+    # 未提交前共享套（db）里仍是旧名；改名只体现在返回的字段元组、待 _persist_prompts 才落库。
+    assert app._active_prompt_set().reference_fields[0].reference_name == "info3"

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import prompts_db
 from config_store import (
     DEFAULT_AI_PROFILE_NAME,
     DEFAULT_OUTPUT_PATH,
@@ -9,6 +10,7 @@ from config_store import (
     active_product,
     has_admin_password,
     hash_password,
+    ProductConfig,
     load_config,
     normalize_output_formats,
     normalize_output_path,
@@ -64,9 +66,11 @@ def test_save_and_load_config_round_trip(tmp_path):
     )
 
     save_config(config, path)
+    # 首次 load 会为产品迁移回填 prompt_set_id（非空），故不再等于内存里 set_id 为空的 config。
     loaded = load_config(path)
-
-    assert loaded == config
+    assert active_product(loaded).prompt_set_id
+    # 迁移幂等：再次 load 完全相等（已带 prompt_set_id，跳过迁移）。
+    assert load_config(path) == loaded
 
 
 def test_load_config_returns_defaults_when_file_is_missing(tmp_path):
@@ -194,30 +198,56 @@ def test_save_and_load_config_keeps_layout_defaults(tmp_path):
     assert loaded.layout_defaults.text_x == 555
 
 
-def test_save_and_load_config_keeps_product_prompts(tmp_path):
-    """提取提示词 / 背景提示词随产品配置往返持久化（空值也合法）。"""
+def test_product_prompt_set_id_round_trips_and_background_lives_in_db(tmp_path):
+    """产品只持有 prompt_set_id（配置往返保持）；背景提示词写进共享库 set 并往返保持。"""
     path = tmp_path / "config.json"
-    config = with_product_prompts(
-        AppConfig(), extraction_prompt="提取顾客名字与花", background_prompt="木盒礼品语境"
-    )
+    db_path = path.parent / "prompts.db"
+    # 先建配置（load 会为产品迁移出 prompt_set_id），再用 with_product_prompts 改背景提示词写库。
+    save_config(AppConfig(), path)
+    config = load_config(path)
+    set_id = active_product(config).prompt_set_id
+    assert set_id  # 迁移已回填
 
+    with_product_prompts(config, background_prompt="木盒礼品语境", db_path=db_path)
+
+    # 配置侧：prompt_set_id 往返不变。
+    loaded = load_config(path)
+    assert active_product(loaded).prompt_set_id == set_id
+    # db 侧：背景提示词写入同一 set 并能往返载出。
+    assert prompts_db.load_prompt_set(set_id, db_path).background_prompt == "木盒礼品语境"
+
+
+def test_all_products_share_one_global_prompt_set(tmp_path):
+    """全局共用一套：多个产品 load 后指向同一个 prompt_set_id（改一处=全产品生效）；迁移幂等。"""
+    path = tmp_path / "config.json"
+    config = AppConfig(
+        products=(
+            ProductConfig(id="a", name="A"),
+            ProductConfig(id="b", name="B"),
+            ProductConfig(id="c", name="C"),
+        ),
+        active_product_id="a",
+    )
     save_config(config, path)
     loaded = load_config(path)
 
-    product = active_product(loaded)
-    assert product.extraction_prompt == "提取顾客名字与花"
-    assert product.background_prompt == "木盒礼品语境"
+    set_ids = {product.prompt_set_id for product in loaded.products}
+    assert len(set_ids) == 1  # 三个产品共用同一套
+    assert all(product.prompt_set_id for product in loaded.products)  # 都已回填非空
+    assert load_config(path) == loaded  # 幂等：再次 load 不变
 
 
-def test_with_product_prompts_allows_empty_and_isolates_other_products(tmp_path):
-    config = with_product_prompts(AppConfig(), extraction_prompt="x", background_prompt="y")
-    cleared = with_product_prompts(config, extraction_prompt="", background_prompt="")
-
+def test_with_product_prompts_allows_empty_background(tmp_path):
     path = tmp_path / "c.json"
-    save_config(cleared, path)
-    product = active_product(load_config(path))
-    assert product.extraction_prompt == ""
-    assert product.background_prompt == ""
+    db_path = path.parent / "prompts.db"
+    save_config(AppConfig(), path)
+    config = load_config(path)
+    set_id = active_product(config).prompt_set_id
+
+    with_product_prompts(config, background_prompt="y", db_path=db_path)
+    with_product_prompts(config, background_prompt="", db_path=db_path)
+
+    assert prompts_db.load_prompt_set(set_id, db_path).background_prompt == ""
 
 
 def test_save_and_load_config_keeps_inbox_settings(tmp_path):

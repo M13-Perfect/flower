@@ -14,12 +14,66 @@ FONT_EXTENSIONS = {".ttf", ".otf"}
 # Font 4 独立爱心），故文件名数字必须与目标编号一致。
 _FONT_INDEX_RE = re.compile(r"(\d+)")
 
+# 目录扫描缓存：切产品/重扫频繁，磁盘扫描+SVG 解析+字体名读取最贵。按「目录下相关文件的
+# (名字, mtime_ns, 大小) 签名」缓存——任意增/删/改文件签名即变，缓存自动失效；导入新库目录
+# （新增文件）天然会因签名变化重扫，故对「导入新库」正确失效。每入口最多保留近用的若干目录。
+_SCAN_CACHE_LIMIT = 16
+_FLOWER_CACHE: dict[str, tuple[tuple, list[FlowerAsset]]] = {}
+_FONT_CACHE: dict[str, tuple[tuple, list[FontAsset]]] = {}
+
+
+def _dir_signature(root: Path, suffixes: set[str]) -> tuple:
+    """目录下匹配后缀的文件签名：每个文件取 (名字, mtime_ns, 大小)，对增/删/改敏感。"""
+    items: list[tuple[str, int, int]] = []
+    try:
+        for entry in root.iterdir():
+            if not entry.is_file() or entry.suffix.casefold() not in suffixes:
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            items.append((entry.name.casefold(), st.st_mtime_ns, st.st_size))
+    except OSError:
+        return ()
+    items.sort()
+    return tuple(items)
+
+
+def _file_signature(path: Path) -> tuple:
+    try:
+        st = path.stat()
+    except OSError:
+        return ()
+    return (path.name.casefold(), st.st_mtime_ns, st.st_size)
+
+
+def _cache_get(cache: dict, key: str, signature: tuple):
+    cached = cache.get(key)
+    if cached is not None and cached[0] == signature:
+        # 返回副本，防止调用方就地修改污染缓存。
+        return list(cached[1])
+    return None
+
+
+def _cache_put(cache: dict, key: str, signature: tuple, value: list) -> None:
+    if len(cache) >= _SCAN_CACHE_LIMIT and key not in cache:
+        # 朴素淘汰：删最早插入的一个，避免无界增长（目录数本就很少）。
+        cache.pop(next(iter(cache)))
+    cache[key] = (signature, list(value))
+
 
 def scan_flower_assets(directory: Path | str) -> list[FlowerAsset]:
     """扫描花朵 SVG 目录：每个 .svg 一个素材，key=文件名 slug，不再识别月份/花序号。"""
     root = Path(directory)
     if not root.exists() or not root.is_dir():
         return []
+
+    cache_key = str(root)
+    signature = _dir_signature(root, {".svg"})
+    cached = _cache_get(_FLOWER_CACHE, cache_key, signature)
+    if cached is not None:
+        return cached
 
     assets: list[FlowerAsset] = []
     for path in sorted(root.glob("*.svg"), key=lambda item: item.name.casefold()):
@@ -36,6 +90,7 @@ def scan_flower_assets(directory: Path | str) -> list[FlowerAsset]:
                 embedded_raster_warnings=tuple(raster_warnings),
             )
         )
+    _cache_put(_FLOWER_CACHE, cache_key, signature, assets)
     return assets
 
 
@@ -47,14 +102,28 @@ def scan_font_assets(source: Path | str) -> list[FontAsset]:
     """
     path = Path(source)
     if path.is_file() and path.suffix.casefold() in FONT_EXTENSIONS:
-        return _index_fonts([path])
+        cache_key = f"file:{path}"
+        signature = _file_signature(path)
+        cached = _cache_get(_FONT_CACHE, cache_key, signature)
+        if cached is not None:
+            return cached
+        result = _index_fonts([path])
+        _cache_put(_FONT_CACHE, cache_key, signature, result)
+        return result
     if not path.exists() or not path.is_dir():
         return []
 
+    cache_key = f"dir:{path}"
+    signature = _dir_signature(path, FONT_EXTENSIONS)
+    cached = _cache_get(_FONT_CACHE, cache_key, signature)
+    if cached is not None:
+        return cached
     fonts = [
         item for item in path.iterdir() if item.is_file() and item.suffix.casefold() in FONT_EXTENSIONS
     ]
-    return _index_fonts(fonts)
+    result = _index_fonts(fonts)
+    _cache_put(_FONT_CACHE, cache_key, signature, result)
+    return result
 
 
 def _index_fonts(fonts: list[Path]) -> list[FontAsset]:

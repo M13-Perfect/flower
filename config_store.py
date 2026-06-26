@@ -13,12 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from models import EngravingLayout
-from prompt_references import (
-    ReferenceField,
-    create_reference_field,
-    default_prompt_template,
-    reference_fields_from_legacy,
-)
+from prompt_references import ReferenceField
 from production import ProductionParams
 
 
@@ -126,13 +121,9 @@ class ProductConfig:
     defaults: EngravingLayout = EngravingLayout()
     layer_pins: tuple[LayerPin, ...] = ()
     manual_fields: tuple[str, ...] = ()  # 人工确认字段集；空=用产品默认（Phase 2 UI 消费）
-    extraction_prompt: str = ""  # 「提取提示词」：发给 API 的提取指令（按产品存）
-    background_prompt: str = ""  # 「背景提示词」：附加背景上下文（按产品存）
-    # Reference Field System: 新结构与旧 extraction_prompt/background_prompt 并存，便于渐进发布和回滚。
-    reference_fields: tuple[ReferenceField, ...] = ()
-    field_seq_max: int = 0
-    prompt_template: str = ""
-    template_version: int = 1
+    # 提示词整套已搬进共享库 prompts.db；产品只持有指向某套的引用（FK），不再持有副本。
+    # 空串=尚未迁移（旧配置）；load_config 会用产品原始 payload 走 prompts_db 迁移并回填。
+    prompt_set_id: str = ""
     status: str = "active"  # active|disabled（停用=软删，可恢复）
 
 
@@ -222,7 +213,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     autoparse_user_set = _bool_value(payload, "inbox_autoparse_user_set", False)
     inbox_autoparse = _bool_value(payload, "inbox_autoparse", False) if autoparse_user_set else False
     layout_defaults = _layout_from_payload(payload.get("layout_defaults"))
-    return AppConfig(
+    config = AppConfig(
         flower_dir=Path(_string_value(payload, "flower_dir", str(AppConfig().flower_dir))),
         font_source=Path(_string_value(payload, "font_source", str(AppConfig().font_source))),
         output_path=normalize_output_path(_string_value(payload, "output_path", str(AppConfig().output_path))),
@@ -241,6 +232,58 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         admin_password_hash=_optional_string_value(payload, "admin_password_hash", ""),
         pane_sash_fractions=_fractions_value(payload, "pane_sash_fractions"),
     )
+    # 提示词迁移：把还没有 prompt_set_id 的产品（旧配置）按其原始 payload 建一套共享 set 并回填。
+    # 幂等：再次加载因已带 prompt_set_id 跳过。容错：set_id 指向的 set 在 db 缺失时建空默认 set 重指。
+    return _migrate_prompt_sets(config, payload.get("products"), config_path)
+
+
+def _prompts_db_path_for(config_path: Path) -> Path:
+    """该配置文件对应的 prompts.db（与配置同目录），使测试用 tmp 配置时 db 也落在 tmp。"""
+    return config_path.parent / "prompts.db"
+
+
+def _migrate_prompt_sets(config: AppConfig, raw_products: Any, config_path: Path) -> AppConfig:
+    """全局共用一套：所有产品指向同一个共享提示词 set（改一处=全产品生效）。
+
+    基线取「当前激活产品」的提示词：其 set 已在 db 则复用，否则用其原始 payload 建一套。
+    其余产品（旧 config 内嵌提示词、或指向别的 set）一律改指这同一套；有变动才 save 一次（幂等）。
+    raw_products 是配置里 products 的原始 list（含旧 reference_fields/extraction_prompt），供首次重建用。
+    """
+    import prompts_db  # 延迟导入，避免与 prompts_db 顶层 import config_store 形成环。
+
+    if not config.products:
+        return config
+
+    db_path = _prompts_db_path_for(config_path)
+    raw_by_id: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_products, list):
+        for item in raw_products:
+            if isinstance(item, dict):
+                raw_by_id[_string_value(item, "id", "product")] = item
+
+    active = active_product(config)
+    # 1) 选全局 set：优先激活产品已有的有效 set，再退任一产品的有效 set。
+    global_id = ""
+    for product in (active, *config.products):
+        set_id = product.prompt_set_id
+        if set_id and prompts_db.load_prompt_set(set_id, db_path) is not None:
+            global_id = set_id
+            break
+    # 2) 一个都没有 → 用激活产品的原始 payload 建一套作全局基线。
+    if not global_id:
+        global_id = prompts_db.migrate_product_payload(
+            raw_by_id.get(active.id, {}), name="全局提示词", db_path=db_path
+        )
+
+    # 3) 所有产品改指同一套；有变动才落盘（幂等）。
+    if all(product.prompt_set_id == global_id for product in config.products):
+        return config
+    migrated = replace(
+        config,
+        products=tuple(replace(product, prompt_set_id=global_id) for product in config.products),
+    )
+    save_config(migrated, config_path)
+    return migrated
 
 
 def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Path:
@@ -476,55 +519,67 @@ def with_product_layer_pins(
     return replace(config, products=products)
 
 
+def _product_set_id(config: AppConfig, product_id: str | None) -> str:
+    """取目标产品的 prompt_set_id（默认当前激活产品）。找不到产品时回落激活产品。"""
+    target_id = product_id or config.active_product_id
+    target = next((p for p in config.products if p.id == target_id), active_product(config))
+    return target.prompt_set_id
+
+
 def with_product_prompts(
     config: AppConfig,
     *,
-    extraction_prompt: str,
     background_prompt: str,
     product_id: str | None = None,
-) -> AppConfig:
-    """更新指定产品（默认当前激活产品）的「提取提示词」「背景提示词」，返回新配置（不可变）。
+    db_path: Path | str | None = None,
+) -> None:
+    """更新指定产品所引用共享套的「背景提示词」（写入 prompts.db）。
 
-    其余产品原样保留。空字符串是合法值（表示未填）。
+    纯共享：所有引用同一 set_id 的产品同步变。提示词不再内嵌产品，故不返回新 AppConfig。
+    （旧的 extraction_prompt 已废弃，迁移期由 prompts_db 从旧 payload 还原一次后不再使用。）
     """
-    target_id = product_id or config.active_product_id
-    products = tuple(
-        replace(product, extraction_prompt=extraction_prompt, background_prompt=background_prompt)
-        if product.id == target_id
-        else product
-        for product in config.products
+    import prompts_db
+
+    set_id = _product_set_id(config, product_id)
+    if not set_id:
+        return
+    prompts_db.replace_prompt_set_fields(
+        set_id,
+        prompts_db.load_prompt_set(set_id, db_path).reference_fields,
+        background_prompt=background_prompt,
+        db_path=db_path,
     )
-    return replace(config, products=products)
 
 
 def with_product_reference_fields(
     config: AppConfig,
     *,
     reference_fields: tuple[ReferenceField, ...],
-    field_seq_max: int,
+    field_seq_max: int = 0,
     prompt_template: str | None = None,
     template_version: int | None = None,
-    extraction_prompt: str | None = None,
     background_prompt: str | None = None,
     product_id: str | None = None,
-) -> AppConfig:
-    """更新当前产品的可引用字段配置；旧字段同步保留，供兼容期回滚。"""
-    target_id = product_id or config.active_product_id
+    db_path: Path | str | None = None,
+) -> None:
+    """整体替换指定产品所引用共享套的字段/模板（写入 prompts.db，原子）。
 
-    def patch(product: ProductConfig) -> ProductConfig:
-        if product.id != target_id:
-            return product
-        return replace(
-            product,
-            reference_fields=reference_fields,
-            field_seq_max=max(field_seq_max, *(field.sequence_number for field in reference_fields), 0),
-            prompt_template=product.prompt_template if prompt_template is None else prompt_template,
-            template_version=product.template_version if template_version is None else template_version,
-            extraction_prompt=product.extraction_prompt if extraction_prompt is None else extraction_prompt,
-            background_prompt=product.background_prompt if background_prompt is None else background_prompt,
-        )
+    纯共享：写的是 db 里的套，所有引用同一 set_id 的产品同步变。不再返回 AppConfig。
+    field_seq_max 参数仅为兼容旧签名；实际 field_seq_max 由 prompts_db 取现存值与新字段最大序号的较大者。
+    """
+    import prompts_db
 
-    return replace(config, products=tuple(patch(product) for product in config.products))
+    set_id = _product_set_id(config, product_id)
+    if not set_id:
+        return
+    prompts_db.replace_prompt_set_fields(
+        set_id,
+        reference_fields,
+        prompt_template=prompt_template,
+        background_prompt=background_prompt,
+        template_version=template_version,
+        db_path=db_path,
+    )
 
 
 def create_product_reference_field_in_file(
@@ -535,29 +590,25 @@ def create_product_reference_field_in_file(
     prompt: str,
     field_type: str = "文本",
 ) -> tuple[AppConfig, ReferenceField]:
-    """在锁内读取最新配置、分配序号并原子写回，避免并发创建拿到重复序号。"""
-    with _CONFIG_WRITE_LOCK:
-        config = load_config(path)
-        target_id = product_id or active_product(config).id
-        target = next((product for product in config.products if product.id == target_id), active_product(config))
-        fields, seq_max, created = create_reference_field(
-            target.reference_fields,
-            field_seq_max=target.field_seq_max,
-            scope_id=target.id,
-            reference_name=reference_name,
-            prompt=prompt,
-            field_type=field_type,
-        )
-        template = target.prompt_template or default_prompt_template(fields, target.background_prompt)
-        updated = with_product_reference_fields(
-            config,
-            product_id=target.id,
-            reference_fields=fields,
-            field_seq_max=seq_max,
-            prompt_template=template,
-        )
-        save_config(updated, path)
-        return updated, created
+    """在产品所引用共享套里原子分配序号、新建一个字段，返回 (最新配置, 新字段)。
+
+    序号原子分配由 prompts_db.allocate_field_in_set 在单事务 + 进程内锁内完成，并发不撞号。
+    db 落在配置文件同目录的 prompts.db。
+    """
+    import prompts_db
+
+    config = load_config(path)
+    target_id = product_id or active_product(config).id
+    target = next((product for product in config.products if product.id == target_id), active_product(config))
+    db_path = _prompts_db_path_for(Path(path))
+    created, _seq_max = prompts_db.allocate_field_in_set(
+        target.prompt_set_id,
+        reference_name,
+        prompt=prompt,
+        field_type=field_type,
+        db_path=db_path,
+    )
+    return config, created
 
 
 # ===== 管理员密码（PBKDF2-SHA256，纯标准库，无新依赖）=====
@@ -643,20 +694,11 @@ def _products_from_payload(value: Any, defaults: EngravingLayout | None = None) 
 
 
 def _product_from_payload(payload: dict[str, Any], defaults: EngravingLayout | None = None) -> ProductConfig:
+    """从产品 payload 重建 ProductConfig。提示词不再内嵌，只读 prompt_set_id（空=待迁移）。
+
+    本函数不做任何 db 副作用；迁移（按原始 payload 建 set 并回填 prompt_set_id）在 load_config 里做。
+    """
     product_id = _string_value(payload, "id", "product")
-    extraction_prompt = _optional_string_value(payload, "extraction_prompt", "")
-    background_prompt = _optional_string_value(payload, "background_prompt", "")
-    reference_fields = _reference_fields_from_payload(payload.get("reference_fields"), product_id)
-    if not reference_fields:
-        reference_fields = reference_fields_from_legacy(extraction_prompt, scope_id=product_id)
-    field_seq_max = _int_value(
-        payload,
-        "field_seq_max",
-        max((field.sequence_number for field in reference_fields), default=0),
-    )
-    prompt_template = _optional_string_value(payload, "prompt_template", "")
-    if not prompt_template and reference_fields:
-        prompt_template = default_prompt_template(reference_fields, background_prompt)
     return ProductConfig(
         id=product_id,
         name=_string_value(payload, "name", product_id),
@@ -665,12 +707,7 @@ def _product_from_payload(payload: dict[str, Any], defaults: EngravingLayout | N
         defaults=_layout_from_payload(payload.get("defaults"), defaults),
         layer_pins=_layer_pins_from_payload(payload.get("layer_pins")),
         manual_fields=_str_tuple(payload.get("manual_fields")),
-        extraction_prompt=extraction_prompt,
-        background_prompt=background_prompt,
-        reference_fields=reference_fields,
-        field_seq_max=max(field_seq_max, *(field.sequence_number for field in reference_fields), 0),
-        prompt_template=prompt_template,
-        template_version=_int_value(payload, "template_version", 1),
+        prompt_set_id=_optional_string_value(payload, "prompt_set_id", ""),
         status=_string_value(payload, "status", "active") or "active",
     )
 
@@ -684,12 +721,7 @@ def _product_to_payload(product: ProductConfig) -> dict[str, Any]:
         "defaults": _layout_to_payload(product.defaults),
         "layer_pins": [_layer_pin_to_payload(pin) for pin in product.layer_pins],
         "manual_fields": list(product.manual_fields),
-        "extraction_prompt": product.extraction_prompt,
-        "background_prompt": product.background_prompt,
-        "reference_fields": [_reference_field_to_payload(field) for field in product.reference_fields],
-        "field_seq_max": product.field_seq_max,
-        "prompt_template": product.prompt_template,
-        "template_version": product.template_version,
+        "prompt_set_id": product.prompt_set_id,
         "status": product.status,
     }
 
@@ -748,55 +780,6 @@ def _layer_pins_from_payload(value: Any) -> tuple[LayerPin, ...]:
 
 def _layer_pin_to_payload(pin: LayerPin) -> dict[str, Any]:
     return {"key": pin.key, "production": pin.production.to_dict()}
-
-
-def _reference_fields_from_payload(value: Any, product_id: str) -> tuple[ReferenceField, ...]:
-    if not isinstance(value, list):
-        return ()
-    fields: list[ReferenceField] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        field_id = _optional_string_value(item, "id", "")
-        if not field_id:
-            continue
-        sequence = _int_value(item, "sequence_number", 0)
-        if sequence <= 0:
-            continue
-        fields.append(
-            ReferenceField(
-                id=field_id,
-                scope_id=_optional_string_value(item, "scope_id", product_id) or product_id,
-                sequence_number=sequence,
-                reference_name=_optional_string_value(item, "reference_name", "") or f"字段{sequence}",
-                prompt=_optional_string_value(item, "prompt", ""),
-                sort_order=_int_value(item, "sort_order", sequence),
-                enabled=_bool_value(item, "enabled", True),
-                created_at=_optional_string_value(item, "created_at", ""),
-                updated_at=_optional_string_value(item, "updated_at", ""),
-                deleted_at=_optional_string_value(item, "deleted_at", ""),
-                field_type=_optional_string_value(item, "field_type", "文本") or "文本",
-                legacy_key=_optional_string_value(item, "legacy_key", ""),
-            )
-        )
-    return tuple(sorted(fields, key=lambda field: (field.sort_order, field.sequence_number)))
-
-
-def _reference_field_to_payload(field: ReferenceField) -> dict[str, Any]:
-    return {
-        "id": field.id,
-        "scope_id": field.scope_id,
-        "sequence_number": field.sequence_number,
-        "reference_name": field.reference_name,
-        "prompt": field.prompt,
-        "sort_order": field.sort_order,
-        "enabled": field.enabled,
-        "created_at": field.created_at,
-        "updated_at": field.updated_at,
-        "deleted_at": field.deleted_at,
-        "field_type": field.field_type,
-        "legacy_key": field.legacy_key,
-    }
 
 
 def _path_tuple(value: Any) -> tuple[Path, ...]:
