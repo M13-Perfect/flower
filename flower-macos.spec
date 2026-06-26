@@ -16,17 +16,29 @@ SERVICES_API = PROJECT_ROOT / "services" / "api"
 if str(SERVICES_API) not in sys.path:
     sys.path.insert(0, str(SERVICES_API))
 
-# ── 运行期只读资产：铺到 _MEIPASS 根（runtime hook 把 FLOWER_PROJECT_ROOT/CWD 指过来）──
+# ── 运行期只读资产：存在才打包（缺失不报错）──
 # 注意：datas 元组是 Python 字符串，带空格目录名 "BirthMonth flowers" 直接写即可（不走命令行 --add-data，绕开空格坑）。
-datas = [
-    ("BirthMonth flowers", "BirthMonth flowers"),  # 28 花型 .svg(含尾随空格名) + Front1-4.ttf + heart.svg
-    ("Birthmonth_font.ttf", "."),                  # 仓库根默认单文件字体源
-    ("glyph_maps", "glyph_maps"),                  # glyph_maps.json + glyph_bindings.json + glyph_rules.json
-    ("assets", "assets"),                          # icons/*.svg + symbols/heart.svg
-    ("templates", "templates"),                    # products/birth-flower-card.json（物理尺寸权威输入）
+# 关键：BirthMonth flowers/ 与 Birthmonth_font.ttf 是被 .gitignore 排除的商业资产（公开仓库不上传），
+# 云构建 runner 上不存在 → 这里**存在才加、缺失跳过**，构建照常成功；运行期由用户把这两样放进数据目录
+# (~/Library/Application Support/BirthFlower)，runtime hook 会从那里解析（见 pyi_rthook_flower.py 与 docs/macos-build.md）。
+# 本地全量构建（资产在）则正常随包，hook 自动切回包内解析。
+_candidate_datas = [
+    ("BirthMonth flowers", "BirthMonth flowers"),  # 28 花型 .svg(含尾随空格名) + Front1-4.ttf + heart.svg（商业资产，常缺）
+    ("Birthmonth_font.ttf", "."),                  # 默认单文件字体源（商业资产，常缺）
+    ("glyph_maps", "glyph_maps"),                  # glyph_maps.json + glyph_bindings.json + glyph_rules.json（已入库）
+    ("assets", "assets"),                          # icons/*.svg + symbols/heart.svg（已入库）
+    ("templates", "templates"),                    # products/birth-flower-card.json（已入库）
 ]
+datas = [(s, d) for (s, d) in _candidate_datas if (PROJECT_ROOT / s).exists()]
+_skipped = [s for (s, d) in _candidate_datas if not (PROJECT_ROOT / s).exists()]
+if _skipped:
+    print(f"[flower-macos.spec] 跳过未随包的资产（运行期由用户放入数据目录）: {_skipped}")
+
 datas += collect_data_files("customtkinter")       # 主题/字体数据（set_default_color_theme("dark-blue") 必读）
-datas += collect_data_files("cairosvg")
+try:
+    datas += collect_data_files("cairosvg")        # cairo 缺失时该调用可能抛错；非核心，跳过不影响构建
+except Exception as _e:
+    print(f"[flower-macos.spec] cairosvg 数据收集跳过（PNG/图标栅格化将降级）: {_e}")
 
 # ── hiddenimports：tkinter 全家桶 + 惰性/动态 import 目标 + services/api 的 app 包 ──
 hiddenimports = [

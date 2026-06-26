@@ -26,6 +26,10 @@ jobs:
           pip install -r requirements.txt   # 含 pyinstaller、fastapi/pydantic（app 包牵连依赖）
 
       - name: Build .app
+        env:
+          # brew 的 cairo 在 /opt/homebrew/lib，不在 dlopen 默认搜索路径；
+          # 让 cairosvg 在构建期(collect 阶段)能加载到 libcairo，避免收集告警/缺失。
+          DYLD_FALLBACK_LIBRARY_PATH: /opt/homebrew/lib
         run: pyinstaller --clean --noconfirm flower-macos.spec
 
       - name: Verify bundle
