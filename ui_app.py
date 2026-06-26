@@ -51,6 +51,7 @@ from config_store import (
 )
 from prompt_references import (
     DuplicateReferenceNameError,
+    GLOBAL_SCOPE,
     PromptReferenceError,
     ReferenceConflictError,
     ReferenceField,
@@ -99,6 +100,7 @@ from models import (
     GroupLayer,
     HistoryManager,
     ImageLayer,
+    LayoutSlot,
     ParsePromptTrace,
     TextLayer,
     ParseResult,
@@ -569,6 +571,8 @@ def _enable_dark_titlebar(window: tk.Misc) -> None:
 
 
 def ensure_services_api_import_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return SERVICES_API_DIR  # 冻结态 app.* 已编进 PYZ，无需 insert，更不该 raise（_MEIPASS 下无此目录）
     if not SERVICES_API_DIR.is_dir():
         raise RuntimeError(f"services/api not found: {SERVICES_API_DIR}")
     api_path = str(SERVICES_API_DIR)
@@ -1771,8 +1775,11 @@ class BirthFlowerApp:
             self.config = dataclasses.replace(self.config, pane_sash_fractions=fractions)
             save_config(self.config)
 
-    def _switch_product(self, product_id: str) -> None:
-        """切换激活产品：持久化 + 把该产品的素材/字体库灌进扫描入口并重扫。"""
+    def _switch_product(self, product_id: str, *, reset_document: bool = False) -> None:
+        """切换激活产品：持久化 + 把该产品的素材/字体库灌进扫描入口并重扫。
+
+        reset_document=True（新建产品时）清空画板为该产品默认画布；普通切换保留画板内容。
+        """
         if product_id == active_product(self.config).id:
             return
         self._persist_prompts()  # 先把当前产品的提示词存盘，再切走
@@ -1786,6 +1793,9 @@ class BirthFlowerApp:
             self.font_source_var.set(str(product.font_library_dirs[0]))
         self._scan_assets(show_errors=False, redraw=False)  # 末尾统一重绘，不在扫描里重绘
         self._apply_layout_defaults(product.defaults)
+        if reset_document:
+            self.document = Document(product.defaults.canvas_width, product.defaults.canvas_height)
+            self.selected_preview_item = self.document.selected_layer_id
         self._clear_document_history()
         self._load_prompts_into_widgets()  # 载入新产品的提示词
         self._render_product_rail()
@@ -1872,14 +1882,18 @@ class BirthFlowerApp:
             name=name,
             image_library_dirs=image_dirs,
             font_library_dirs=font_dirs,
-            defaults=self._active_layout_defaults(),
-            prompt_set_id=active_product(self.config).prompt_set_id,  # 新产品直接共用全局提示词套
+            defaults=EngravingLayout(),                       # 空白默认布局，不继承当前产品
+            prompt_set_id=self._new_product_prompt_set(product_id, name),  # 独立新套（空内容），不复用旧套
         )
         # 先追加（不激活）再走切换逻辑，复用切换里的重扫/重绘/持久化。
         # 不在此处 save_config：紧接的 _switch_product 会改 active 并落盘一次，单独存盘是多余 IO。
         self.config = with_added_product(self.config, product, activate=False)
         window.destroy()
-        self._switch_product(product_id)
+        self._switch_product(product_id, reset_document=True)  # 新建产品清空画板
+
+    def _new_product_prompt_set(self, product_id: str, name: str) -> str:
+        """为新产品建一套**独立**提示词：给每个全局字段定义建一条空内容 value（不复用旧套、不新建定义）。"""
+        return prompts_db.create_product_set_with_all_fields(name, product_id=product_id)
 
     # ---- 产品 右键菜单 ------------------------------------
     def _product_by_id(self, product_id: str):
@@ -3661,21 +3675,21 @@ class BirthFlowerApp:
         )
 
     def _render_prompt_set_selector(self, body) -> None:
-        """字段卡顶部「提示词套」下拉：列出共享库所有套，选中即把当前产品改指该套并重载面板。
+        """字段卡顶部「提示词套」行：列出**当前产品自己的套**（一产品可多套），可切换/新建/改名/删除。
 
-        纯共享：选中已有套 = 让本产品引用它（多个产品可共用一套）。set 缺失/空库时不显示。
+        切换 = 改当前产品的激活套（prompt_set_id）；字段内容按套独立，定义全局共享。产品无套时不显示。
         """
-        sets = prompts_db.list_prompt_sets()
+        product = active_product(self.config)
+        sets = prompts_db.list_sets_for_product(product.id)
         if not sets:
             return
-        current_id = active_product(self.config).prompt_set_id
+        current_id = product.prompt_set_id
         id_by_name: dict[str, str] = {}
         names: list[str] = []
         current_name = ""
         for set_id, name in sets:
             label = name or set_id
-            # 同名套用 id 尾段去歧义，保证 name→id 映射唯一。
-            if label in id_by_name:
+            if label in id_by_name:  # 同名套用 id 尾段去歧义
                 label = f"{label} ({set_id[:8]})"
             id_by_name[label] = set_id
             names.append(label)
@@ -3694,10 +3708,15 @@ class BirthFlowerApp:
             button_hover_color=APP_COLORS["accent_soft"], text_color=APP_COLORS["text"],
             command=lambda label, mapping=id_by_name: self._on_select_prompt_set(mapping.get(label, "")),
         ).grid(row=0, column=1, sticky="ew")
+        actions = ctk.CTkFrame(row, fg_color="transparent")
+        actions.grid(row=0, column=2, sticky="e", padx=(6, 0))
+        self._btn(actions, "新建套", self._new_prompt_set_for_product, width=64).grid(row=0, column=0, padx=2)
+        self._btn(actions, "改名", self._rename_active_prompt_set, width=44).grid(row=0, column=1, padx=2)
+        self._btn(actions, "删除", self._delete_active_prompt_set, width=44).grid(row=0, column=2, padx=2)
 
-    def _on_select_prompt_set(self, set_id: str) -> None:
-        """切到选中的提示词套：改当前产品的 prompt_set_id、落盘、重载字段/背景面板。"""
-        if not set_id or set_id == active_product(self.config).prompt_set_id:
+    def _switch_active_set(self, set_id: str) -> None:
+        """把当前产品的激活套切到 set_id：改 prompt_set_id、落盘、重载字段/背景面板。"""
+        if not set_id:
             return
         target_id = active_product(self.config).id
         products = tuple(
@@ -3707,7 +3726,52 @@ class BirthFlowerApp:
         self.config = dataclasses.replace(self.config, products=products)
         save_config(self.config)
         self._load_prompts_into_widgets()
+
+    def _on_select_prompt_set(self, set_id: str) -> None:
+        if not set_id or set_id == active_product(self.config).prompt_set_id:
+            return
+        self._switch_active_set(set_id)
         self.status_var.set("已切换提示词套")
+
+    def _new_prompt_set_for_product(self) -> None:
+        """给当前产品新建一套（每个全局字段一条空内容 value），切过去编辑。"""
+        product = active_product(self.config)
+        seq = len(prompts_db.list_sets_for_product(product.id)) + 1
+        new_id = prompts_db.create_product_set_with_all_fields(
+            f"{product.name} 套{seq}", product_id=product.id
+        )
+        self._switch_active_set(new_id)
+        self.status_var.set("已新建提示词套")
+
+    def _rename_active_prompt_set(self) -> None:
+        from tkinter import simpledialog
+
+        current = self._active_prompt_set()
+        new_name = simpledialog.askstring(
+            "提示词套改名", "新名称：", initialvalue=current.name, parent=self.root
+        )
+        if not new_name or not new_name.strip():
+            return
+        prompts_db.rename_prompt_set(current.id, new_name.strip())
+        self._render_fields()
+        self.status_var.set("提示词套已改名")
+
+    def _delete_active_prompt_set(self) -> None:
+        product = active_product(self.config)
+        sets = prompts_db.list_sets_for_product(product.id)
+        if len(sets) <= 1:
+            messagebox.showwarning("删除提示词套", "至少保留一套，无法删除最后一套。")
+            return
+        current = self._active_prompt_set()
+        if not messagebox.askyesno(
+            "删除提示词套",
+            f"确定删除「{current.name}」？此套字段内容将丢失（字段定义与其他套不受影响）。",
+        ):
+            return
+        remaining = [sid for sid, _ in sets if sid != current.id]
+        prompts_db.delete_prompt_set(current.id)
+        self._switch_active_set(remaining[0])
+        self.status_var.set("提示词套已删除")
 
     def _add_field(self) -> None:
         # 序号原子分配走共享库（prompts_db.allocate_field_in_set，单事务+进程内锁，并发不撞号）。
@@ -4030,6 +4094,35 @@ class BirthFlowerApp:
             prompt_set.reference_fields, prompt_set.background_prompt
         )
 
+    def _field_display(self, field_id: str, scope: str) -> str:
+        """slash chip 显示名（**绝不显示 token / uuid**）：当前套 → /名；@global → /名 ·全局；@产品 → /名 ·产品名。"""
+        if not scope:
+            field = next((f for f in self._active_reference_fields() if f.id == field_id), None)
+            return "/" + field.reference_name if field is not None else "/无效字段"
+        definition = prompts_db.get_field_definition(field_id)
+        if definition is None:
+            return "/无效字段"
+        if scope == GLOBAL_SCOPE:
+            return f"/{definition.reference_name} ·全局"
+        product = self._product_by_id(scope)
+        return f"/{definition.reference_name} ·{product.name if product is not None else scope}"
+
+    def _scoped_content(self, field_id: str, scope: str) -> str | None:
+        """跨作用域引用取内容：@global → 定义全局内容；@产品 → 该产品激活套里该字段的内容。"""
+        if scope == GLOBAL_SCOPE:
+            definition = prompts_db.get_field_definition(field_id)
+            return definition.global_content if definition is not None else None
+        product = self._product_by_id(scope)
+        if product is None or not product.prompt_set_id:
+            return None
+        other = prompts_db.load_prompt_set(product.prompt_set_id)
+        if other is None:
+            return None
+        field = next(
+            (f for f in other.reference_fields if f.id == field_id and not f.deleted_at), None
+        )
+        return field.prompt if field is not None else None
+
     def _tag_prompt_reference(self, kind: str, ref_id: str, start: str, end: str) -> None:
         box = self.background_prompt_text
         if box is None:
@@ -4046,7 +4139,10 @@ class BirthFlowerApp:
             return
         box.delete("1.0", "end")
         prompt_set = self._active_prompt_set()
-        for segment in iter_template_segments(template, fields=prompt_set.reference_fields, scope_id=prompt_set.id):
+        for segment in iter_template_segments(
+            template, fields=prompt_set.reference_fields, scope_id=prompt_set.id,
+            field_display=self._field_display,  # 跨作用域 chip 显示定义名 + 作用域徽标，绝不露 token
+        ):
             if segment[0] == "text":
                 box.insert("insert", segment[1])
                 continue
@@ -4100,6 +4196,8 @@ class BirthFlowerApp:
                 "ref_id": "order_information",
             }
         ]
+        active_id = active_product(self.config).id
+        # ① 当前产品字段（默认，相对引用，解析时取当前套内容）。
         for field in active_reference_fields(self._active_reference_fields()):
             candidates.append(
                 {
@@ -4109,6 +4207,32 @@ class BirthFlowerApp:
                     "ref_id": field.id,
                 }
             )
+        # ② 全局字段内容（@global，绝对引用）。
+        for definition in prompts_db.list_field_definitions():
+            candidates.append(
+                {
+                    "label": f"/{definition.reference_name} ·全局",
+                    "display_name": f"/{definition.reference_name} ·全局",
+                    "ref_kind": "field",
+                    "ref_id": f"{definition.id}@{GLOBAL_SCOPE}",
+                }
+            )
+        # ③ 其他产品的字段内容（@产品，绝对引用）。
+        for product in self.config.products:
+            if product.id == active_id or not product.prompt_set_id:
+                continue
+            other = prompts_db.load_prompt_set(product.prompt_set_id)
+            if other is None:
+                continue
+            for field in active_reference_fields(other.reference_fields):
+                candidates.append(
+                    {
+                        "label": f"/{field.reference_name} ·{product.name}",
+                        "display_name": f"/{field.reference_name} ·{product.name}",
+                        "ref_kind": "field",
+                        "ref_id": f"{field.id}@{product.id}",
+                    }
+                )
         if query_norm:
             candidates = [
                 item for item in candidates
@@ -4355,6 +4479,7 @@ class BirthFlowerApp:
                 scope_id=prompt_set.id,
                 fields=prompt_set.reference_fields,
                 order_information=remark,
+                content_resolver=self._scoped_content,
             )
             text = resolved.final_prompt or "（空）"
         except PromptReferenceError as exc:
@@ -4948,8 +5073,94 @@ class BirthFlowerApp:
         ttk.Label(frame, text="字间距(px)").grid(row=base_row + 9, column=0, sticky="w", pady=2)
         ttk.Entry(frame, textvariable=dlg_spacing, width=14).grid(row=base_row + 9, column=1, sticky="ew", pady=2)
 
+        # —— 全局布局槽位（多槽位）：查看 / 删除 / 改绑定字段；新增/更新走图层面板 🔒 ——
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=base_row + 10, column=0, columnspan=2, sticky="ew", pady=(10, 6)
+        )
+        ttk.Label(
+            frame,
+            text="全局布局槽位（在图层面板点 🔒 写入/更新；解析订单时按这些槽位生成图层）",
+            style="Status.TLabel",
+            wraplength=360,
+        ).grid(row=base_row + 11, column=0, columnspan=2, sticky="w")
+        slots_tree = ttk.Treeview(frame, columns=("type", "field", "geom"), show="tree headings", height=4)
+        slots_tree.heading("#0", text="名称")
+        slots_tree.heading("type", text="类型")
+        slots_tree.heading("field", text="绑定字段")
+        slots_tree.heading("geom", text="x,y,宽,高")
+        slots_tree.column("#0", width=90)
+        slots_tree.column("type", width=48, anchor="center")
+        slots_tree.column("field", width=96)
+        slots_tree.column("geom", width=120)
+        slots_tree.grid(row=base_row + 12, column=0, columnspan=2, sticky="ew", pady=(4, 4))
+
+        slot_field_var = tk.StringVar()
+
+        def refresh_slots() -> None:
+            slots_tree.delete(*slots_tree.get_children(""))
+            for slot in active_product(self.config).defaults.layout_slots:
+                slots_tree.insert(
+                    "", "end", iid=slot.slot_id,
+                    text=slot.slot_name or slot.slot_id,
+                    values=(
+                        slot.slot_type,
+                        slot.source_field,
+                        f"{int(slot.x)},{int(slot.y)},{int(slot.width)},{int(slot.height)}",
+                    ),
+                )
+
+        def selected_slot_id() -> str | None:
+            sel = slots_tree.selection()
+            return sel[0] if sel else None
+
+        def on_slot_select(_event=None) -> None:
+            sid = selected_slot_id()
+            slot = next((s for s in active_product(self.config).defaults.layout_slots if s.slot_id == sid), None)
+            if slot is not None:
+                slot_field_var.set(slot.source_field)
+
+        def write_slots(new_slots) -> None:
+            product = active_product(self.config)
+            self.config = with_product_defaults(
+                self.config, dataclasses.replace(product.defaults, layout_slots=tuple(new_slots))
+            )
+            save_config(self.config)
+            refresh_slots()
+            self._refresh_layers_panel()
+
+        def delete_selected_slot() -> None:
+            sid = selected_slot_id()
+            if sid is None:
+                return
+            slots_now = active_product(self.config).defaults.layout_slots
+            for lyr in self.document.iter_all_layers():
+                if getattr(lyr, "bound_global_slot_id", "") == sid:
+                    lyr.bound_global_slot_id = ""  # 同步解绑画布上引用该槽位的图层
+            write_slots(s for s in slots_now if s.slot_id != sid)
+            self.status_var.set("已删除全局槽位")
+
+        def apply_source_field() -> None:
+            sid = selected_slot_id()
+            new_field = slot_field_var.get().strip()
+            if sid is None or not new_field:
+                return
+            slots_now = active_product(self.config).defaults.layout_slots
+            write_slots(
+                dataclasses.replace(s, source_field=new_field) if s.slot_id == sid else s for s in slots_now
+            )
+            self.status_var.set("已更新槽位绑定字段")
+
+        slots_tree.bind("<<TreeviewSelect>>", on_slot_select)
+        slot_btns = ttk.Frame(frame)
+        slot_btns.grid(row=base_row + 13, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        ttk.Label(slot_btns, text="绑定字段").pack(side="left")
+        ttk.Entry(slot_btns, textvariable=slot_field_var, width=16).pack(side="left", padx=(4, 6))
+        ttk.Button(slot_btns, text="应用字段", command=apply_source_field).pack(side="left", padx=(0, 8))
+        ttk.Button(slot_btns, text="删除选中槽位", command=delete_selected_slot).pack(side="left")
+        refresh_slots()
+
         buttons = ttk.Frame(frame)
-        buttons.grid(row=base_row + 10, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        buttons.grid(row=base_row + 16, column=0, columnspan=2, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="恢复默认值", command=reset_defaults).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="应用", command=lambda: apply_values(False)).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="保存", command=lambda: apply_values(True)).pack(side="left", padx=(0, 8))
@@ -4980,12 +5191,14 @@ class BirthFlowerApp:
             spacing = float(self.letter_spacing_var.get())
         except (ValueError, AttributeError):
             spacing = EngravingLayout().letter_spacing
+        # layout_slots 不经 11 个几何 StringVar 编辑 → 从当前产品配置原样带过来，避免保存全局设置时丢槽位。
         return dataclasses.replace(
             geometry,
             bold=bool(self.font_bold_var.get()),
             underline=bool(self.font_underline_var.get()),
             bold_strength=strength,
             letter_spacing=spacing,
+            layout_slots=active_product(self.config).defaults.layout_slots,
         )
 
     def _clear_document_history(self) -> None:
@@ -5078,6 +5291,7 @@ class BirthFlowerApp:
             scope_id=prompt_set.id,
             fields=prompt_set.reference_fields,
             order_information=remark,
+            content_resolver=self._scoped_content,
         )
         refs = find_template_references(template)
         user_content = "" if "order_information" in refs.source_keys else remark
@@ -5562,19 +5776,194 @@ class BirthFlowerApp:
             return
         if self.flower_label_map.get(self.flower_asset_var.get()) is None:
             return
-        # 解析新订单时旧素材/文字属于上一单输出，必须先清空再生成本单图层。
-        self.document.layers = [
-            layer for layer in self.document.layers if not isinstance(layer, (ImageLayer, TextLayer))
-        ]
-        self.document.normalize_z_indexes()
+        slots = self._active_layout_slots()
         self.document.selected_layer_id = None
         self.selected_preview_item = None
         self.current_manual_glyph_override = None
         self.current_glyph_overrides.clear()
         self.selected_glyph_position = None
-        self._add_selected_flower_to_canvas()
-        self._add_text_layer_from_fields()
+        if slots:
+            # 主路径：全局槽位是唯一持久来源 → 深度清空所有内容层（含组合内）再按槽位生成，避免画布残留重复。
+            self._clear_content_layers()
+            self._build_layers_from_layout_slots(slots, result)
+        else:
+            # fallback（无 layout_slots 时保持旧行为）：只清顶层 Image/Text，重建「花图 + 名字」两层。
+            self.document.layers = [
+                layer for layer in self.document.layers if not isinstance(layer, (ImageLayer, TextLayer))
+            ]
+            self.document.normalize_z_indexes()
+            self._add_selected_flower_to_canvas()
+            self._add_text_layer_from_fields()
         self._clear_document_history()
+
+    def _clear_content_layers(self) -> None:
+        """递归移除所有 Image/Text 内容层（含组合内、含 AnchoredHeart），并丢弃因此清空的图组。"""
+        def prune(layers: list) -> list:
+            kept = []
+            for layer in layers:
+                if isinstance(layer, GroupLayer):
+                    layer.children = prune(layer.children)
+                    if layer.children:  # 空组直接丢弃
+                        kept.append(layer)
+                elif not isinstance(layer, (ImageLayer, TextLayer)):
+                    kept.append(layer)
+            return kept
+        self.document.layers = prune(self.document.layers)
+        self.document.normalize_z_indexes()
+
+    # --- 全局布局槽位（Global Layout Slot）：解析时遍历生成图层 -----------------------------
+    def _active_layout_slots(self) -> tuple:
+        """当前产品的全局布局槽位（持久化在 product.defaults.layout_slots）。空 → 走旧 flower+text fallback。"""
+        return active_product(self.config).defaults.layout_slots
+
+    def _build_layers_from_layout_slots(self, slots, result) -> None:
+        """按 slot_type + source_field 从解析结果生成图层，套用槽位几何（x/y/w/h/rotation/对齐/字号/z序）。
+
+        v1 数据源：flower_image→当前选中花素材；name_text→刻字内容；blessing_text→礼品留言；
+        date_text→出生月。custom_image_*/custom_text_* 槽位结构已支持，但暂无数据源 → 跳过（不报错）。
+        """
+        for slot in sorted(slots, key=lambda s: int(getattr(s, "z_index", 0) or 0)):
+            if getattr(slot, "slot_type", "image") == "text":
+                self._build_text_layer_from_slot(slot, result)
+            else:
+                self._build_image_layer_from_slot(slot, result)
+        self.document.normalize_z_indexes()
+        self._refresh_layers_panel()
+
+    def _slot_image_asset(self, slot):
+        """图片槽位的素材来源（v1：flower_image=当前选中花素材；custom_image_* 暂无源 → None）。"""
+        if getattr(slot, "source_field", "") in ("", "flower_image"):
+            return self.flower_label_map.get(self.flower_asset_var.get())
+        return None
+
+    def _slot_text_value(self, slot, result) -> str:
+        """文字槽位的文本来源，按 source_field 路由。custom_text_* 暂无源 → 空。"""
+        source = getattr(slot, "source_field", "") or "name_text"
+        if source == "name_text":
+            return self._content_text_for_render()
+        if source == "blessing_text":
+            return str(getattr(result, "gift_message", "") or "")
+        if source == "date_text":
+            return str(getattr(result, "birth_month", "") or "")
+        return ""
+
+    def _build_image_layer_from_slot(self, slot, result) -> None:
+        asset = self._slot_image_asset(slot)
+        if asset is None or not asset.path.is_file():
+            return  # 该槽位暂无可用素材（如 custom_image_* 未接数据源）→ 跳过
+        material_key = asset.asset_key or asset.path.stem
+        found = self.active_bundle.resolve_material(material_key)
+        layer = add_image_layer(
+            self.document,
+            asset.path,
+            name=asset.display_name or asset.name,
+            x=float(slot.x), y=float(slot.y),
+            width=float(slot.width), height=float(slot.height),
+            material_id=material_key,
+            material_name=asset.display_name or asset.name,
+            library_id=found[0] if found else "",
+            material_key=material_key,
+        )
+        layer.rotation = float(getattr(slot, "rotation", 0.0) or 0.0)
+        layer.bound_global_slot_id = slot.slot_id
+
+    def _build_text_layer_from_slot(self, slot, result) -> None:
+        text = (self._slot_text_value(slot, result) or "").strip() or "Name"
+        layout = self._active_layout_defaults()
+        font_asset = self.font_label_map.get(self.font_asset_var.get())
+        font_found = (
+            self.active_bundle.resolve_font_by_tags(index=font_asset.index) if font_asset is not None else None
+        )
+        font_size = int(getattr(slot, "font_size", 0) or 0) or layout.text_size
+        layer = add_text_layer(
+            self.document,
+            text,
+            font_path=self._selected_font_path(),
+            x=float(slot.x), y=float(slot.y),
+            width=float(slot.width), height=float(slot.height),
+            font_size=font_size,
+            font_library_id=font_found[0] if font_found else "",
+            font_key=font_found[1].key if font_found else "",
+        )
+        layer.align = getattr(slot, "text_align", "center") or "center"
+        layer.rotation = float(getattr(slot, "rotation", 0.0) or 0.0)
+        if getattr(slot, "color", ""):
+            layer.color = slot.color
+        layer.bold = layout.bold
+        layer.underline = layout.underline
+        layer.bold_strength = layout.bold_strength
+        layer.letter_spacing = layout.letter_spacing
+        layer.bound_global_slot_id = slot.slot_id
+        self._apply_auto_glyph_rules_to_layer(layer)
+        self._resize_text_box_for_slot(layer, slot)
+
+    def _resize_text_box_for_slot(self, layer, slot) -> None:
+        """真实字体测量重定文本框；右对齐时以槽位右边界为锚向左延伸（左/居中各自锚定）。"""
+        align = (getattr(slot, "text_align", "center") or "center").casefold()
+        left = float(slot.x)
+        right = float(slot.x) + float(slot.width)
+        center = left + float(slot.width) / 2.0
+        self._resize_text_box_to_font(layer, clamp_to_safe_area=False)
+        new_w = layer.text_box_width * layer.scale_x
+        if align == "right":
+            layer.x = right - new_w
+        elif align == "left":
+            layer.x = left
+        else:
+            layer.x = center - new_w / 2.0
+
+    # --- 图层面板 🔒：把当前图层写入/更新为全局布局槽位 -----------------------------------
+    def _layer_slot_state(self, layer) -> tuple[bool, bool]:
+        """返回 (可写入全局槽位, 已绑定全局槽位)。只有图片/文字内容层可绑定（爱心几何派生自文字，不绑）。"""
+        if not isinstance(layer, (ImageLayer, TextLayer)) or isinstance(layer, AnchoredHeartLayer):
+            return False, False
+        slot_id = getattr(layer, "bound_global_slot_id", "") or ""
+        if not slot_id:
+            return True, False
+        slots = active_product(self.config).defaults.layout_slots
+        return True, any(s.slot_id == slot_id for s in slots)
+
+    def _group_id_of_layer(self, layer) -> str:
+        """图层所属图组 id（不在任何图组返回 ""），用于槽位记录组合关系（P2 约束预留）。"""
+        container, _found = self.document.container_of(layer.id)
+        if container is None or container is self.document.layers:
+            return ""
+        for group in self.document.iter_all_layers():
+            if isinstance(group, GroupLayer) and group.children is container:
+                return group.id
+        return ""
+
+    def _default_source_field(self, layer, existing_slots, *, exclude_slot_id=None) -> str:
+        """新槽位默认绑定字段：首个图片槽=flower_image、首个文字槽=name_text，其余给 custom_* 占位。"""
+        is_text = isinstance(layer, TextLayer)
+        others = [s for s in existing_slots if s.slot_id != exclude_slot_id]
+        if is_text:
+            if not any(s.source_field == "name_text" for s in others):
+                return "name_text"
+            return f"custom_text_{sum(1 for s in others if s.slot_type == 'text') + 1}"
+        if not any(s.source_field == "flower_image" for s in others):
+            return "flower_image"
+        return f"custom_image_{sum(1 for s in others if s.slot_type == 'image') + 1}"
+
+    def _slot_from_layer(self, layer, slot_id, existing_slots) -> LayoutSlot:
+        """从画布图层快照出一个全局布局槽位（几何/类型/对齐/字体/组合关系）。"""
+        is_text = isinstance(layer, TextLayer)
+        return LayoutSlot(
+            slot_id=slot_id or f"slot-{uuid.uuid4().hex[:8]}",
+            slot_type="text" if is_text else "image",
+            source_field=self._default_source_field(layer, existing_slots, exclude_slot_id=slot_id),
+            slot_name=(self._layer_main_text(layer) or getattr(layer, "name", "") or ("文字" if is_text else "图片"))[:30],
+            x=float(layer.x), y=float(layer.y),
+            width=float(layer.width), height=float(layer.height),
+            rotation=float(getattr(layer, "rotation", 0.0) or 0.0),
+            z_index=int(getattr(layer, "z_index", 0) or 0),
+            text_align=(getattr(layer, "align", "center") or "center") if is_text else "center",
+            font_size=int(getattr(layer, "font_size", 0) or 0) if is_text else 0,
+            font_library_id=getattr(layer, "font_library_id", "") if is_text else "",
+            font_key=getattr(layer, "font_key", "") if is_text else "",
+            color=getattr(layer, "color", "") if is_text else "",
+            group_id=self._group_id_of_layer(layer),
+        )
 
     def _parse_result_can_create_layers(self, result) -> bool:
         # 与 parse_pipeline._is_complete 同口径：text + font +（flower_name | material_key）。
@@ -6606,13 +6995,13 @@ class BirthFlowerApp:
         def insert_layers(parent: str, layers: list) -> None:
             for layer in reversed(layers):
                 tags = []
-                pinnable, pinned = self._layer_pin_state(layer)
+                bindable, bound = self._layer_slot_state(layer)
                 if not layer.visible:
                     tags.append("hidden")
                 if layer.locked:
                     tags.append("locked")
-                if pinned:
-                    tags.append("pinned")
+                if bound:
+                    tags.append("pinned")  # 复用既有金色高亮样式标记「已写入全局槽位」
                 tree.insert(
                     parent,
                     "end",
@@ -6621,7 +7010,7 @@ class BirthFlowerApp:
                     values=(
                         self._layer_resource_cell(layer),
                         "👁" if layer.visible else "🚫",
-                        "🔒" if pinned else ("🔓" if pinnable else "·"),
+                        "🔒" if bound else ("🔓" if bindable else "·"),
                         "⊘" if layer.locked else "🗑",
                     ),
                     tags=tuple(tags),
@@ -6643,8 +7032,8 @@ class BirthFlowerApp:
     def _layer_tree_name(self, layer) -> str:
         # 实时显示内容优先：文字层=文本框内容，图片层=素材名；都没有才回落到图层名。
         label = self._layer_main_text(layer) or str(getattr(layer, "name", "") or "").strip() or "Layer"
-        _pinnable, pinned = self._layer_pin_state(layer)
-        suffix = "  [已锁定]" if pinned else ""
+        _bindable, bound = self._layer_slot_state(layer)
+        suffix = "  [全局槽位]" if bound else ""
         return f"{self._layer_icon_spec(layer)[0]} {label}{suffix}"
 
     def _layer_resource_cell(self, layer) -> str:
@@ -6775,7 +7164,7 @@ class BirthFlowerApp:
             self.document.selected_layer_id = layer.id
             self._toggle_selected_layer_visible()
             return "break"
-        if column == "#3":  # 🔒 锁定初始位置
+        if column == "#3":  # 🔒 写入/更新全局布局槽位（再次点击=移除）
             self._toggle_layer_initial_pin(layer)
             return "break"
         if column == "#4":  # 🗑
@@ -7674,30 +8063,36 @@ class BirthFlowerApp:
             layer.text_box_height = layer.height
 
     def _toggle_layer_initial_pin(self, layer=None) -> None:
+        """图层面板 🔒：把当前图层写入/更新为全局布局槽位（再次点击=从全局设置移除该槽位）。
+
+        这是「保存为全局设置 / Global Layout Slot」，不是编辑锁——不碰 layer.locked。解析订单时按
+        全局槽位生成图层；编辑锁（禁拖拽/删除）仍由右键菜单独立维护。
+        """
         layer = layer or self.document.selected_layer()
         if layer is None:
             self.status_var.set("未选择有效图层")
             return
-        key = self._pin_key(layer)
-        if not key:
-            self.status_var.set("该图层的位置由其他图层派生，不能独立锁定初始位置")
+        if not isinstance(layer, (ImageLayer, TextLayer)) or isinstance(layer, AnchoredHeartLayer):
+            self.status_var.set("只有图片/文字图层可写入全局设置槽位")
             return
         product = active_product(self.config)
-        existing = {pin.key: pin for pin in product.layer_pins}
-        if key in existing:
-            pins = tuple(pin for pin in product.layer_pins if pin.key != key)
-            self.config = with_product_layer_pins(self.config, pins)
-            save_config(self.config)
-            self.status_var.set("已取消初始位置锁定")
+        slots = product.defaults.layout_slots
+        slot_id = getattr(layer, "bound_global_slot_id", "") or ""
+        bound = bool(slot_id) and any(s.slot_id == slot_id for s in slots)
+        self._push_document_history()
+        if bound:
+            # 取消：从全局设置移除该槽位 + 解绑（不动 layer.locked）。
+            new_slots = tuple(s for s in slots if s.slot_id != slot_id)
+            layer.bound_global_slot_id = ""
+            self.status_var.set("已从全局设置移除该槽位")
         else:
-            snapshot = self._snapshot_layer_production(layer)
-            if snapshot is None:
-                self.status_var.set("当前图层几何无效，未写入锁定")
-                return
-            pins = product.layer_pins + (LayerPin(key, snapshot),)
-            self.config = with_product_layer_pins(self.config, pins)
-            save_config(self.config)
-            self.status_var.set("已锁定该素材的初始位置")
+            # 写入/更新：用当前图层几何/类型/对齐生成或更新一个全局槽位，并把图层绑定到它。
+            slot = self._slot_from_layer(layer, slot_id or None, slots)
+            layer.bound_global_slot_id = slot.slot_id
+            new_slots = tuple(s for s in slots if s.slot_id != slot.slot_id) + (slot,)
+            self.status_var.set("已写入全局设置槽位（解析时按此生成图层）")
+        self.config = with_product_defaults(self.config, dataclasses.replace(product.defaults, layout_slots=new_slots))
+        save_config(self.config)
         self._refresh_layers_panel()
         self._redraw_preview()
 
@@ -7750,7 +8145,7 @@ class BirthFlowerApp:
             self.status_var.set("未选择有效图层")
             return
         self._push_document_history()
-        layer.locked = not layer.locked
+        layer.locked = not layer.locked  # 纯编辑锁：禁拖拽/移动/删除/微移，与全局槽位无关
         self._refresh_layers_panel()
         self._redraw_preview()
 

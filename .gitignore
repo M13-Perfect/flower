@@ -14,6 +14,8 @@ dist-electron/
 apps/desktop/dist/
 packages/design-core/dist/
 services/api/.ruff_cache/
+.ruff_cache/
+*.egg-info/
 
 # Local business assets are intentionally kept out of GitHub.
 BirthMonth flowers/

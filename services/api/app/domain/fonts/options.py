@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -10,7 +11,8 @@ from app.domain import DomainError
 from app.domain.orders.issues import ReviewIssue
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[5]
+# 冻结态(打包)由 runtime hook 注入 FLOWER_PROJECT_ROOT 指向随包资源根；未设时取仓库根（开发态行为不变）。
+PROJECT_ROOT = Path(os.environ.get("FLOWER_PROJECT_ROOT", Path(__file__).resolve().parents[5])).resolve()
 LISTING_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$")
 
 

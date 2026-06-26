@@ -94,6 +94,24 @@ def system_token(source_key: str) -> str:
     return "{{source:" + source_key + "}}"
 
 
+GLOBAL_SCOPE = "global"
+
+
+def split_field_value(value: str) -> tuple[str, str]:
+    """把字段 token 值拆成 (field_id, scope)。
+
+    ``uuid`` → ``(uuid, "")``（当前套）；``uuid@global`` → ``(uuid, "global")``；
+    ``uuid@<product_id>`` → ``(uuid, "<product_id>")``。
+    """
+    base, sep, scope = value.partition("@")
+    return base.strip(), (scope.strip() if sep else "")
+
+
+def scoped_field_token(field_id: str, scope: str = "") -> str:
+    """构造（可带作用域的）字段 token。scope 空 = 引用当前套内容。"""
+    return field_token(field_id if not scope else f"{field_id}@{scope}")
+
+
 def slash_query_at_cursor(line_before_cursor: str, in_chip) -> str | None:
     """取光标下的斜杠词：从光标往左扫到最近的空白 / chip 边界 / 行首。
 
@@ -300,7 +318,7 @@ def find_template_references(template: str) -> TemplateReferences:
         value = match.group("value")
         token = match.group(0)
         if kind == "field":
-            field_ids.append(value)
+            field_ids.append(split_field_value(value)[0])  # 去掉 @scope，保删除保护跨作用域可靠
             refs.append(PromptReference("field", value, token, match.start(), match.end()))
         elif kind == "source":
             source_keys.append(value)
@@ -313,7 +331,14 @@ def iter_template_segments(
     *,
     fields: tuple[ReferenceField, ...],
     scope_id: str,
+    field_display=None,
 ):
+    """把模板切成 text / field / source 段。
+
+    field_display(field_id, scope) → 显示文本：用于跨作用域引用（@global / @产品）取定义名 + 作用域徽标
+    （由调用方提供 DB 支撑）。不传时退回当前套内查名（仅当前套、无 scope 才显示名，否则「/无效字段」）。
+    **绝不显示 token 原文/uuid。**
+    """
     text = template or ""
     last = 0
     for match in _TOKEN_RE.finditer(text):
@@ -322,8 +347,13 @@ def iter_template_segments(
         kind = match.group("kind")
         value = match.group("value")
         if kind == "field":
-            field = _field_by_id(fields, value)
-            display = "/" + field.reference_name if field is not None and field.scope_id == scope_id else "/无效字段"
+            field_id, scope = split_field_value(value)
+            if field_display is not None:
+                display = field_display(field_id, scope)
+            else:
+                field = _field_by_id(fields, field_id)
+                ok = field is not None and field.scope_id == scope_id and not scope
+                display = "/" + field.reference_name if ok else "/无效字段"
             yield ("field", value, display)
         elif kind == "source":
             yield ("source", value, "/" + SYSTEM_SOURCE_LABELS.get(value, f"未知数据源({value})"))
@@ -352,7 +382,13 @@ def resolve_prompt_template(
     fields: tuple[ReferenceField, ...],
     order_information: str,
     max_order_chars: int = 12_000,
+    content_resolver=None,
 ) -> ResolvedPrompt:
+    """把模板解析成最终提示词。
+
+    content_resolver(field_id, scope) → str|None：解析跨作用域引用（@global / @产品）的内容；
+    当前套引用（无 scope）仍走传入的 ``fields``。不传 resolver 时遇到跨作用域 token 报错。
+    """
     text = template or ""
     _reject_malformed_tokens(text)
     refs: list[PromptReference] = []
@@ -366,7 +402,7 @@ def resolve_prompt_template(
         value = match.group("value").strip()
         ref = PromptReference("field" if kind == "field" else "source", value, token, match.start(), match.end())
         if kind == "field":
-            replacement, snapshot = _resolve_field_reference(value, token, fields, scope_id)
+            replacement, snapshot = _resolve_field_reference(value, token, fields, scope_id, content_resolver)
             snapshots.append(snapshot)
         elif kind == "source":
             replacement = _resolve_source_reference(value, token, order_information, max_order_chars)
@@ -385,13 +421,27 @@ def resolve_prompt_template(
 
 
 def _resolve_field_reference(
-    field_id: str,
+    value: str,
     token: str,
     fields: tuple[ReferenceField, ...],
     scope_id: str,
+    content_resolver=None,
 ) -> tuple[str, ReferenceField]:
+    field_id, scope = split_field_value(value)
     if not _is_uuid(field_id):
         raise PromptReferenceError("字段引用 ID 格式无效。", token=token, reference_id=field_id)
+    if scope:
+        # 跨作用域（@global / @产品）：内容由 content_resolver 提供（DB/config 支撑，见 ui_app）。
+        if content_resolver is None:
+            raise PromptReferenceError("跨作用域字段引用无法解析。", token=token, reference_id=field_id)
+        content = content_resolver(field_id, scope)
+        if content is None:
+            raise PromptReferenceError("跨作用域字段引用不存在。", token=token, reference_id=field_id)
+        snapshot = ReferenceField(
+            id=field_id, scope_id=scope, sequence_number=0, reference_name="",
+            prompt=content, sort_order=0, enabled=True, created_at="", updated_at="",
+        )
+        return content, snapshot
     field = _field_by_id(fields, field_id)
     if field is None:
         raise PromptReferenceError("字段引用不存在。", token=token, reference_id=field_id)

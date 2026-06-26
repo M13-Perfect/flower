@@ -1,0 +1,151 @@
+<!--
+  店小秘「全部订单」列表页结构的蒸馏夹具（取自真实 4092270213 / 4092128423 两单）。
+  覆盖：一单多件（混单）、行项目件数 ×N、订单实时状态（已退款）。
+  保持真实 vxe 结构：同一订单 = 多个共享 rowid 的 <tr>（主表/右固定列/表头），靠 rowid 配对。
+  注意：商品列（.order-sku）只在主表出现一次，不随固定列重复。
+-->
+<table class="vxe-table">
+  <tbody>
+    <!-- 订单 A：4092270213 · 待打单（有货）· 4 个行项目（其中一件 ×2 以测件数解析） -->
+    <tr rowid="100100">
+      <td class="vxe-body--column col_314" colid="col_314">
+        <div class="orderCode"><span class="pointer inline-block">4092270213</span></div>
+      </td>
+      <td class="vxe-body--column col_109" colid="col_109">
+        <div class="order-sku">
+          <div class="order-sku__image"><img src="https://i.etsystatic.com/il_100x100.a.jpg" /></div>
+          <div class="order-sku__info">
+            <div class="order-sku__meta">
+              <a class="order-sku__name" href="https://www.etsy.com/listing/1763390413">21842163406</a>
+              <div class="inline-block"><span class="order-sku__symbol">x</span><span class="order-sku__quantity">1</span></div>
+            </div>
+            <div class="order-sku__price">USD 79.50</div>
+            <div class="order-sku__attr white-space">
+              <div><div>Choose Your Birth Flower ：Oct - Cosmos</div></div>
+              <div><div>Font Design ：Font 3</div></div>
+              <div><div>Personalization ：Anna Veit</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="order-sku">
+          <div class="order-sku__image"><img src="https://i.etsystatic.com/il_100x100.b.jpg" /></div>
+          <div class="order-sku__info">
+            <div class="order-sku__meta">
+              <a class="order-sku__name" href="https://www.etsy.com/listing/1763390427">21842163420</a>
+              <div class="inline-block"><span class="order-sku__symbol">x</span><span class="order-sku__quantity">2</span></div>
+            </div>
+            <div class="order-sku__price">USD 79.50</div>
+            <div class="order-sku__attr white-space">
+              <div><div>Choose Your Birth Flower ：Dec - Narcissus</div></div>
+              <div><div>Font Design ：Font 3</div></div>
+              <div><div>Personalization ：Lavinia Veit</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="order-sku">
+          <div class="order-sku__image"><img src="https://i.etsystatic.com/il_100x100.c.jpg" /></div>
+          <div class="order-sku__info">
+            <div class="order-sku__meta">
+              <a class="order-sku__name" href="https://www.etsy.com/listing/1900000001">27901510805</a>
+            </div>
+            <div class="order-sku__price">USD 65.00</div>
+            <div class="order-sku__attr white-space">
+              <div><div>Customization &amp; Birth Flower ：Dec - Narcissus</div></div>
+              <div><div>Gift Box Option ：I need gift box</div></div>
+              <div><div>Personalization ：Lavinia</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="order-sku">
+          <div class="order-sku__image"><img src="https://i.etsystatic.com/il_100x100.d.jpg" /></div>
+          <div class="order-sku__info">
+            <div class="order-sku__meta">
+              <a class="order-sku__name" href="https://www.etsy.com/listing/1900000002">28275184592</a>
+              <div class="inline-block"><span class="order-sku__symbol">x</span><span class="order-sku__quantity">1</span></div>
+            </div>
+            <div class="order-sku__price">USD 65.00</div>
+            <div class="order-sku__attr white-space">
+              <div><div>Customization &amp; Birth Flower ：Oct - Cosmos + Name</div></div>
+              <div><div>Gift Box Option ：I need gift box</div></div>
+              <div><div>Personalization ：Anna</div></div>
+            </div>
+          </div>
+        </div>
+      </td>
+    </tr>
+    <!-- 右固定列：订单状态 + 时间轴（与主行共享 rowid） -->
+    <tr rowid="100100">
+      <td class="vxe-body--column col_315" colid="col_315">
+        <ul class="order-time-list">
+          <li><div class="order-time-list-item"><div>下单：<span>2026-06-19 02:20</span></div></div></li>
+          <li><div class="order-time-list-item"><div>付款：<span>2026-06-19 02:25</span></div></div></li>
+          <li><div class="order-time-list-item"><div class="pointer">审核：<span>2026-06-19 02:36</span></div></div></li>
+        </ul>
+      </td>
+      <td class="vxe-body--column col_317" colid="col_317">
+        <div class="render-container">
+          <div class="orderState"><div>待打单（有货） </div><div class="mb-6"></div><p class="text-center">copy</p></div>
+        </div>
+      </td>
+    </tr>
+    <!-- 表头行：店铺 -->
+    <tr rowid="100100_header">
+      <td class="vxe-body--column col_115" colid="col_115">Etsy：Thai-1</td>
+    </tr>
+
+    <!-- 订单 B：4092128423 · 已退款 · 2 个行项目 -->
+    <tr rowid="100200">
+      <td class="vxe-body--column col_314" colid="col_314">
+        <div class="orderCode"><span class="pointer inline-block">4092128423</span></div>
+      </td>
+      <td class="vxe-body--column col_109" colid="col_109">
+        <div class="order-sku">
+          <div class="order-sku__image"><img src="https://i.etsystatic.com/il_100x100.e.jpg" /></div>
+          <div class="order-sku__info">
+            <div class="order-sku__meta">
+              <a class="order-sku__name" href="https://www.etsy.com/listing/1763390301">21842163266</a>
+              <div class="inline-block"><span class="order-sku__symbol">x</span><span class="order-sku__quantity">1</span></div>
+            </div>
+            <div class="order-sku__price">USD 79.50</div>
+            <div class="order-sku__attr white-space">
+              <div><div>Choose Your Birth Flower ：Jan - Carnation</div></div>
+              <div><div>Font Design ：Font 3</div></div>
+              <div><div>Personalization ：Therese</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="order-sku">
+          <div class="order-sku__image"><img src="https://i.etsystatic.com/il_100x100.f.jpg" /></div>
+          <div class="order-sku__info">
+            <div class="order-sku__meta">
+              <a class="order-sku__name" href="https://www.etsy.com/listing/1482780391">21482780391</a>
+              <div class="inline-block"><span class="order-sku__symbol">x</span><span class="order-sku__quantity">1</span></div>
+            </div>
+            <div class="order-sku__price">USD 79.50</div>
+            <div class="order-sku__attr white-space">
+              <div><div>Choose Your Birth Flower ：May - Lily of the Valley</div></div>
+              <div><div>Font Design ：Font 3</div></div>
+              <div><div>Personalization ：Myriam</div></div>
+            </div>
+          </div>
+        </div>
+      </td>
+    </tr>
+    <tr rowid="100200">
+      <td class="vxe-body--column col_315" colid="col_315">
+        <ul class="order-time-list">
+          <li><div class="order-time-list-item"><div>下单：<span>2026-06-19 03:05</span></div></div></li>
+          <li><div class="order-time-list-item"><div>付款：<span>2026-06-19 03:10</span></div></div></li>
+        </ul>
+      </td>
+      <td class="vxe-body--column col_317" colid="col_317">
+        <div class="render-container">
+          <div class="orderState"><div>已退款 </div><div class="mb-6"></div><p class="text-center">copy</p></div>
+        </div>
+      </td>
+    </tr>
+    <tr rowid="100200_header">
+      <td class="vxe-body--column col_115" colid="col_115">Etsy：Thai-1</td>
+    </tr>
+  </tbody>
+</table>

@@ -37,7 +37,7 @@ def test_init_db_creates_tables(db_path):
         names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     finally:
         conn.close()
-    assert {"prompt_sets", "reference_fields"} <= names
+    assert {"prompt_sets", "field_definitions", "field_values"} <= names
 
 
 def test_create_and_load_round_trip(db_path):
@@ -67,6 +67,96 @@ def test_load_missing_returns_none(db_path):
     assert prompts_db.load_prompt_set("does-not-exist", db_path=db_path) is None
 
 
+def test_clone_prompt_set_shares_definitions_but_independent_values(db_path):
+    src = prompts_db.create_prompt_set(
+        "源套",
+        prompt_template="头 " + field_token("id-a") + " 尾 " + field_token("id-b"),
+        background_prompt="背景",
+        fields=(_field("id-a", 1, "字段A", prompt="A源内容"), _field("id-b", 2, "字段B")),
+        db_path=db_path,
+    )
+    clone_id = prompts_db.clone_prompt_set(src, name="副本", db_path=db_path)
+    clone = prompts_db.load_prompt_set(clone_id, db_path=db_path)
+    assert clone is not None and clone_id != src
+    assert clone.name == "副本"
+    # 定义全局共享：field id（=定义 id）不变，模板原样照搬（token 指向定义 id，无需改写）。
+    assert [f.id for f in clone.reference_fields] == ["id-a", "id-b"]
+    assert clone.prompt_template == "头 " + field_token("id-a") + " 尾 " + field_token("id-b")
+    assert clone.background_prompt == "背景"
+    assert clone.reference_fields[0].prompt == "A源内容"  # 值被复制过来
+    # 值按套独立：清空副本的值，不影响源套的值。
+    prompts_db.replace_prompt_set_fields(clone_id, (), db_path=db_path)
+    assert len(prompts_db.load_prompt_set(clone_id, db_path=db_path).reference_fields) == 0
+    assert len(prompts_db.load_prompt_set(src, db_path=db_path).reference_fields) == 2
+    # 定义只有一份（全局唯一），不因克隆翻倍。
+    assert len(prompts_db.list_field_definitions(db_path=db_path)) == 2
+
+
+def test_clone_missing_source_raises(db_path):
+    with pytest.raises(KeyError):
+        prompts_db.clone_prompt_set("nope", db_path=db_path)
+
+
+def test_new_product_set_gets_empty_values_for_all_global_fields(db_path):
+    prompts_db.create_prompt_set(
+        "A套", product_id="a",
+        fields=(_field("id-a", 1, "花名", prompt="提取花名"), _field("id-b", 2, "人名", prompt="提取人名")),
+        db_path=db_path,
+    )
+    new_set = prompts_db.create_product_set_with_all_fields("B套", product_id="b", db_path=db_path)
+    loaded = prompts_db.load_prompt_set(new_set, db_path=db_path)
+    # 结构齐全（两个全局字段都在），但内容全空。
+    assert {f.reference_name for f in loaded.reference_fields} == {"花名", "人名"}
+    assert all(f.prompt == "" for f in loaded.reference_fields)
+    assert loaded.product_id == "b"
+    # 没有新建定义（仍是 2 个全局定义）。
+    assert len(prompts_db.list_field_definitions(db_path=db_path)) == 2
+
+
+def test_legacy_reference_fields_migrate_to_definitions_and_values(db_path):
+    # 手工造旧 schema：prompt_sets（无 product_id）+ reference_fields（每套各一份字段）。
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE prompt_sets (id TEXT PRIMARY KEY, name TEXT, prompt_template TEXT,
+            background_prompt TEXT, template_version INTEGER, field_seq_max INTEGER,
+            created_at TEXT, updated_at TEXT);
+        CREATE TABLE reference_fields (id TEXT PRIMARY KEY, set_id TEXT, sequence_number INTEGER,
+            reference_name TEXT, prompt TEXT, sort_order INTEGER, enabled INTEGER,
+            field_type TEXT, legacy_key TEXT, created_at TEXT, updated_at TEXT, deleted_at TEXT);
+        """
+    )
+    conn.execute("INSERT INTO prompt_sets VALUES ('s1','套1',?, '',1,1,'','')", (field_token("fa"),))
+    conn.execute("INSERT INTO prompt_sets VALUES ('s2','套2',?, '',1,1,'','')", (field_token("fb"),))
+    # 两套各有一个「花名」字段（不同 uuid）→ 迁移后合并成一个全局定义。
+    conn.execute("INSERT INTO reference_fields VALUES ('fa','s1',1,'花名','s1内容',1,1,'文本','k','','','')")
+    conn.execute("INSERT INTO reference_fields VALUES ('fb','s2',1,'花名','s2内容',1,1,'文本','k','','','')")
+    conn.commit()
+    conn.close()
+
+    s1 = prompts_db.load_prompt_set("s1", db_path=db_path)  # 触发一次性迁移
+    s2 = prompts_db.load_prompt_set("s2", db_path=db_path)
+    defs = prompts_db.list_field_definitions(db_path=db_path)
+    assert len(defs) == 1 and defs[0].reference_name == "花名"  # 全局唯一
+    canonical = defs[0].id
+    # 内容按套独立，但都指向同一个全局定义；模板 token 改写成 canonical id。
+    assert [f.id for f in s1.reference_fields] == [canonical]
+    assert [f.id for f in s2.reference_fields] == [canonical]
+    assert s1.reference_fields[0].prompt == "s1内容"
+    assert s2.reference_fields[0].prompt == "s2内容"
+    assert s1.prompt_template == field_token(canonical)
+    assert s2.prompt_template == field_token(canonical)
+
+
+def test_global_uniqueness_same_name_reuses_definition(db_path):
+    set_id = prompts_db.create_prompt_set("套", product_id="a", db_path=db_path)
+    f1, _ = prompts_db.allocate_field_in_set(set_id, "花名", field_type="文本", db_path=db_path)
+    other = prompts_db.create_prompt_set("套2", product_id="b", db_path=db_path)
+    f2, _ = prompts_db.allocate_field_in_set(other, "花名", field_type="文本", db_path=db_path)
+    assert f1.id == f2.id  # 同名同类型 → 同一个全局定义
+    assert len(prompts_db.list_field_definitions(db_path=db_path)) == 1
+
+
 def test_list_prompt_sets(db_path):
     a = prompts_db.create_prompt_set("套甲", db_path=db_path)
     b = prompts_db.create_prompt_set("套乙", db_path=db_path)
@@ -79,8 +169,15 @@ def test_foreign_keys_enforced(db_path):
     prompts_db.init_db(db_path)
     conn = prompts_db._connect(db_path)
     try:
+        # field_value 指向不存在的 set/定义 → 外键拒绝。
+        conn.execute(
+            "INSERT INTO field_definitions (id, reference_name, field_type) VALUES ('d1', '孤儿', '文本')"
+        )
         with pytest.raises(sqlite3.IntegrityError):
-            prompts_db._insert_fields(conn, "no-such-set", (_field("orphan", 1, "孤儿"),))
+            conn.execute(
+                "INSERT INTO field_values (set_id, field_def_id, sequence_number, sort_order) "
+                "VALUES ('no-such-set', 'd1', 1, 1)"
+            )
             conn.commit()
     finally:
         conn.close()

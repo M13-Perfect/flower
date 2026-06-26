@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { width: 240px; font: 13px/1.6 system-ui, sans-serif; padding: 12px; margin: 0; }
+      h1 { font-size: 14px; margin: 0 0 8px; }
+      .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+      .ok { background: #1d9e75; }
+      .bad { background: #e24b4a; }
+      .hint { color: #666; }
+    </style>
+  </head>
+  <body>
+    <h1>Flower 取单助手</h1>
+    <p id="health"><span class="dot bad"></span>检查本地服务…</p>
+    <p class="hint">在店小秘订单详情页点右下角「发送到 Flower」即可把当前订单发给本地服务。</p>
+    <script type="module" src="./popup.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+name: build-macos
+
+# 在 GitHub 的 macOS runner 上把 flower 桌面 App 打包成 .app/.dmg（Windows 无法跨平台编译 .app）。
+# 触发：手动（Actions 页 Run workflow）或推 v* tag。产物在本次 run 的 Artifacts 里下载。
+on:
+  workflow_dispatch: {}
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: macos-latest            # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native libs (cairo dlopen 依赖链 + freetype)
+        run: brew install cairo pango freetype pixman glib libffi fontconfig libpng
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"     # python.org 构建，自带 Tcl/Tk 8.6（勿用 brew/pyenv 的 Python，易缺 Tk）
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt   # 含 pyinstaller、fastapi/pydantic（app 包牵连依赖）
+
+      - name: Build .app
+        run: pyinstaller --clean --noconfirm flower-macos.spec
+
+      - name: Verify bundle
+        run: |
+          test -d "dist/BirthFlowerMVP.app" || { echo "::error::.app 未生成"; exit 1; }
+          echo "Bundle Contents:"; ls -la "dist/BirthFlowerMVP.app/Contents/"
+
+      - name: Make .dmg
+        run: |
+          mkdir -p dist/dmg
+          cp -R "dist/BirthFlowerMVP.app" dist/dmg/
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname "BirthFlowerMVP" -srcfolder dist/dmg \
+            -ov -format UDZO "dist/BirthFlowerMVP.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BirthFlowerMVP-macos-arm64
+          path: dist/BirthFlowerMVP.dmg
+          if-no-files-found: error

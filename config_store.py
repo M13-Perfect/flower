@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 import hashlib
 import hmac
 import json
@@ -12,7 +12,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from models import EngravingLayout
+from models import EngravingLayout, LayoutSlot
 from prompt_references import ReferenceField
 from production import ProductionParams
 
@@ -243,10 +243,12 @@ def _prompts_db_path_for(config_path: Path) -> Path:
 
 
 def _migrate_prompt_sets(config: AppConfig, raw_products: Any, config_path: Path) -> AppConfig:
-    """全局共用一套：所有产品指向同一个共享提示词 set（改一处=全产品生效）。
+    """每个产品一套**独立**提示词 set：保证每个产品的 prompt_set_id 有效且互不共用。
 
-    基线取「当前激活产品」的提示词：其 set 已在 db 则复用，否则用其原始 payload 建一套。
-    其余产品（旧 config 内嵌提示词、或指向别的 set）一律改指这同一套；有变动才 save 一次（幂等）。
+    - 旧 config（内嵌提示词、无 prompt_set_id）：按各自原始 payload 建一套独立 set。
+    - 历史「全局共用一套」的 config：第一个共用者保留原 set，其余各拆出一份独立副本
+      （clone：新 set_id + 新 field id + 同步改写 prompt_template 引用）。
+    幂等：每个产品都已是有效且唯一的 set 时不改动；有变动才 save 一次。
     raw_products 是配置里 products 的原始 list（含旧 reference_fields/extraction_prompt），供首次重建用。
     """
     import prompts_db  # 延迟导入，避免与 prompts_db 顶层 import config_store 形成环。
@@ -261,27 +263,34 @@ def _migrate_prompt_sets(config: AppConfig, raw_products: Any, config_path: Path
             if isinstance(item, dict):
                 raw_by_id[_string_value(item, "id", "product")] = item
 
-    active = active_product(config)
-    # 1) 选全局 set：优先激活产品已有的有效 set，再退任一产品的有效 set。
-    global_id = ""
-    for product in (active, *config.products):
+    seen: set[str] = set()
+    new_products: list[ProductConfig] = []
+    changed = False
+    for product in config.products:
         set_id = product.prompt_set_id
-        if set_id and prompts_db.load_prompt_set(set_id, db_path) is not None:
-            global_id = set_id
-            break
-    # 2) 一个都没有 → 用激活产品的原始 payload 建一套作全局基线。
-    if not global_id:
-        global_id = prompts_db.migrate_product_payload(
-            raw_by_id.get(active.id, {}), name="全局提示词", db_path=db_path
-        )
+        valid = bool(set_id) and prompts_db.load_prompt_set(set_id, db_path) is not None
+        if valid and set_id not in seen:
+            seen.add(set_id)
+            if prompts_db.set_owner(set_id, db_path) != product.id:
+                prompts_db.assign_set_owner(set_id, product.id, db_path)  # 归属回填（不改 config）
+            new_products.append(product)
+            continue
+        if valid:  # 与前面的产品共用同一套 → 拆出独立副本（复制值；定义全局共享）
+            new_id = prompts_db.clone_prompt_set(
+                set_id, name=product.name or product.id, product_id=product.id, db_path=db_path
+            )
+        else:  # 无/失效 set_id：按该产品原始 payload 建一套独立 set
+            new_id = prompts_db.migrate_product_payload(
+                raw_by_id.get(product.id, {}), name=product.name or product.id,
+                product_id=product.id, db_path=db_path,
+            )
+        seen.add(new_id)
+        new_products.append(replace(product, prompt_set_id=new_id))
+        changed = True
 
-    # 3) 所有产品改指同一套；有变动才落盘（幂等）。
-    if all(product.prompt_set_id == global_id for product in config.products):
+    if not changed:
         return config
-    migrated = replace(
-        config,
-        products=tuple(replace(product, prompt_set_id=global_id) for product in config.products),
-    )
+    migrated = replace(config, products=tuple(new_products))
     save_config(migrated, config_path)
     return migrated
 
@@ -317,6 +326,29 @@ def save_config(config: AppConfig, path: Path | str = DEFAULT_CONFIG_PATH) -> Pa
 
 
 
+_SLOT_FIELDS = {spec.name for spec in fields(LayoutSlot)}
+
+
+def _slot_to_payload(slot: LayoutSlot) -> dict[str, Any]:
+    return {spec.name: getattr(slot, spec.name) for spec in fields(LayoutSlot)}
+
+
+def _slot_from_payload(data: Any) -> LayoutSlot | None:
+    """单个槽位 dict → LayoutSlot；忽略未知键、缺 slot_id 则丢弃（不让坏数据中断整份配置）。"""
+    if not isinstance(data, dict) or not str(data.get("slot_id", "")).strip():
+        return None
+    try:
+        return LayoutSlot(**{k: v for k, v in data.items() if k in _SLOT_FIELDS})
+    except TypeError:
+        return None
+
+
+def _slots_from_payload(payload: Any) -> tuple[LayoutSlot, ...]:
+    if not isinstance(payload, list):
+        return ()
+    return tuple(slot for slot in (_slot_from_payload(item) for item in payload) if slot is not None)
+
+
 def _layout_from_payload(payload: Any, default: EngravingLayout | None = None) -> EngravingLayout:
     """从配置文件恢复全局默认布局；字段缺失或非法时使用项目默认值。"""
     default = default or EngravingLayout()
@@ -350,8 +382,10 @@ def _layout_from_payload(payload: Any, default: EngravingLayout | None = None) -
             style[fkey] = float(payload.get(fkey, getattr(default, fkey)))
         except (TypeError, ValueError):
             style[fkey] = getattr(default, fkey)
+    # 多槽位（新增）：旧 JSON 无此键 → 空 tuple，向后兼容、无需迁移脚本。
+    slots = _slots_from_payload(payload.get("layout_slots"))
     try:
-        return EngravingLayout(**values, **style)
+        return EngravingLayout(**values, **style, layout_slots=slots)
     except TypeError:
         return default
 
@@ -375,6 +409,7 @@ def _layout_to_payload(layout: EngravingLayout) -> dict[str, Any]:
         "italic": layout.italic,
         "bold_strength": layout.bold_strength,
         "letter_spacing": layout.letter_spacing,
+        "layout_slots": [_slot_to_payload(slot) for slot in layout.layout_slots],
     }
 
 def normalize_output_formats(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:

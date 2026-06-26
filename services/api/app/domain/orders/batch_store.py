@@ -15,7 +15,8 @@ from app.schemas.orders import ParsedOrder
 
 
 _MISSING = object()
-PROJECT_ROOT = Path(__file__).resolve().parents[5]
+# 冻结态(打包)由 runtime hook 注入 FLOWER_PROJECT_ROOT 指向随包资源根；未设时取仓库根（开发态行为不变）。
+PROJECT_ROOT = Path(os.environ.get("FLOWER_PROJECT_ROOT", Path(__file__).resolve().parents[5])).resolve()
 
 
 def save_batch(batch: BatchImport) -> BatchImport:

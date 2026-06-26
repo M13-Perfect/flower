@@ -1,7 +1,7 @@
 # AGENTS.md — flower（纯 Python 桌面版）
 
 > 新对话先读本文件 + `PROJECT_INDEX.md` + `CURRENT_TASKS.md`。
-> 最近一次实质改动：**2026-06-26 提示词整套搬进 flower 内 SQLite 共享库 `prompts.db`（全局共用一套）+ 修产品增删慢**（commit `81ab706`，见下「本次改动」）。
+> 最近一次实质改动：**2026-06-26 全局设置从固定花图/文字两槽升级为可扩展 `layout_slots`（多槽位）；图层面板🔒改为「写入/更新全局布局槽位」；解析订单时遍历全局槽位动态生成 N 个图层**（见下「本次改动」）。⚠️ 上一版「图层面板🔒=模板锁定（设 layer.locked + locked_by_template）」方向已被否决并纠偏，见「上次改动（已纠偏）」。
 > 分支 `layer-system-v2-rest`，逐次提交。**未 merge 回 main、未 push。** Layer System v2 RFC 全文见 `docs/rfcs/layer-system-v2.md`。
 
 ## 背景 / 当前生产链路
@@ -11,10 +11,60 @@
   链路：订单备注 → 解析（`parse_pipeline`/`gpt_parser`，AI 可选）→ 人工确认字段 → 实时画板编辑（选层/移动/缩放/换素材）→ 导出 DXF/SVG/PNG。
 - **导出权威在 `services/api`**（`app/domain/exports/dxf.py`/`svg.py`/`png.py`），桌面经 `desktop_export.py` in-process 调用；DXF = R2018 + SPLINE/POLYLINE + 单层色7，单次 Y 翻转在 `dxf.py`。所见即所得（预览==导出，`_apply_canvas_fit` 把 contain-fit 烘进导出）。
 - 素材：花按 `BirthMonth flowers/` 下 `*.svg` 文件名扫；字体 `Front1-4.ttf`（index 从文件名数字推，全链路用 `"Font N"` 字符串作身份）。**无月份/序号映射**。
-- **提示词（字段/提取规则/模板/背景提示词）现存在 flower 内独立 SQLite 库 `prompts.db`**（与 `birth_flower_config.json` 同目录），**全局共用一套**：所有产品共指同一个 `prompt_set_id`，改一处=全产品生效。产品配置里**只剩 `prompt_set_id` 引用**，不再内嵌提示词。详见下「本次改动」。
-- **易混点（防走偏）**：① `automation/` 下的 **inbox-service**（仓库外）有自己的 SQLite，那是**订单状态机**，与提示词库无关；② `flower/services/api` 是**已暂缓的 web API**，与本次提示词重构无关。本次只动 flower 自身（桌面侧）。`prompts.db` ≠ inbox-service 的库，别混。
+- **提示词存在 flower 内独立 SQLite 库 `prompts.db`**（与 `birth_flower_config.json` 同目录），**三表「定义/值分离」模型**（2026-06-26 重构，见下「本次改动」）：`field_definitions`（**全局唯一**：身份 uuid〔仅内部用、不显示〕+ 显示名 + 类型 + 全局默认内容）、`prompt_sets`（**一产品可多套**，`product_id` 归属）、`field_values`（**按套独立**：内容/序号/排序/启用）。产品配置只持 `prompt_set_id`（=该产品当前激活套）。token `{{field:uuid}}` 里 uuid=定义 id；`{{field:uuid@global}}`/`{{field:uuid@产品}}` 为跨作用域引用。对外仍以 `PromptSet`+`ReferenceField`（定义⨝值的视图）暴露，下游 `resolve_prompt_template`/UI 不感知拆表。
+- **易混点（防走偏）**：① `automation/` 下的 **inbox-service**（2026-06-26 已迁回本仓 `automation/`）有自己的 SQLite，那是**订单状态机**，与提示词库无关；② `flower/services/api` 是**已暂缓的 web API**，与本次提示词重构无关。本次只动 flower 自身（桌面侧）。`prompts.db` ≠ inbox-service 的库，别混。
 
-## 本次改动（2026-06-26，commit 81ab706）：提示词搬进 SQLite 共享库（全局共用一套）+ 修产品增删慢
+## 本次改动（2026-06-26）：全局设置升级为多槽位 `layout_slots` + 图层🔒写入全局槽位 + 解析遍历槽位生成 N 层
+
+**目标（用户纠偏后的真实需求）**：全局设置 = `active_product(config).defaults`（`EngravingLayout`）原本被 frozen 字段 `flower_*`/`text_*` 写死成「一花图 + 一文字」两槽。本次打开这个限制：支持保存任意数量的图片/文字槽位；**图层面板🔒 的语义改成「把当前图层写入/更新为全局布局槽位 Global Layout Slot」（不是编辑锁、不设 `layer.locked`）**；解析订单时遍历全局槽位动态生成对应图层，不再只生成「花图+名字」两层。`layer.locked` 仅保留为右键编辑锁，且**不作为自动排版依据**——排版只看 `layout_slots`。
+
+**与上一版的关系**：上一版把🔒做成 pin+`layer.locked=True`+`locked_by_template`（禁拖拽=模板锁），方向被否决。本次：删掉 `locked_by_template`/`locked_manual` 两字段、`_toggle_selected_layer_locked` 回退为纯 `layer.locked` 翻转、删掉 `_fill_template_*`/`_get_template_locked_layers`/`_template_group_scenes`/`_mm_to_px` 一整套模板回填代码，换成下面的全局槽位体系。（组内 3mm/右对齐联动降级为 P2，仅在 slot 里预留 `group_id/gap_mm/anchor` 字段。）
+
+**本次实现（P0 + 部分 P1）**：
+- **`models.py`**：新增 frozen `LayoutSlot`（`slot_id/slot_type(image|text)/source_field/slot_name/x/y/width/height/rotation/z_index/text_align/font_size/font_library_id/font_key/color/group_id/parent_id/gap_mm/anchor`）；`EngravingLayout` 加 `layout_slots: tuple[LayoutSlot,...] = ()`（空=回退旧两槽）。`Layer` 基类删 `locked_by_template/locked_manual`，新增 `bound_global_slot_id: str=""`（图层绑定到哪个全局槽位；与 `locked` 完全正交）。
+- **`config_store.py`**：`_layout_to_payload`/`_layout_from_payload` 手写序列化里加 `layout_slots`（新增 `_slot_to_payload`/`_slot_from_payload`/`_slots_from_payload`，按 `fields(LayoutSlot)` 反射、忽略未知键、缺 `slot_id` 丢弃）。旧 JSON 无该键 → 空 tuple，**向后兼容、无需迁移脚本**。
+- **`ui_app._toggle_layer_initial_pin`（面板🔒，列 #3）**：改为「写入/更新/移除全局槽位」——未绑定则 `_slot_from_layer` 快照出槽位（几何/类型/对齐/字体/`group_id`）写进 `product.defaults.layout_slots` 并设 `layer.bound_global_slot_id`；已绑定则从 `layout_slots` 移除该槽位并解绑。**全程不碰 `layer.locked`**。经 `with_product_defaults` + `save_config` 落盘。
+- **`ui_app._toggle_selected_layer_locked`（右键锁）**：回退为纯 `layer.locked = not layer.locked`（编辑锁，禁拖拽/删除/微移，读点不变）。
+- **解析主逻辑 `_replace_layers_from_parse_result`**：读 `_active_layout_slots()`；**有槽位**→`_clear_content_layers()`（递归清所有 Image/Text 含组合内、丢空组）+ `_build_layers_from_layout_slots`；**无槽位**→旧 fallback（清顶层 Image/Text + `_add_selected_flower_to_canvas`/`_add_text_layer_from_fields`）。
+- **生成函数**：`_build_layers_from_layout_slots`（按 `z_index` 排序遍历）、`_build_image_layer_from_slot`（`_slot_image_asset`：`flower_image`=当前选中花素材；套 slot 的 x/y/w/h/rotation）、`_build_text_layer_from_slot`（`_slot_text_value` 按 `source_field` 路由：`name_text`=刻字内容、`blessing_text`=`result.gift_message`、`date_text`=`result.birth_month`；套 slot 几何 + `text_align`/`font_size`，复用 `_apply_auto_glyph_rules_to_layer` + `_resize_text_box_for_slot`〔真实字体测量重定框、右对齐以槽位右边界为锚〕）。`_slot_from_layer`/`_default_source_field`/`_group_id_of_layer`/`_layer_slot_state` 辅助。
+- **UI 文案/指示**：图层行后缀 `[模板锁定]`→`[全局槽位]`；列 #3 图标 🔒/🔓 改读 `_layer_slot_state`（已绑定/可绑定）。**全局设置对话框**（`open_layout_settings`）新增槽位管理区：Treeview 列出当前 `layout_slots`（名称/类型/绑定字段/几何）+「删除选中槽位」+「应用字段」改 `source_field`（P1 最小：查看/删除/改绑定字段；新增/更新走图层🔒）。
+- **兼容**：`_active_layout_defaults` 用 `dataclasses.replace(..., layout_slots=active_product(config).defaults.layout_slots)` 把槽位带过 11 字段 UI 往返，避免保存全局设置时丢槽位。LayerPin 读路径（`_pin_for`/`_layer_effective_production`，手动加层 seed 用）保留作旧兼容；新槽位**不再依赖** pin 的 `text:0` 共享 key。
+
+**已知问题 / 未做（如实）**：
+- **本轮按要求未写/未跑任何测试，未真机手测**。需手测：① 在画板加图片/文字、点面板🔒→行显示`[全局槽位]`、🔒 图标点亮、关 App 重开后 `birth_flower_config.json` 的 `products[].defaults.layout_slots` 里有该槽位；② 解析订单→按槽位生成图层（数量/位置=槽位），不再固定两层；③ 同类型加第 2 个槽位（如两个文字）→各自独立 `slot_id`，互不覆盖（已脱离旧 `text:0` 冲突）；④ 删光所有 `layout_slots` 后解析→回退旧「花图+名字」fallback；⑤ 右键锁定仍只禁拖拽/删除，与🔒槽位互不影响；⑥ 全局设置对话框槽位列表的删除/改绑定字段。
+- **P0 已完成**：多槽位数据模型 + 序列化兼容 + 图层🔒写槽位 + 解析遍历槽位生成 N 层 + 无槽位 fallback。
+- **P1 部分完成**：全局设置对话框有槽位列表（查看/删除/改 `source_field`）；图层🔒可更新已有槽位（`bound_global_slot_id` 复用同 id）；保留 `z_index`。**未做**：槽位的几何/对齐在对话框里直接编辑（目前只能改 `source_field`，几何更新靠在画板调好后再点🔒覆盖）、重命名槽位。
+- **P2 仅预留结构未实现**：`LayoutSlot` 的 `group_id/parent_id/gap_mm/anchor` 字段已存但不消费；组合内 3mm/右对齐文字变长带动图片左移、多图片/多文本/自定义字段绑定 UI 均未做。
+- **v1 数据源限制**：`flower_image`/`name_text`/`blessing_text`(=`gift_message`)/`date_text`(=`birth_month`) 可用；`custom_image_*`/`custom_text_*` 槽位结构支持但**暂无数据源 → 生成时跳过**（图片）或空文本。生成的文字层字体仍用解析选中的字体（非槽位冻结字体），与旧默认流程一致。槽位生成的图层目前是**扁平顶层**（不按 `group_id` 重建图组，P2）。第二道闸门 `flower_label_map.get(...) is None → return` 仍要求选中花素材，故「纯文字、无图片槽位」的产品在没选花时不会生成（v1 限制）。
+
+**怎么跑**：桌面 App 入口 `python birth_flower_mvp.py`（在 `flower/`，用 `.venv-win`）。语法校验：`python -m py_compile ui_app.py models.py config_store.py`（本次已过）。
+
+## 上次改动（已纠偏，2026-06-26）：图层面板🔒曾被做成「模板锁定」——方向已否决
+
+> ⚠️ 本节是历史记录。该版把🔒做成 pin+`layer.locked=True`+`locked_by_template`（=禁拖动的「模板锁」），并新增 `_fill_template_*`/`_get_template_locked_layers`/`_template_group_scenes`/`_mm_to_px` 一套模板回填、以 `locked_by_template` 识别模板槽位。**用户判定方向错误**（核心需求是「全局设置多槽位 + 🔒写入全局槽位」，不是编辑锁），已在上面「本次改动」全部纠偏/删除。代码里这些字段/函数均已不存在，勿据本节找代码。
+
+## 上次改动（2026-06-26）：提示词重构为「字段定义/值分离」三表模型
+
+把原来「每套各持一份字段（定义+内容混在 `reference_fields` 一张表）」拆成 **全局唯一定义 + 按套独立值**，并补齐多套与跨作用域引用。用户拍板的 5 条规则：①字段定义全局唯一；②内容按产品独立；③序号按产品独立；④提示词套切换=编辑范围（一产品可多套）；⑤`/` 默认引用当前产品内容，也可选 `@global` 或 `@其他产品` 的绝对内容。**token/uuid 一律不展示给用户**（编辑器只显示 chip：`/名`、`/名 ·全局`、`/名 ·产品名`）。
+
+- **`prompts_db.py`（整体重写）**：三表 `field_definitions`/`prompt_sets`(+`product_id`)/`field_values`。新 API：`load_prompt_set`(定义⨝值视图)、`list_sets_for_product`、`list_field_definitions`、`get_field_definition`、`create_product_set_with_all_fields`(新产品=给每个全局定义建空值)、`clone_prompt_set`(复制值、定义共享、不改 token)、`rename_prompt_set`/`delete_prompt_set`、`set_owner`/`assign_set_owner`。写路径约定见文件头 docstring（单字段 `allocate_field_in_set` 按名+类型 get-or-create canonical id；批量 `replace_prompt_set_fields` 只按 id upsert 定义、不按名去重；去重只在迁移做）。`_connect` 内置一次性 schema 迁移 `_migrate_legacy_reference_fields`：旧 `reference_fields` → 定义(按 归一化名+类型 去重、保最早 uuid)+值，并改写模板 token。
+- **`prompt_references.py`**：token 值支持 `uuid@scope`；新 `split_field_value`/`scoped_field_token`/`GLOBAL_SCOPE`。`iter_template_segments` 加 `field_display` 回调（跨作用域 chip 显示定义名+徽标，绝不露 token）；`resolve_prompt_template` 加 `content_resolver` 回调（@global/@产品 内容）；`find_template_references` 去 `@scope` 后返回 bare id（删除保护可靠）。**当前套(无 scope)行为零变化**。
+- **`config_store.py`**：`_migrate_prompt_sets` 给每产品一套独立 set + 回填 `product_id` 归属；共用同一 set 的产品 clone 拆独立。
+- **`ui_app.py`**：新建产品走 `create_product_set_with_all_fields`（空内容、不复用旧套）；「提示词套」选择器改列**当前产品的套** + 新建/改名/删除（`_new_prompt_set_for_product`/`_rename_active_prompt_set`/`_delete_active_prompt_set`/`_switch_active_set`）；`/` 候选加 `@global`+其他产品字段（`_prompt_reference_candidates`）；chip 渲染/解析接 `_field_display`/`_scoped_content`（跨作用域在 UI 侧解析，`parse_pipeline` 不动——`resolve_prompt_template` 只在 ui_app 调用）。
+- **测试**：`test_prompts_db` 加 clone 共享定义/独立值、新产品空值、全局唯一复用、旧表迁移去重等；`test_config_store` 拆分独立套；`test_reference_field_ui_mapping` 补 `_field_display` 桩。验证：`ruff`+`py_compile` 全绿；全量 `pytest tests/`(绕开缺 ezdxf 两文件) = **558 passed / 33 skipped / 0 fail，0 回归**。
+- **真机手测待做**：①新建产品后字段结构全有、内容全空、与原产品互不影响；②同名字段在两产品复用同一定义、改名全产品生效；③`/` 选 `@全局`/`@其他产品` 插入 chip（显示名+徽标不露 token）、「预览」解析出对应内容；④提示词套 新建/改名/删除/切换；⑤改完**完全关掉 App 重开**再测。
+
+## 上次改动（2026-06-26）：新建产品真正初始化 + 提示词改回「每产品一套独立」（已被本次的定义/值模型取代）
+
+修两个真问题：① 新建产品不在 `prompts.db` 建任何数据，只抄当前产品的 `prompt_set_id`（全局共用的后遗症）；② 新建产品不初始化——布局/字体设置抄当前产品、画板（`self.document`）从不清空。
+
+- **`prompts_db.py`**：新增 `clone_prompt_set(source_set_id, name=..., new_set_id=..., db_path=...)`——把一套复制成**独立**新套（新 `set_id` + 每个 field 重新分配 id + 同步改写 `prompt_template` 里的 `{{field:旧id}}`→新 id，否则模板引用全失效）。源套不存在抛 `KeyError`。
+- **`config_store.py` `_migrate_prompt_sets`**：从「全局共用一套」改回**「每个产品一套独立 set」**。旧 config（无 `prompt_set_id`）按各自 payload 建套；历史共用同一 set 的产品——第一个保留原 set、其余 `clone_prompt_set` 各拆独立副本（不留孤儿）。幂等：每个产品都已唯一有效 set 时不动。
+- **`ui_app.py`**：① `_create_product_from_dialog` 改 `defaults=EngravingLayout()`（空白默认布局）、`prompt_set_id=self._new_product_prompt_set(name)`（新增 helper：克隆当前套→独立新套，当前无套则建空套），结尾 `_switch_product(product_id, reset_document=True)`。② `_switch_product` 新增 `*, reset_document=False`；为 True 时 `self.document = Document(product.defaults.canvas_width, height)` 清空画板（普通切换仍保留画板）。
+- **测试**：`tests/test_prompts_db.py` 加 `clone_prompt_set` 独立性/模板改写/缺源套 2 例；`tests/test_config_store.py` 把旧 `test_all_products_share_one_global_prompt_set` 改为 `test_products_get_independent_prompt_sets`（3 产品 3 套）+ 新增 `test_shared_prompt_set_is_split_into_independent_copies`（历史共用→自动拆分、保留原 set、幂等）。
+- 验证：`ruff` clean；`pytest test_prompts_db / test_config_store / test_product_config_migration / test_reference_field_system / test_product_switcher / test_product_registry_config` = 全绿（59 + 17）。UI 两方法无无头测试覆盖（GUI 绑定），逻辑靠上述单测护栏；**真机手测待做**：新建产品后字段/布局/画板应全空、与原产品互不影响。
+
+## 上次改动（2026-06-26，commit 81ab706）：提示词搬进 SQLite 共享库（全局共用一套）+ 修产品增删慢
 
 把整套提示词从内嵌进 `birth_flower_config.json`（按产品各一份）搬进 flower 内独立 SQLite 库 `prompts.db`，并改成**所有产品共用同一套全局提示词**；顺带修产品新建/删除慢。
 
@@ -92,3 +142,45 @@
   - 既有失败（与本次无关）：`test_heart_symbol`×2、`test_layer_baseline`×2、`test_error_recovery_packet7` 的导出 smoke = 环境缺 `fontTools`/`ezdxf`；**直接跑全仓 `pytest` 会因 `services/api` 缺 `pydantic` 在收集阶段中断**。
 - lint：`.\.venv-win\Scripts\python.exe -m ruff check <file>`。
 - 致命坑：改完 Python 必须完全关掉 App 重开（旧进程缓存旧模块）；pytest 必须在仓库根跑（部分测试用相对路径）；首次在真实 config 跑前先备份 `birth_flower_config.json`（迁移就地改写）。
+
+## automation 中间层（2026-06-26 从 `Documents\flower` 迁回）
+
+**这是什么**：店小秘订单 → flower 的自动取单子系统，HTTP 解耦三段式：
+
+```
+flower 桌面App ──写采集任务/租约(8770)──▶ inbox-service(本地FastAPI服务) ◀──读授权去抓+回传── Chrome扩展(店小秘页)
+   └ inbox_service_client.py(根目录,客户端,已在)      └ automation/inbox-service       └ automation/extension
+```
+
+- **inbox-service**（`automation/inbox-service`，FastAPI+SQLAlchemy+Alembic，独立 `.venv`、独立 `inbox.db`）：订单状态机 + 退款闸 + 批量导出 + **task-lease 任务租约**。租约是「多子代理」的核心——多个 flower 实例/扩展 worker 靠 `start/heartbeat/stop` 抢同一份采集授权，`is_authorized` = enabled且租约未过期且有 scrape_from（**fail-closed**，授权唯一判据见 `app/authorization.py`）。
+- **extension**（`automation/extension`，Chrome MV3 + TS + Vite）：worker 子代理 paginate/rescrape/mark_writeback/ai_reconcile/auto_cycle，读 `GET /inbox/scrape/control.authorized` 决定跑不跑。
+- flower 这边**只动 `inbox_service_client.py` 那一个客户端**（写采集开关/租约 + 读状态），不直连扩展。契约 9 端点已与服务端逐条对齐。
+
+**怎么跑 / 怎么测**：
+- inbox-service：`cd automation/inbox-service` → `.venv\Scripts\python -m alembic upgrade head`（建空库）→ `python -m uvicorn app.main:app --port 8770`（或 `automation\启动服务.bat`）。测试：`.venv\Scripts\python -m pytest -q`。
+- 扩展：`cd automation/extension` → `npm install` → `npm run build`（产物 `dist/`，Chrome 加载已解压扩展）→ `npx vitest run`。
+
+**已知 / 待验证**：
+- 迁回时修了 `test_task_lease.py` 两个**时间炸弹测试**（`order_in_scope`/`paid_in_time_window` 缺 `now` 注入、写死 6/22 租约，过期后必红）：给两函数加可选 `now=None`（默认真实墙钟、**生产行为零变化**），测试改注入 `now=NOW`。这是源仓库就存在的红，非迁移引入。
+- **真实抓单未端到端验证**：需本机 Chrome 装扩展 + 登录店小秘，本会话只验到「构建通过 + 单测通过 + 活体 healthz 链路通」。真机联调前请按 `automation/docs/real-machine-test-2026-06-19.md` / `inbox-smoke.md` 走。
+- 验收快照（2026-06-26）：inbox-service pytest **190 passed**；扩展 vitest **144 passed**；flower 客户端契约（test_inbox_service_client/poller/config_store）**52 passed**；起服务后真实客户端 health/get_scrape_control/list_orders 全通。
+
+## macOS 打包（.app/.dmg，GitHub Actions 云构建，2026-06-26）
+
+**硬约束**：macOS `.app` 必须在 macOS 上构建（PyInstaller 不跨平台编译），Windows 出不了包。故走 GitHub Actions 的 `macos-latest`(arm64) runner 云端打包，产物为 `.dmg` artifact。完整操作见 `docs/macos-build.md`。
+
+**新增文件**：
+- `flower-macos.spec`：PyInstaller spec。datas 把只读素材（`BirthMonth flowers/`、`Birthmonth_font.ttf`、`glyph_maps/`、`assets/`、`templates/`）铺到 `_MEIPASS` 根；`services/api` 的 `app` 包靠 `collect_submodules('app')` 进 PYZ（spec 顶部把 `services/api` 加进 sys.path/pathex）；cairosvg 的 `libcairo` 等 brew dylib 显式收进 binaries；`upx=False`（Mac 必关）；`BUNDLE` 出 `.app`。
+- `pyi_rthook_flower.py`：PyInstaller runtime hook（spec 的 `runtime_hooks`）。冻结态注入 `FLOWER_PROJECT_ROOT=_MEIPASS`（domain 层 `_project_root()` 命中随包资源）、`BIRTHFLOWER_DATA_DIR=~/Library/Application Support/BirthFlower`（可写数据根）、`FLOWER_PY_REEXEC=1`，并 `chdir(_MEIPASS)` 让默认相对素材路径在双击启动(CWD=/)时命中。**这是关键粘合层**。
+- `.github/workflows/build-macos.yml`：`brew install cairo …` + `setup-python@3.12`(自带 Tcl/Tk) + `pip install -r requirements.txt` + `pyinstaller flower-macos.spec` + `hdiutil` 打 dmg + 上传 artifact。
+- `docs/macos-build.md`：触发/安装/绕过 Gatekeeper（未签名）/已知限制。
+
+**源码改动（4 处，全部向后兼容：env 未设时取值与改前完全一致，开发态零影响）**：
+- `ui_app.py` `ensure_services_api_import_path()`：冻结态提前 `return`（原本找不到 `services/api` 目录会 `raise`，而 `_MEIPASS` 下无此目录、`app.*` 已在 PYZ）。
+- `services/api/app/domain/fonts/scanner.py:13`、`fonts/options.py:13`、`orders/batch_store.py:18`：模块级常量 `PROJECT_ROOT` 改为优先读 `FLOWER_PROJECT_ROOT`（这 3 个是常量、import 时固化，runtime hook 的 env 救不了，必须改源码；其余 domain 层 `_project_root()` 是函数且本就读 env，hook 即可覆盖）。
+
+**已知限制 / 待验证**：
+- **本会话在 Windows 无法实跑 macOS 构建**——spec/hook/yaml 语法、YAML 结构、4 处改动向后兼容（services/api 相关测试 65 passed + 双向 env 验证）均已在 Windows 验过；但 PyInstaller 真打 `.app`、App 能否启动/导出，只能在 runner 上验，首次构建可能需 1–2 轮修 bundling（最可能：cairo dylib dlopen、customtkinter 主题数据、导出找不到模板——对策已写进 spec/hook）。
+- `.app` **未签名公证**，首次打开需右键→打开或 `xattr -dr com.apple.quarantine`。
+- 「改物理尺寸」回写 `templates/products/*.json` 在只读 `.app` 内不持久（首版接受）。
+- 默认只出 **arm64**；Intel Mac 需另配 runner。

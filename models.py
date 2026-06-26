@@ -81,6 +81,38 @@ class ParsePromptTrace:
 
 
 @dataclass(frozen=True)
+class LayoutSlot:
+    """全局布局槽位（Global Layout Slot）：产品级「这个位置放什么、几何如何」的持久化描述。
+
+    取代写死的「花图 + 文字」两槽：解析订单时按 layout_slots 遍历生成图层，数量/类型可任意扩展。
+    坐标 x/y/width/height 为画布绝对像素（与 EngravingLayout 同坐标系）。group_id/gap_mm/anchor
+    为 P2 组合约束预留（先存不消费）。slot_id 全局唯一，是图层 bound_global_slot_id 的绑定目标。
+    """
+
+    slot_id: str
+    slot_type: str = "image"          # 'image' | 'text'（后续可扩 material/custom_image/custom_text/group）
+    source_field: str = ""            # 取数来源：flower_image | name_text | blessing_text | date_text | custom_*
+    slot_name: str = ""
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 100.0
+    height: float = 100.0
+    rotation: float = 0.0
+    z_index: int = 0
+    # 文字槽专用
+    text_align: str = "center"        # left | center | right
+    font_size: int = 0                # 0 = 用全局默认字号
+    font_library_id: str = ""
+    font_key: str = ""
+    color: str = ""
+    # 组合 / 约束（P2 预留，仅存储不消费）
+    group_id: str = ""
+    parent_id: str = ""
+    gap_mm: float | None = None
+    anchor: str = ""
+
+
+@dataclass(frozen=True)
 class EngravingLayout:
     canvas_width: int = 1732
     canvas_height: int = 1280
@@ -101,6 +133,8 @@ class EngravingLayout:
     italic: bool = False
     bold_strength: float = 0.016  # 经预览实测：≈stroke 2px@104，清晰可读且字怀不糊（0.028 起糊）
     letter_spacing: float = 0.0  # 字间距全局默认（已有 per-layer 全链路；建层时烘进图层）
+    # 多槽位全局布局（新增）：空=回退旧 flower_*/text_* 两槽默认流程；非空=解析时按槽位生成 N 个图层。
+    layout_slots: tuple[LayoutSlot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -191,7 +225,10 @@ class Layer:
     rotation: float = 0.0
     opacity: float = 1.0
     visible: bool = True
-    locked: bool = False
+    locked: bool = False  # 编辑锁（禁拖拽/移动/删除/微移），仅由右键菜单维护；与全局槽位完全正交。
+    # 该图层绑定到哪个全局布局槽位（Global Layout Slot）；空=未写入全局设置。图层面板 🔒 写入/更新槽位
+    # 时设置它，并不强制 locked=True（写入全局设置 ≠ 禁止移动）。
+    bound_global_slot_id: str = ""
     z_index: int = 0
     # Content Provider 注册表（Packet 3 / ADR-001）查表用：内容层可填 'text'/'image'/...，
     # 留空时 providers.get_provider 回退 layer.type（旧内存态兼容）。**不进导出 dict**——

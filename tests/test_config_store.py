@@ -217,8 +217,8 @@ def test_product_prompt_set_id_round_trips_and_background_lives_in_db(tmp_path):
     assert prompts_db.load_prompt_set(set_id, db_path).background_prompt == "木盒礼品语境"
 
 
-def test_all_products_share_one_global_prompt_set(tmp_path):
-    """全局共用一套：多个产品 load 后指向同一个 prompt_set_id（改一处=全产品生效）；迁移幂等。"""
+def test_products_get_independent_prompt_sets(tmp_path):
+    """每个产品一套独立提示词：多个产品 load 后各自 prompt_set_id 互不相同且非空；迁移幂等。"""
     path = tmp_path / "config.json"
     config = AppConfig(
         products=(
@@ -232,9 +232,33 @@ def test_all_products_share_one_global_prompt_set(tmp_path):
     loaded = load_config(path)
 
     set_ids = {product.prompt_set_id for product in loaded.products}
-    assert len(set_ids) == 1  # 三个产品共用同一套
+    assert len(set_ids) == 3  # 三个产品各自独立，不共用
     assert all(product.prompt_set_id for product in loaded.products)  # 都已回填非空
     assert load_config(path) == loaded  # 幂等：再次 load 不变
+
+
+def test_shared_prompt_set_is_split_into_independent_copies(tmp_path):
+    """历史「全局共用一套」的 config：load 后被拆成各自独立的 set（其一保留原 set）。"""
+    import prompts_db
+
+    path = tmp_path / "config.json"
+    db_path = path.parent / "prompts.db"
+    shared = prompts_db.create_prompt_set("全局提示词", db_path=db_path)
+    config = AppConfig(
+        products=(
+            ProductConfig(id="a", name="A", prompt_set_id=shared),
+            ProductConfig(id="b", name="B", prompt_set_id=shared),
+            ProductConfig(id="c", name="C", prompt_set_id=shared),
+        ),
+        active_product_id="a",
+    )
+    save_config(config, path)
+    loaded = load_config(path)
+
+    set_ids = [product.prompt_set_id for product in loaded.products]
+    assert len(set(set_ids)) == 3  # 拆成三套独立
+    assert shared in set_ids  # 其中一个保留原 set，不留孤儿
+    assert load_config(path) == loaded  # 幂等
 
 
 def test_with_product_prompts_allows_empty_background(tmp_path):

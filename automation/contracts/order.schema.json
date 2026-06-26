@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flower.local/contracts/order.schema.json",
+  "title": "FlowerOrder",
+  "description": "店小秘订单 → Flower 自动取单的统一合同。Chrome 扩展抓取、本地服务校验、Flower 读取三方共用此结构。落盘文件 {order_id}.json 与 HTTP POST 报文同形。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "order_id"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "合同版本。服务对未知版本直接拒收并提示操作员更新扩展。"
+    },
+    "order_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^[A-Za-z0-9_.\\-]+$",
+      "description": "店小秘订单号。同时作为：SQLite 主键 / 去重键 / 收件夹文件名 {order_id}.json / 批量 report.xlsx「订单号」列的匹配键。正则保证文件名安全。"
+    },
+    "remark": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 5000,
+      "description": "订单备注（买家留言）。键名必须为 remark，以命中 Flower order_importer.REMARK_KEYS 的首键，单单导入器零改动即可读；批量 xlsx 的备注列也取它。【2026-06-19 起改为可选、可空串】列表页无任何定制备注的标品单 remark 为空，数据由 items[].personalization_raw 承载——下游（flower order_importer / 批量）读到空 remark 时须回退 items[]，不得因空 remark 报错。schema_version 仍 1.0（这是放宽必填、向后兼容：带 remark 的老 JSON 照常通过）。"
+    },
+    "shop": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "店铺名（可选）。"
+    },
+    "spec": {
+      "type": "string",
+      "maxLength": 1000,
+      "description": "规格 / SKU（可选）。"
+    },
+    "source_url": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2000,
+      "description": "订单页 URL，便于溯源 / 回看（可选）。"
+    },
+    "scraped_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "抓取时间，ISO 8601（可选）。"
+    },
+    "refund_status": {
+      "type": ["string", "null"],
+      "maxLength": 64,
+      "description": "店小秘订单实时状态（退款拦截用）。首次抓取写入；Phase 2 在排版/雕刻/发货前重抓刷新。建议取值 normal/refunded/cancelled/unknown，确切取值待店小秘详情页确认（计划 D5）。可选。"
+    },
+    "items": {
+      "type": "array",
+      "description": "订单行项目，打破「一单一件」：同一订单可有多个目标盒子 + 其他商品。可选，缺省=按 remark 走旧单件逻辑。语义拆分交给 Flower GPT 解析层，扩展只抓结构与原文。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["line_index"],
+        "properties": {
+          "line_index": {"type": "integer", "minimum": 0, "description": "订单内行项目序号，从 0 起。"},
+          "product_sku": {"type": "string", "maxLength": 1000, "description": "该行 SKU/规格（可选）。"},
+          "is_target_box": {"type": "boolean", "description": "是否本系统负责生产的目标盒子（false=其他商品，仅配货提醒）。缺省 true。"},
+          "quantity": {"type": "integer", "minimum": 1, "description": "该行件数（店小秘 ×N）。缺省 1。"},
+          "personalization_raw": {"type": "string", "maxLength": 5000, "description": "该行原始定制备注。"},
+          "extras": {"type": "object", "description": "该行店小秘特定字段兜底（图片/链接等，待 D5 确认）。"}
+        }
+      }
+    },
+    "extras": {
+      "type": "object",
+      "description": "未来字段兜底袋。未知字段统一放这里，不必改 schema。"
+    }
+  }
+}

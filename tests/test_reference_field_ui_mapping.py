@@ -131,6 +131,7 @@ def _app_with(field: ReferenceField, box=None):
     )
     app._active_prompt_set = lambda: prompt_set
     app._active_reference_fields = lambda: prompt_set.reference_fields
+    app._field_display = lambda field_id, scope: BirthFlowerApp._field_display(app, field_id, scope)
     app._tag_prompt_reference = lambda kind, ref_id, start, end: BirthFlowerApp._tag_prompt_reference(
         app, kind, ref_id, start, end
     )
