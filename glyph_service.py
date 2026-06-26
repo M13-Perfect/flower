@@ -41,9 +41,10 @@ FONT4_DEFAULT_ENDING_GLYPHS = {
     for index, letter in enumerate("abcdefghijklmnopqrstuvwxyz")
 }
 
-# Font 2 常用结尾字形：截图中的 a.005-z.005，按 a-z 顺序连续映射到 PUA E068-E081。
+# Font 2 末尾「字母+爱心」花体：Front2.ttf 实测落在 PUA E034-E04D（与 Font 4 同码位，
+# 经字体 cmap + 目视确认；旧值 E068-E081 该字体里不存在，会 missing-codepoint）。按 a-z 连续映射。
 FONT2_DEFAULT_ENDING_GLYPHS = {
-    letter: f"U+{0xE068 + index:04X}"
+    letter: f"U+{0xE034 + index:04X}"
     for index, letter in enumerate("abcdefghijklmnopqrstuvwxyz")
 }
 

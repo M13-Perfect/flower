@@ -22,15 +22,15 @@ def test_font2_default_payload_binds_26_ending_glyphs():
     letters = payload["Font 2"]["letters"]
 
     assert tuple(letters) == tuple("abcdefghijklmnopqrstuvwxyz")
-    assert letters["a"]["codepoint"] == "U+E068"
-    assert letters["z"]["codepoint"] == "U+E081"
+    assert letters["a"]["codepoint"] == "U+E034"
+    assert letters["z"]["codepoint"] == "U+E04D"
 
     config = GlyphMapConfig.load(Path("glyph_maps/glyph_maps.json"))
     result = resolve_glyph("Jazmin", "Font 2", config)
 
-    assert result.render_text == "Jazmi" + chr(0xE075)
+    assert result.render_text == "Jazmi" + chr(0xE041)
     assert result.source_letter == "n"
-    assert result.glyph_codepoint == "U+E075"
+    assert result.glyph_codepoint == "U+E041"
 
 
 def test_font4_default_payload_binds_26_heart_ending_glyphs():
@@ -62,7 +62,7 @@ def test_font4_defaults_are_merged_into_legacy_empty_config(tmp_path):
 
     assert result.render_text == "Jazmi" + chr(0xE041)
     assert config.get_glyph_for_letter("Font 4", "n")["codepoint"] == "U+E041"
-    assert config.get_glyph_for_letter("Font 2", "n")["codepoint"] == "U+E075"
+    assert config.get_glyph_for_letter("Font 2", "n")["codepoint"] == "U+E041"
 
 
 def test_font4_jazmin_replaces_last_n_when_mapping_exists(tmp_path):

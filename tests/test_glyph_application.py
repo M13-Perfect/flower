@@ -229,10 +229,10 @@ def test_font2_default_bindings_and_rules_cover_common_ending_glyphs():
     bindings = default_glyph_bindings_payload()["fonts"]["Font 2"]["bindings"]
     rules = default_glyph_rules_payload()["fonts"]["Font 2"]["end_char_rules"]
 
-    assert bindings["E068"]["base_char"] == "a"
-    assert bindings["E081"]["base_char"] == "z"
-    assert rules["a"] == "E068"
-    assert rules["z"] == "E081"
+    assert bindings["E034"]["base_char"] == "a"
+    assert bindings["E04D"]["base_char"] == "z"
+    assert rules["a"] == "E034"
+    assert rules["z"] == "E04D"
 
     render_text, overrides, warnings, applied, wants_heart = apply_automatic_glyph_rules(
         "Jazmin",
@@ -245,8 +245,8 @@ def test_font2_default_bindings_and_rules_cover_common_ending_glyphs():
     assert warnings == []
     assert applied is True
     assert wants_heart is False
-    assert render_text == "Jazmi\ue075"
-    assert overrides[5]["codepoint"] == "E075"
+    assert render_text == "Jazmi\ue041"
+    assert overrides[5]["codepoint"] == "E041"
 
 
 def test_font4_default_bindings_and_rules_cover_heart_ending_glyphs():
@@ -302,7 +302,7 @@ def test_corrupt_bindings_and_rules_are_backed_up_and_rebuilt(tmp_path):
 
     assert bindings.data == default_glyph_bindings_payload()
     assert rules.data["enabled"] is True
-    assert rules.data["fonts"]["Font 2"]["end_char_rules"]["n"] == "E075"
+    assert rules.data["fonts"]["Font 2"]["end_char_rules"]["n"] == "E041"
     assert list(tmp_path.glob("glyph_bindings.broken.*.json"))
     assert list(tmp_path.glob("glyph_rules.broken.*.json"))
 

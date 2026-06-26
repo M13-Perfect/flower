@@ -453,10 +453,10 @@ def order_row_view(order: dict) -> dict:
 
 
 GLYPH_HELP_TEXT = (
-    "Font 2 已内置 a-z 26 个结尾字形：a=U+E068，z=U+E081，中间按字母顺序连续递增。\n\n"
+    "Font 2 已内置 a-z 26 个结尾字形：a=U+E034，z=U+E04D，中间按字母顺序连续递增。\n\n"
     "默认模式 replace_last_letter 会用配置的 PUA 字形替换最后一个英文字母，例如 Jazmin -> Jazmi + n.005。\n\n"
     "人工绑定：编辑 -> 管理字形绑定，选择 Font 2，筛选 PUA only；单个绑定时选择映射字母、"
-    "输入 U+E068 这类 codepoint，再点绑定到映射字母。\n\n"
+    "输入 U+E034 这类 codepoint，再点绑定到映射字母。\n\n"
     "批量绑定：按 a-z 顺序粘贴 26 个 PUA 字符，再点按 a-z 绑定。\n\n"
     "按位置替换只影响当前订单；映射绑定会保存到 glyph_maps/glyph_maps.json。\n\n"
     "SVG 和 DXF 当前仍依赖字体文件显示 PUA 字符，换环境可能显示异常。"
@@ -7722,6 +7722,12 @@ class BirthFlowerApp:
         removed = delete_layer(self.document, self.document.selected_layer_id)
         if removed is None:
             self.status_var.set("未选择有效图层，或图层已锁定")
+        elif isinstance(removed, AnchoredHeartLayer):
+            # 删独立爱心层 = 这段文字不再要末尾爱心：清锚定文字的 ending_heart，
+            # 否则导出端会自烘爱心、或重开/seed 时 ensure 又把爱心层补回来（复活）。
+            anchor = self.document.layer_by_id(removed.anchor_layer_id)
+            if isinstance(anchor, TextLayer):
+                anchor.ending_heart = False
         elif isinstance(removed, TextLayer):
             remove_anchored_heart_for(self.document, removed.id)
             if self.document.selected_layer() is None:

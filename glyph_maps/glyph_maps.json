@@ -116,107 +116,107 @@
     "description": "Font 2 ending swash glyphs",
     "letters": {
       "a": {
-        "codepoint": "U+E068",
+        "codepoint": "U+E034",
         "label": "a.005 ending glyph"
       },
       "b": {
-        "codepoint": "U+E069",
+        "codepoint": "U+E035",
         "label": "b.005 ending glyph"
       },
       "c": {
-        "codepoint": "U+E06A",
+        "codepoint": "U+E036",
         "label": "c.005 ending glyph"
       },
       "d": {
-        "codepoint": "U+E06B",
+        "codepoint": "U+E037",
         "label": "d.005 ending glyph"
       },
       "e": {
-        "codepoint": "U+E06C",
+        "codepoint": "U+E038",
         "label": "e.005 ending glyph"
       },
       "f": {
-        "codepoint": "U+E06D",
+        "codepoint": "U+E039",
         "label": "f.005 ending glyph"
       },
       "g": {
-        "codepoint": "U+E06E",
+        "codepoint": "U+E03A",
         "label": "g.005 ending glyph"
       },
       "h": {
-        "codepoint": "U+E06F",
+        "codepoint": "U+E03B",
         "label": "h.005 ending glyph"
       },
       "i": {
-        "codepoint": "U+E070",
+        "codepoint": "U+E03C",
         "label": "i.005 ending glyph"
       },
       "j": {
-        "codepoint": "U+E071",
+        "codepoint": "U+E03D",
         "label": "j.005 ending glyph"
       },
       "k": {
-        "codepoint": "U+E072",
+        "codepoint": "U+E03E",
         "label": "k.005 ending glyph"
       },
       "l": {
-        "codepoint": "U+E073",
+        "codepoint": "U+E03F",
         "label": "l.005 ending glyph"
       },
       "m": {
-        "codepoint": "U+E074",
+        "codepoint": "U+E040",
         "label": "m.005 ending glyph"
       },
       "n": {
-        "codepoint": "U+E075",
+        "codepoint": "U+E041",
         "label": "n.005 ending glyph"
       },
       "o": {
-        "codepoint": "U+E076",
+        "codepoint": "U+E042",
         "label": "o.005 ending glyph"
       },
       "p": {
-        "codepoint": "U+E077",
+        "codepoint": "U+E043",
         "label": "p.005 ending glyph"
       },
       "q": {
-        "codepoint": "U+E078",
+        "codepoint": "U+E044",
         "label": "q.005 ending glyph"
       },
       "r": {
-        "codepoint": "U+E079",
+        "codepoint": "U+E045",
         "label": "r.005 ending glyph"
       },
       "s": {
-        "codepoint": "U+E07A",
+        "codepoint": "U+E046",
         "label": "s.005 ending glyph"
       },
       "t": {
-        "codepoint": "U+E07B",
+        "codepoint": "U+E047",
         "label": "t.005 ending glyph"
       },
       "u": {
-        "codepoint": "U+E07C",
+        "codepoint": "U+E048",
         "label": "u.005 ending glyph"
       },
       "v": {
-        "codepoint": "U+E07D",
+        "codepoint": "U+E049",
         "label": "v.005 ending glyph"
       },
       "w": {
-        "codepoint": "U+E07E",
+        "codepoint": "U+E04A",
         "label": "w.005 ending glyph"
       },
       "x": {
-        "codepoint": "U+E07F",
+        "codepoint": "U+E04B",
         "label": "x.005 ending glyph"
       },
       "y": {
-        "codepoint": "U+E080",
+        "codepoint": "U+E04C",
         "label": "y.005 ending glyph"
       },
       "z": {
-        "codepoint": "U+E081",
+        "codepoint": "U+E04D",
         "label": "z.005 ending glyph"
       }
     }

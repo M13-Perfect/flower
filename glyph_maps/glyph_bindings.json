@@ -164,157 +164,157 @@
     "Font 2": {
       "font_path": "",
       "bindings": {
-        "E068": {
+        "E034": {
           "base_char": "a",
           "usage": "end",
           "display_name": "a.005 ending glyph",
           "glyph_name": "a.005"
         },
-        "E069": {
+        "E035": {
           "base_char": "b",
           "usage": "end",
           "display_name": "b.005 ending glyph",
           "glyph_name": "b.005"
         },
-        "E06A": {
+        "E036": {
           "base_char": "c",
           "usage": "end",
           "display_name": "c.005 ending glyph",
           "glyph_name": "c.005"
         },
-        "E06B": {
+        "E037": {
           "base_char": "d",
           "usage": "end",
           "display_name": "d.005 ending glyph",
           "glyph_name": "d.005"
         },
-        "E06C": {
+        "E038": {
           "base_char": "e",
           "usage": "end",
           "display_name": "e.005 ending glyph",
           "glyph_name": "e.005"
         },
-        "E06D": {
+        "E039": {
           "base_char": "f",
           "usage": "end",
           "display_name": "f.005 ending glyph",
           "glyph_name": "f.005"
         },
-        "E06E": {
+        "E03A": {
           "base_char": "g",
           "usage": "end",
           "display_name": "g.005 ending glyph",
           "glyph_name": "g.005"
         },
-        "E06F": {
+        "E03B": {
           "base_char": "h",
           "usage": "end",
           "display_name": "h.005 ending glyph",
           "glyph_name": "h.005"
         },
-        "E070": {
+        "E03C": {
           "base_char": "i",
           "usage": "end",
           "display_name": "i.005 ending glyph",
           "glyph_name": "i.005"
         },
-        "E071": {
+        "E03D": {
           "base_char": "j",
           "usage": "end",
           "display_name": "j.005 ending glyph",
           "glyph_name": "j.005"
         },
-        "E072": {
+        "E03E": {
           "base_char": "k",
           "usage": "end",
           "display_name": "k.005 ending glyph",
           "glyph_name": "k.005"
         },
-        "E073": {
+        "E03F": {
           "base_char": "l",
           "usage": "end",
           "display_name": "l.005 ending glyph",
           "glyph_name": "l.005"
         },
-        "E074": {
+        "E040": {
           "base_char": "m",
           "usage": "end",
           "display_name": "m.005 ending glyph",
           "glyph_name": "m.005"
         },
-        "E075": {
+        "E041": {
           "base_char": "n",
           "usage": "end",
           "display_name": "n.005 ending glyph",
           "glyph_name": "n.005"
         },
-        "E076": {
+        "E042": {
           "base_char": "o",
           "usage": "end",
           "display_name": "o.005 ending glyph",
           "glyph_name": "o.005"
         },
-        "E077": {
+        "E043": {
           "base_char": "p",
           "usage": "end",
           "display_name": "p.005 ending glyph",
           "glyph_name": "p.005"
         },
-        "E078": {
+        "E044": {
           "base_char": "q",
           "usage": "end",
           "display_name": "q.005 ending glyph",
           "glyph_name": "q.005"
         },
-        "E079": {
+        "E045": {
           "base_char": "r",
           "usage": "end",
           "display_name": "r.005 ending glyph",
           "glyph_name": "r.005"
         },
-        "E07A": {
+        "E046": {
           "base_char": "s",
           "usage": "end",
           "display_name": "s.005 ending glyph",
           "glyph_name": "s.005"
         },
-        "E07B": {
+        "E047": {
           "base_char": "t",
           "usage": "end",
           "display_name": "t.005 ending glyph",
           "glyph_name": "t.005"
         },
-        "E07C": {
+        "E048": {
           "base_char": "u",
           "usage": "end",
           "display_name": "u.005 ending glyph",
           "glyph_name": "u.005"
         },
-        "E07D": {
+        "E049": {
           "base_char": "v",
           "usage": "end",
           "display_name": "v.005 ending glyph",
           "glyph_name": "v.005"
         },
-        "E07E": {
+        "E04A": {
           "base_char": "w",
           "usage": "end",
           "display_name": "w.005 ending glyph",
           "glyph_name": "w.005"
         },
-        "E07F": {
+        "E04B": {
           "base_char": "x",
           "usage": "end",
           "display_name": "x.005 ending glyph",
           "glyph_name": "x.005"
         },
-        "E080": {
+        "E04C": {
           "base_char": "y",
           "usage": "end",
           "display_name": "y.005 ending glyph",
           "glyph_name": "y.005"
         },
-        "E081": {
+        "E04D": {
           "base_char": "z",
           "usage": "end",
           "display_name": "z.005 ending glyph",

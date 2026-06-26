@@ -1903,8 +1903,8 @@ def test_glyph_help_explains_font2_default_binding(monkeypatch):
 
         message = ui_app_module.GLYPH_HELP_TEXT
         assert "Font 2 已内置 a-z 26 个结尾字形" in message
-        assert "a=U+E068" in message
-        assert "z=U+E081" in message
+        assert "a=U+E034" in message
+        assert "z=U+E04D" in message
         assert "编辑 -> 管理字形绑定" in message
         assert "按 a-z 绑定" in message
     finally:

@@ -142,7 +142,13 @@ def _heart_for(document: Document, text_layer_id: str) -> AnchoredHeartLayer | N
 
 
 def ensure_anchored_heart_for(document: Document, text_layer: TextLayer) -> AnchoredHeartLayer:
-    """文字图层若还没有锚定爱心则补建一个（颜色随文字色），已有则原样返回。"""
+    """文字图层若还没有锚定爱心则补建一个（颜色随文字色），已有则原样返回。
+
+    一旦存在独立爱心层，立即把锚定文字标记 ending_heart_detached=True：关掉「建层后~首次
+    resolve 前」那一帧的窗口（否则那帧文字仍会自贴爱心 → 与独立爱心层叠成双爱心）。
+    resolve 每帧会再幂等确认；切走字体 / 删层时由对应路径清回 False。
+    """
+    text_layer.ending_heart_detached = True
     existing = _heart_for(document, text_layer.id)
     if existing is not None:
         return existing
