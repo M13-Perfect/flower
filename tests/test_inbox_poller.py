@@ -9,7 +9,9 @@
 import os
 from pathlib import Path
 
-from config_store import AppConfig
+import ui_app
+from config_store import AppConfig, load_config
+from config_store import save_config as save_real
 from ui_app import BirthFlowerApp
 
 
@@ -179,3 +181,64 @@ def test_disabled_when_folder_unset(tmp_path):
 
     assert app._inbox_dir is None
     assert app.root.scheduled == []
+
+
+# ── 「自动识别」开关：与「自动抓取」独立、默认关、拨动即持久化并立即生效 ──
+
+
+def _make_autoparse_app(config_path: Path, *, autoparse: bool) -> BirthFlowerApp:
+    """裸实例 + 「自动识别」开关回调所需的最小属性（不构造 Tk 窗口）。"""
+    app = BirthFlowerApp.__new__(BirthFlowerApp)
+    app.config = AppConfig(inbox_autoparse=autoparse, inbox_autoparse_user_set=True)
+    app.status_var = _FakeVar()
+    app.autoparse_switch_var = _FakeVar(autoparse)  # type: ignore[arg-type]
+    app._config_path = config_path
+    return app
+
+
+def test_autoparse_switch_toggle_on_persists_and_takes_effect(tmp_path, monkeypatch):
+    """关→开：config.inbox_autoparse=True + user_set=True，写盘后重新 load 仍为 True（采信用户显式设置）。"""
+    config_path = tmp_path / "config.json"
+    saved: list = []
+    monkeypatch.setattr(ui_app, "save_config", lambda cfg: (saved.append(cfg), save_real(cfg, config_path))[0])
+    app = _make_autoparse_app(config_path, autoparse=False)
+
+    app.autoparse_switch_var.set(True)  # 模拟用户点开
+    app._on_autoparse_switch_toggle()
+
+    assert app.config.inbox_autoparse is True
+    assert app.config.inbox_autoparse_user_set is True
+    assert saved and saved[-1].inbox_autoparse is True  # 立即持久化
+    # 重新读取：用户显式开 → 不被安全迁移回落，仍为 True。
+    assert load_config(config_path).inbox_autoparse is True
+
+
+def test_autoparse_switch_toggle_off_persists(tmp_path, monkeypatch):
+    """开→关：config.inbox_autoparse=False，且仍记 user_set=True（显式关，非旧配置遗留）。"""
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_app, "save_config", lambda cfg: save_real(cfg, config_path))
+    app = _make_autoparse_app(config_path, autoparse=True)
+
+    app.autoparse_switch_var.set(False)
+    app._on_autoparse_switch_toggle()
+
+    assert app.config.inbox_autoparse is False
+    assert app.config.inbox_autoparse_user_set is True
+    assert load_config(config_path).inbox_autoparse is False
+
+
+def test_autoparse_toggle_independent_of_scrape_control(tmp_path, monkeypatch):
+    """两开关互不影响：拨「自动识别」纯本地，绝不触碰 inbox-service 的自动抓开关（不发 HTTP）。"""
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(ui_app, "save_config", lambda cfg: save_real(cfg, config_path))
+
+    def _boom(*_a, **_k):
+        raise AssertionError("自动识别开关不应调用 inbox-service 抓取控制")
+
+    monkeypatch.setattr(ui_app.inbox_client, "put_scrape_control", _boom)
+    app = _make_autoparse_app(config_path, autoparse=False)
+
+    app.autoparse_switch_var.set(True)
+    app._on_autoparse_switch_toggle()  # 若误碰 scrape control 会 AssertionError
+
+    assert app.config.inbox_autoparse is True

@@ -1,7 +1,20 @@
 # CURRENT_TASKS — flower
 
 > 配 `PROJECT_INDEX.md` 一起读。导出/EzCad 细节看 `docs/superpowers/plans/2026-06-13-dxf-export-progress.md`。
-> 更新：2026-06-18。
+> 更新：2026-06-23。
+
+## 本轮（2026-06-23）引用字段系统 UI 修复 ✅逻辑+自动化测试 / ⬜真机
+
+> **执行计划（自包含，交给 Codex 直接做）**：`docs/superpowers/plans/2026-06-23-reference-field-ui-fix-execplan.md`。
+> 设计基线：`docs/superpowers/plans/2026-06-23-reference-field-system.md`。
+
+已修两个已确认 bug（均在 `ui_app.py` UI 集成层）：
+- **现象1**：背景提示词编辑器不再直显 `{{field:UUID}}`；加载/切产品时用 `iter_template_segments()` 渲染成 `/字段名` / `/订单信息`，Tk Text tag 保存稳定 `ref::<uuid>` / `src::<key>`，回读时恢复 canonical token。
+- **现象2**：字段名输入新增 `<FocusOut>` 保存，失焦错误只写状态栏；`_reference_fields_from_field_defs()` 补读 `name_var`，未按 Enter 的改名不会在增删/持久化时丢。
+- **展示/插入分离**：斜杠菜单 `label` 可显示 `/#3 名称`，插入编辑器只用 `display_name=/名称`，内部仍用 `insert={{field:uuid}}` 与 `ref_id` 保持稳定关联。
+- **序号语义**：固定序号逻辑未重写，仍按 `field_seq_max + 1` 单调分配；删除不重排、不复用。
+
+测试：`tests/test_template_segments.py`、`tests/test_reference_field_ui_mapping.py` 新增；`pytest tests/test_template_segments.py tests/test_reference_field_ui_mapping.py tests/test_reference_field_system.py tests/test_config_store.py -q` = 45 passed；`pytest tests/test_orders_multi.py tests/test_inbox_poller.py -q` = 26 passed；`py_compile`/`ruff` 通过。当前环境无 Tk display，相关真 GUI 用例 skip，仍须关 App 重开手测：改名不按 Enter → 背景框 `/` 菜单立即新名；插入后不显示 `#`/UUID；保存重启仍显示 `/名称`；解析最终提示词正常展开。
 
 ## 本轮（2026-06-18）素材映射改为「按花名」（不再用月份选花）
 

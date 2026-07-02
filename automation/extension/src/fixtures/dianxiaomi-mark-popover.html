@@ -1,0 +1,107 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      标记回写蒸馏夹具（2026-06-20 claude-in-chrome 只读勘查真实店小秘「待处理」页结构）。
+      · 订单行：vxe 两行配对（明细行 tr[rowid="X"] 含 .orderCode；表头行 tr[rowid="X_header"] 含标记区 .bag-info-coustom）。
+        识别已打标记靠图标 class（icon_brush_bill=AI未识别 / icon_change_order=AI已处理），颜色不唯一勿用。
+        .bag-info-coustom 末尾空 .order-mark-block（无 i、无背景色）= 添加按钮；纯色块（已排版蓝）无 i 但有背景色，不是添加。
+      · 弹窗 .markPopover（Ant Popover，全页单例）：标记行 .remark-item（.remark-item__text=label，
+        .remark-item__action 恒含 停用 icon_block + 编辑 icon_edit2；选中行额外多一个对勾 i=icon_support）。
+        头部两个 ant-btn-primary：创建标记 与 确定 → 确定必须按文本精确挑。
+        本夹具状态：4090000001 已打 AI未识别；弹窗里 AI未识别 选中、AI已处理 未选（已选 1/10）。
+    -->
+  </head>
+  <body class="order-layout-active">
+    <table>
+      <tbody>
+        <tr rowid="1">
+          <td class="orderCode"><span class="pointer">4090000001</span></td>
+        </tr>
+        <tr rowid="1_header">
+          <td>
+            <div class="flex-align-center orderBagInfo">
+              <a class="mr-10">PKG-A</a>
+              <div class="flex-align-center mr-5">
+                <div class="order-mark-block">拣</div>
+                <div class="order-mark-block">客</div>
+              </div>
+              <div class="flex-align-center bag-info-coustom">
+                <div class="order-mark-block" style="background-color: rgb(226, 36, 127);">
+                  <i class="icon_brush_bill"></i>
+                </div>
+                <div class="order-mark-block"></div>
+              </div>
+            </div>
+          </td>
+        </tr>
+        <tr rowid="2">
+          <td class="orderCode"><span class="pointer">4090000002</span></td>
+        </tr>
+        <tr rowid="2_header">
+          <td>
+            <div class="flex-align-center orderBagInfo">
+              <a class="mr-10">PKG-B</a>
+              <div class="flex-align-center bag-info-coustom">
+                <div class="order-mark-block" style="background-color: rgb(19, 122, 191);"></div>
+                <div class="order-mark-block"></div>
+              </div>
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="ant-popover common-source-image-popover css-x ant-popover-arrow-hidden">
+      <div class="ant-popover-inner">
+        <div class="ant-popover-inner-content">
+          <div class="markPopover">
+            <div class="markPopover__header">
+              <button class="ant-btn ant-btn-primary ant-btn-background-ghost created-mark" type="button">
+                <span>创建标记</span>
+              </button>
+              <div>
+                <button class="ant-btn ant-btn-primary" type="button"><span>确定</span></button>
+                <button class="ant-btn ant-btn-default" type="button"><span>取消</span></button>
+              </div>
+            </div>
+            <div class="markPopover__filter"><input class="ant-input" type="text" /></div>
+            <div class="markPopover__content">
+              <div class="tabs-box">
+                <div class="tabs-box__item is-active">已启用</div>
+                <div class="tabs-box__item">已停用</div>
+              </div>
+              <div class="scrollContainer no-tab">
+                <div class="remark-item">
+                  <div class="remark-item__icon order-mark-block icon_completed"></div>
+                  <div class="remark-item__text w200 no-new-line">Confirmed-可以生产/发货</div>
+                  <div class="remark-item__action">
+                    <a class="disable-action"><i class="icon_block"></i></a><a><i class="icon_edit2"></i></a>
+                  </div>
+                </div>
+                <div class="remark-item">
+                  <div class="remark-item__icon order-mark-block icon_change_order"></div>
+                  <div class="remark-item__text w200 no-new-line">AI已处理</div>
+                  <div class="remark-item__action">
+                    <a class="disable-action"><i class="icon_block"></i></a><a><i class="icon_edit2"></i></a>
+                  </div>
+                </div>
+                <div class="remark-item">
+                  <div class="remark-item__icon order-mark-block icon_brush_bill"></div>
+                  <div class="remark-item__text w200 no-new-line">AI未识别</div>
+                  <div class="remark-item__action">
+                    <a class="disable-action"><i class="icon_block"></i></a><a><i class="icon_edit2"></i></a><a><i class="icon_support"></i></a>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="markPopover__footer gray-c">
+              <span><i class="icon_info_outline"></i></span><span>已选 1 / 10</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

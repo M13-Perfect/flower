@@ -29,9 +29,11 @@ def test_ingest_writes_file_and_persists(client, settings):
     assert status["inbox_path"].endswith("ORD-1.json")
 
 
-def test_ingest_rejects_missing_remark(client):
+def test_ingest_accepts_missing_remark(client):
+    # 2026-06-19：remark 改为可选（D-1）。缺 remark 不再拒收，默认空串（数据走 items[]）。
     resp = client.post("/inbox/orders", json={"schema_version": "1.0", "order_id": "ORD-2"})
-    assert resp.status_code == 422
+    assert resp.status_code == 200
+    assert client.get("/inbox/orders/ORD-2").json()["remark"] == ""
 
 
 def test_ingest_rejects_bad_order_id(client):
